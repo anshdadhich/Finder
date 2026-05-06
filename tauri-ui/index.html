@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FastSeek</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <section class="spotlight-card">
+      <header class="top-row">
+        <div class="search-wrap">
+          <span class="search-icon">⌕</span>
+          <input id="searchInput" autocomplete="off" placeholder="Search apps, files, folders" />
+        </div>
+        <button id="settingsBtn" class="icon-btn" title="Settings">⚙</button>
+      </header>
+
+      <ul id="results" class="results"></ul>
+
+      <footer class="hint-row">
+        <span>↑ ↓ navigate</span>
+        <span>Enter open</span>
+        <span>Ctrl+Enter open folder</span>
+        <span>Esc hide</span>
+      </footer>
+    </section>
+  </main>
+
+  <dialog id="settingsDialog" class="settings-dialog">
+    <form method="dialog" class="settings-card" id="settingsForm">
+      <div class="settings-header">
+        <h2>Settings</h2>
+        <button class="icon-btn" value="cancel" type="submit">✕</button>
+      </div>
+
+      <label class="toggle-row">
+        <span>Case sensitive search</span>
+        <input id="caseSensitive" type="checkbox" />
+      </label>
+
+      <label for="excludedPaths">Excluded paths (one per line)</label>
+      <textarea id="excludedPaths" rows="8" placeholder="C:\Users\name\AppData\"></textarea>
+
+      <div class="actions">
+        <button id="saveSettingsBtn" type="button" class="primary-btn">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
