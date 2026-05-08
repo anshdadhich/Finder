@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/1",
+  "build": {
+    "beforeBuildCommand": "",
+    "beforeDevCommand": "",
+    "devPath": "tauri-ui",
+    "distDir": "tauri-ui",
+    "withGlobalTauri": true
+  },
+  "package": {
+    "productName": "FastSeek",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "window": {
+        "hide": true,
+        "show": true,
+        "setFocus": true
+      },
+      "globalShortcut": {
+        "all": true
+      }
+    },
+    "bundle": {
+      "active": false,
+      "identifier": "com.fastseek.search",
+      "icon": ["icons/icon.ico"]
+    },
+    "systemTray": {
+      "iconPath": "icons/icon.ico",
+      "iconAsTemplate": false
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "title": "FastSeek",
+        "width": 900,
+        "height": 600,
+        "center": true,
+        "resizable": false,
+        "fullscreen": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": true
+      }
+    ]
+  }
+}

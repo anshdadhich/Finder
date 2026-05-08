@@ -22,6 +22,8 @@ public sealed class IndexEntry
     public ushort NameLen;
     public ushort NameLowerLen;
     public byte Flags;
+    public string NameText = "";
+    public string NameLowerText = "";
 
     [JsonIgnore]
     public bool IsDir => (Flags & 1) != 0;
@@ -38,8 +40,13 @@ public sealed class IndexStore
     public string DriveRoot { get; set; } = "";
     public List<JournalCheckpoint> Checkpoints { get; set; } = [];
 
-    public string Name(IndexEntry e) => System.Text.Encoding.UTF8.GetString(CollectionsMarshal.AsSpan(NameArena).Slice((int)e.NameOff, e.NameLen));
-    public string NameLower(IndexEntry e) => System.Text.Encoding.UTF8.GetString(CollectionsMarshal.AsSpan(NameLowerArena).Slice((int)e.NameLowerOff, e.NameLowerLen));
+    public string Name(IndexEntry e) => e.NameText.Length != 0
+        ? e.NameText
+        : System.Text.Encoding.UTF8.GetString(CollectionsMarshal.AsSpan(NameArena).Slice((int)e.NameOff, e.NameLen));
+
+    public string NameLower(IndexEntry e) => e.NameLowerText.Length != 0
+        ? e.NameLowerText
+        : System.Text.Encoding.UTF8.GetString(CollectionsMarshal.AsSpan(NameLowerArena).Slice((int)e.NameLowerOff, e.NameLowerLen));
 
     public uint? LookupIdx(ulong fileRef)
     {
@@ -147,6 +154,8 @@ public sealed class IndexStore
             NameLen = (ushort)nameBytes.Length,
             NameLowerLen = (ushort)nameLowerBytes.Length,
             Flags = kind == FileKind.Directory ? (byte)1 : (byte)0,
+            NameText = name,
+            NameLowerText = nameLower,
         };
 
         if (!sorted)

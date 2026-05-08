@@ -38,6 +38,11 @@ fn main() {
                     Ok(bytes) => {
                         match bincode::deserialize::<fastsearch::index::store::CacheData>(&bytes) {
                             Ok(cache) => {
+                                if cache.entries.is_empty() {
+                                    println!("empty cache, rescanning...");
+                                    let _ = std::fs::remove_file(&cache_path);
+                                    false
+                                } else {
                                 let count = cache.entries.len();
                                 let checkpoints = cache.checkpoints.clone();
                                 *index.write() = IndexStore::from_cache(cache);
@@ -108,6 +113,7 @@ fn main() {
                                     println!();
                                     true
                                 }
+                                }
                             }
                             Err(_) => { println!("cache corrupt, rescanning..."); false }
                         }
@@ -158,8 +164,9 @@ fn main() {
 
                 let t1 = std::time::Instant::now();
                 let (scan, method) = match reader.scan_direct() {
-                    Some(s) => (s, "direct"),
+                    Some(s) if !s.records.is_empty() => (s, "direct"),
                     None => (reader.scan(), "ioctl"),
+                    Some(_) => (reader.scan(), "ioctl"),
                 };
                 let count = scan.records.len();
                 let scan_time = t1.elapsed();
@@ -195,6 +202,9 @@ fn main() {
         // Save cache
         {
             let store = index.read();
+            if store.entries.is_empty() {
+                eprintln!("Not saving empty cache.");
+            } else {
             let cache = store.to_cache();
             match bincode::serialize(&cache) {
                 Ok(bytes) => {
@@ -207,6 +217,7 @@ fn main() {
                     }
                 }
                 Err(e) => eprintln!("Could not serialize: {}", e),
+            }
             }
         }
 
@@ -251,6 +262,9 @@ fn main() {
     let cps_for_save = Arc::clone(&live_checkpoints);
     ctrlc::set_handler(move || {
         let mut store = index_for_save.write();
+        if store.entries.is_empty() {
+            std::process::exit(0);
+        }
         store.checkpoints = cps_for_save.lock().clone();
         let cache = store.to_cache();
         if let Ok(bytes) = bincode::serialize(&cache) {
@@ -406,12 +420,12 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                             rank: 0,
                             is_dir: matches!(entry.kind(), fastsearch::mft::types::FileKind::Directory),
                         })
-                    }).take(50).collect()
+                    }).take(300).collect()
                 } else {
                     let raw = search(
                         &store,
                         parsed.query,
-                        200,
+                        300,
                         case_sensitive,
                         &excluded_dirs,
                     );
@@ -421,7 +435,7 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                             Filter::Dirs  => r.is_dir,
                             Filter::Files => !r.is_dir,
                         }
-                    }).take(50).collect()
+                    }).take(300).collect()
                 };
                 let elapsed = start.elapsed();
 

@@ -1,4 +1,5 @@
 using FastSearch.Mft;
+using System.IO;
 
 namespace FastSearch.Index;
 
