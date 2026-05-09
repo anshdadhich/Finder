@@ -720,6 +720,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "windows 0.60.0",
+ "winreg",
  "winres",
 ]
 

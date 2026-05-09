@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use crossbeam_channel::unbounded;
 
 use fastsearch::index::store::IndexStore;
-use fastsearch::index::search::search;
+use fastsearch::index::search::{search, apps};
 use fastsearch::mft::reader::MftReader;
 use fastsearch::mft::watcher::UsnWatcher;
 use fastsearch::mft::types::IndexEvent;
@@ -17,6 +17,18 @@ fn main() {
     println!("║       FastSeek - File Search      ║");
     println!("╚══════════════════════════════════╝");
     println!();
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--apps" {
+        let apps = unsafe { fastsearch::index::apps::get_installed_apps() };
+        for app in apps {
+            println!("{}", app.name);
+            if let Some(loc) = app.install_location {
+                println!("  Location: {}", loc);
+            }
+        }
+        return;
+    }
 
     let drives = get_ntfs_drives();
     if drives.is_empty() {
@@ -277,6 +289,20 @@ fn main() {
         std::process::exit(0);
     }).ok();
 
+    // Show apps on startup
+    {
+        let store = index.read();
+        let apps = fastsearch::index::search::apps(&store, 50);
+        if !apps.is_empty() {
+            println!("📱 Installed Apps ({} shown):", apps.len());
+            println!();
+            for (i, app) in apps.iter().enumerate() {
+                println!("  [{:>3}] {}", i + 1, app.name);
+            }
+            println!();
+        }
+    }
+
     search_loop(index);
 }
 
@@ -299,6 +325,7 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
     println!("  quit              exit");
     println!();
 
+    
     loop {
         print!("search> ");
         io::stdout().flush().unwrap();
