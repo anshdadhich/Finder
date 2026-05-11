@@ -172,6 +172,8 @@ pub fn search(
             name: store.name(entry).to_string(),
             rank,
             is_dir: entry.is_dir(),
+            modified_time: None,
+            file_type_priority: 0,
         });
     }
 
@@ -188,6 +190,8 @@ pub fn apps(_store: &IndexStore, _limit: usize) -> Vec<SearchResult> {
             name: app.name,
             rank: 0,
             is_dir: false,
+            modified_time: None,
+            file_type_priority: 0,
         }
     }).collect()
 }
