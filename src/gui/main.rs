@@ -35,12 +35,14 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::{
     Common::ITEMIDLIST, BHID_SFObject, BHID_SFUIObject, ILCombine, ILFree, IEnumIDList,
     IShellFolder, IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SHGetFileInfoW,
-    SHGetNameFromIDList, SHParseDisplayName, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
-    SHGFI_PIDL, SHGFI_USEFILEATTRIBUTES, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
-    SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
-    SHGSI_ICON, SHGSI_LARGEICON, SHGetStockIconInfo, SIID_APPLICATION, SHSTOCKICONINFO,
+    SHGetImageList, SHGetNameFromIDList, SHParseDisplayName, SHFILEINFOW, SHGFI_ICON,
+    SHGFI_LARGEICON, SHGFI_PIDL, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHCONTF_FOLDERS,
+    SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
+    SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, SHGSI_ICON, SHGSI_LARGEICON, SHGetStockIconInfo,
+    SIID_APPLICATION, SHSTOCKICONINFO, SHIL_JUMBO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
+use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 
 use fastsearch::{
     index::{search, store::IndexStore},
@@ -284,7 +286,25 @@ fn generic_icon_data_uri() -> Option<String> {
 }
 
 fn extract_icon_data_uri(path: &str) -> Option<String> {
-    // Prefer the shell item image factory: cleaner, higher-res, no shortcut
+    // Prefer the 256px system-image-list icon (crisp at any scale).
+    let wide0: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let mut sfi0: SHFILEINFOW = std::mem::zeroed();
+        let res0 = SHGetFileInfoW(
+            PCWSTR(wide0.as_ptr()),
+            FILE_ATTRIBUTE_NORMAL,
+            Some(&mut sfi0),
+            size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX,
+        );
+        if res0 != 0 {
+            if let Some(uri) = imagelist_icon_data_uri(sfi0.iIcon) {
+                return Some(uri);
+            }
+        }
+    }
+
+    // Fall back to the shell item image factory: cleaner, higher-res, no shortcut
     // arrow overlay for .lnk, real app icon for .exe.
     if let Some(uri) = shellitem_icon_data_uri(path, 64) {
         return Some(uri);
@@ -377,11 +397,27 @@ fn aumid_icon_data_uri(aumid: &str) -> Option<String> {
     }
 }
 
+/// Extract the shell item's icon from the system image list at 256 px (JUMBO).
+/// `index` comes from SHGetFileInfoW with SHGFI_SYSICONINDEX.
+fn imagelist_icon_data_uri(index: i32) -> Option<String> {
+    if index < 0 {
+        return None;
+    }
+    unsafe {
+        let list: IImageList = SHGetImageList(SHIL_JUMBO as i32).ok()?;
+        let icon = list.GetIcon(index & 0xffff, ILD_TRANSPARENT.0).ok()?;
+        let png = icon_to_png(icon)?;
+        let _ = DestroyIcon(icon);
+        Some(format!("data:image/png;base64,{}", B64.encode(&png)))
+    }
+}
+
 /// Extract the real per-item icon using the item's absolute PIDL. This is the
 /// reliable way for AppsFolder (Store/UWP) entries: SHGetFileInfoW with
 /// SHGFI_PIDL resolves the actual shell item (not a file-type guess), and it
 /// avoids both the BindToHandler E_NOINTERFACE and the USEFILEATTRIBUTES
-/// "every icon looks like a document" problems.
+/// "every icon looks like a document" problems. Prefers the 256px JUMBO
+/// system-image-list icon, falling back to a plain 32px HICON.
 fn pidl_icon_data_uri(pidl: *mut ITEMIDLIST) -> Option<String> {
     if pidl.is_null() {
         return None;
@@ -393,13 +429,28 @@ fn pidl_icon_data_uri(pidl: *mut ITEMIDLIST) -> Option<String> {
             FILE_ATTRIBUTE_NORMAL,
             Some(&mut sfi),
             size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX | SHGFI_PIDL,
+        );
+        if res != 0 {
+            if let Some(uri) = imagelist_icon_data_uri(sfi.iIcon) {
+                return Some(uri);
+            }
+        }
+
+        // Path 2: plain large icon from the PIDL.
+        let mut sfi2: SHFILEINFOW = std::mem::zeroed();
+        let res2 = SHGetFileInfoW(
+            PCWSTR(pidl as *const u16),
+            FILE_ATTRIBUTE_NORMAL,
+            Some(&mut sfi2),
+            size_of::<SHFILEINFOW>() as u32,
             SHGFI_ICON | SHGFI_LARGEICON | SHGFI_PIDL,
         );
-        if res == 0 || sfi.hIcon.is_invalid() {
+        if res2 == 0 || sfi2.hIcon.is_invalid() {
             return None;
         }
-        let png = icon_to_png(sfi.hIcon)?;
-        let _ = DestroyIcon(sfi.hIcon);
+        let png = icon_to_png(sfi2.hIcon)?;
+        let _ = DestroyIcon(sfi2.hIcon);
         Some(format!("data:image/png;base64,{}", B64.encode(&png)))
     }
 }
