@@ -22,12 +22,20 @@ use tauri::{
 };
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HWND, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BI_RGB, DIB_RGB_COLORS,
-    HGDIOBJ,
+    DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BI_RGB, DIB_RGB_COLORS,
+    HGDIOBJ, HBITMAP,
 };
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
-use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES};
+use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+use windows::Win32::UI::Shell::{
+    Common::ITEMIDLIST, BHID_SFObject, BHID_SFUIObject, ILFree, IEnumIDList, IShellFolder, IShellItem,
+    IShellItemImageFactory, SHCreateItemFromParsingName, SHGetFileInfoW, SHGetNameFromIDList, SHFILEINFOW,
+    SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, SHCONTF_FOLDERS, SHCONTF_NONFOLDERS,
+    SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+};
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
 use fastsearch::{
@@ -103,19 +111,24 @@ fn search_files(query: String, state: tauri::State<AppState>) -> Vec<UiResult> {
 #[tauri::command]
 fn search_apps(query: String, state: tauri::State<AppState>) -> Vec<UiResult> {
     let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return Vec::new();
-    }
 
-    let mut scored: Vec<(u8, &AppEntry)> = state
-        .apps
-        .iter()
-        .filter_map(|app| app_rank(&app.name.to_lowercase(), &q).map(|rank| (rank, app)))
-        .collect();
+    let mut scored: Vec<(u8, &AppEntry)> = if q.is_empty() {
+        state
+            .apps
+            .iter()
+            .map(|app| (1u8, app))
+            .collect()
+    } else {
+        state
+            .apps
+            .iter()
+            .filter_map(|app| app_rank(&app.name.to_lowercase(), &q).map(|rank| (rank, app)))
+            .collect()
+    };
     scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase())));
     scored
         .into_iter()
-        .take(10)
+        .take(if q.is_empty() { 16 } else { 10 })
         .map(|(rank, app)| UiResult {
             name: app.name.clone(),
             path: app.path.clone(),
@@ -144,24 +157,18 @@ fn app_rank(name_lower: &str, q: &str) -> Option<u8> {
 }
 
 #[tauri::command]
-fn get_icon(path: String, state: tauri::State<AppState>) -> String {
-    let key = path.to_lowercase();
-    if let Some(icon) = state.icon_cache.lock().get(&key) {
-        return icon.clone();
-    }
-
-    let icon = extract_icon_data_uri(&path).unwrap_or_default();
-    if !icon.is_empty() {
-        state.icon_cache.lock().insert(key, icon.clone());
-    }
-    icon
-}
-
-#[tauri::command]
 fn launch_app(path: String) -> Result<(), String> {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     use windows::core::PCWSTR;
+
+    if let Some(rest) = path.strip_prefix("aumid:") {
+        let target = format!("shell:appsFolder\\{}", rest);
+        let _ = std::process::Command::new("explorer")
+            .arg(&target)
+            .spawn();
+        return Ok(());
+    }
 
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     let operation: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
@@ -180,6 +187,32 @@ fn launch_app(path: String) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+#[tauri::command]
+fn get_icons(paths: Vec<String>, state: tauri::State<AppState>) -> HashMap<String, String> {
+    let mut out = HashMap::with_capacity(paths.len());
+    let mut cache = state.icon_cache.lock();
+    for path in paths {
+        let key = path.to_lowercase();
+        let uri = if let Some(v) = cache.get(&key) {
+            v.clone()
+        } else if let Some(v) = get_icon_data_uri(&path) {
+            cache.insert(key, v.clone());
+            v
+        } else {
+            continue;
+        };
+        out.insert(path, uri);
+    }
+    out
+}
+
+fn get_icon_data_uri(path: &str) -> Option<String> {
+    if let Some(rest) = path.strip_prefix("aumid:") {
+        return aumid_icon_data_uri(rest);
+    }
+    extract_icon_data_uri(path)
 }
 
 fn extract_icon_data_uri(path: &str) -> Option<String> {
@@ -218,8 +251,37 @@ fn icon_to_png(icon: HICON) -> Option<Vec<u8>> {
         if GetIconInfo(icon, &mut info).is_err() {
             return None;
         }
-        let hbm = info.hbmColor;
+        let out = hbitmap_to_png(info.hbmColor);
+        let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
+        let _ = DeleteObject(HGDIOBJ(info.hbmMask.0));
+        out
+    }
+}
 
+fn aumid_icon_data_uri(aumid: &str) -> Option<String> {
+    let mut wide = "shell:appsFolder\\".encode_utf16().collect::<Vec<u16>>();
+    wide.extend(aumid.encode_utf16());
+    wide.push(0);
+    unsafe {
+        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+        let factory: IShellItemImageFactory = item
+            .BindToHandler(None, &BHID_SFUIObject)
+            .ok()?;
+        let size = SIZE { cx: 32, cy: 32 };
+        let hbmp = factory
+            .GetImage(size, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
+            .ok()?;
+        let png = hbitmap_to_png(hbmp)?;
+        let _ = DeleteObject(HGDIOBJ(hbmp.0));
+        Some(format!(
+            "data:image/png;base64,{}",
+            B64.encode(&png)
+        ))
+    }
+}
+
+fn hbitmap_to_png(hbm: HBITMAP) -> Option<Vec<u8>> {
+    unsafe {
         let mut bmp: BITMAP = std::mem::zeroed();
         GetObjectW(
             HGDIOBJ(hbm.0),
@@ -234,7 +296,7 @@ fn icon_to_png(icon: HICON) -> Option<Vec<u8>> {
         }
 
         let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmiHeader.biSize = size_of::<BITMAPINFO>() as u32;
+        bmi.bmiHeader.biSize = size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
         bmi.bmiHeader.biWidth = w;
         bmi.bmiHeader.biHeight = -h;
         bmi.bmiHeader.biPlanes = 1;
@@ -272,6 +334,61 @@ fn icon_to_png(icon: HICON) -> Option<Vec<u8>> {
         img.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
         Some(png_bytes)
     }
+}
+
+fn utf16_null(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn apps_from_shell() -> Vec<AppEntry> {
+    let mut out = Vec::new();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let w = utf16_null("shell:AppsFolder");
+        let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(w.as_ptr()), None) else {
+            return out;
+        };
+        let Ok(folder) = item.BindToHandler::<_, IShellFolder>(None, &BHID_SFObject) else {
+            return out;
+        };
+        let mut enums: Option<IEnumIDList> = None;
+        let flags = (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0) as u32;
+        let _ = folder.EnumObjects(HWND(std::ptr::null_mut()), flags, &mut enums);
+        let Some(ids) = enums else { return out };
+        loop {
+            let mut pidls = [std::ptr::null_mut::<ITEMIDLIST>()];
+            let mut fetched = 0u32;
+            let hr = ids.Next(&mut pidls, Some(&mut fetched));
+            if hr.is_err() || fetched == 0 {
+                break;
+            }
+            let pidl = pidls[0];
+            let mut name = String::new();
+            let mut aumid = String::new();
+            if let Ok(pw) = SHGetNameFromIDList(pidl, SIGDN_NORMALDISPLAY) {
+                name = pw.to_string().unwrap_or_default();
+                CoTaskMemFree(Some(pw.0 as *const c_void));
+            }
+            if let Ok(pw) = SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEPARSING) {
+                aumid = pw.to_string().unwrap_or_default();
+                CoTaskMemFree(Some(pw.0 as *const c_void));
+            }
+            ILFree(Some(pidl));
+            if !name.is_empty() && !aumid.is_empty() {
+                let aumid = aumid
+                    .strip_prefix("shell:appsFolder\\")
+                    .or_else(|| aumid.strip_prefix("shell:APPSFOLDER\\"))
+                    .or_else(|| aumid.strip_prefix("shell:AppsFolder\\"))
+                    .unwrap_or(&aumid)
+                    .to_string();
+                out.push(AppEntry {
+                    name,
+                    path: format!("aumid:{}", aumid),
+                });
+            }
+        }
+    }
+    out
 }
 
 #[tauri::command]
@@ -427,7 +544,7 @@ fn main() {
             get_index_status,
             search_files,
             search_apps,
-            get_icon,
+            get_icons,
             launch_app,
             hide_window,
             open_path,
@@ -475,6 +592,16 @@ fn discover_apps() -> Vec<AppEntry> {
     let mut apps: Vec<AppEntry> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Store / UWP apps from the Shell AppsFolder (comes with real icons).
+    for app in apps_from_shell() {
+        let key = app.name.to_lowercase();
+        if seen.insert(key) {
+            apps.push(app);
+        }
+    }
+
+    // Start Menu shortcuts: prefer these over their AppsFolder twin (icon extraction
+    // is cheaper on a real .lnk path) — but keep the UWP one if it's the only copy.
     let program_data = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".into());
     let appdata = std::env::var("APPDATA").unwrap_or_default();
     let mut roots: Vec<String> = Vec::new();
@@ -492,7 +619,7 @@ fn discover_apps() -> Vec<AppEntry> {
     }
 
     for root in roots {
-        collect_shortcuts(&root, &mut apps);
+        collect_shortcuts(&root, &mut apps, &mut seen);
     }
 
     // Registry install locations: find the first .exe and add as fallback
@@ -516,12 +643,12 @@ fn discover_apps() -> Vec<AppEntry> {
     apps
 }
 
-fn collect_shortcuts(dir: &str, out: &mut Vec<AppEntry>) {
+fn collect_shortcuts(dir: &str, out: &mut Vec<AppEntry>, seen: &mut std::collections::HashSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_shortcuts(&path.to_string_lossy(), out);
+            collect_shortcuts(&path.to_string_lossy(), out, seen);
         } else if path
             .extension()
             .map(|e| e.eq_ignore_ascii_case("lnk"))
@@ -530,10 +657,20 @@ fn collect_shortcuts(dir: &str, out: &mut Vec<AppEntry>) {
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                 let name = stem.trim().to_string();
                 if !name.is_empty() {
-                    out.push(AppEntry {
-                        name,
-                        path: path.to_string_lossy().to_string(),
-                    });
+                    let key = name.to_lowercase();
+                    if let Some(existing) = out.iter_mut().find(|a| a.name.to_lowercase() == key) {
+                        // A real .lnk beats the AppsFolder twin for icon/launch.
+                        if existing.path.starts_with("aumid:") {
+                            existing.path = path.to_string_lossy().to_string();
+                        }
+                        continue;
+                    }
+                    if seen.insert(key) {
+                        out.push(AppEntry {
+                            name,
+                            path: path.to_string_lossy().to_string(),
+                        });
+                    }
                 }
             }
         }

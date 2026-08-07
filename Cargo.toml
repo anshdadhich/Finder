@@ -35,9 +35,11 @@ windows = { version = "0.60", features = [
     "Win32_UI_Input",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Diagnostics_Debug",
-    "Win32_System_Registry"
+    "Win32_System_Registry",
+    "Win32_System_Com"
 ] }
 rayon = "1.10"
 crossbeam-channel = "0.5"

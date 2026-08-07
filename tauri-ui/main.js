@@ -8,10 +8,15 @@ const resultsEl = document.querySelector("#results");
 
 let items = [];
 let selected = 0;
-let timer = 0;
-let userInteracted = false;
+let debounceTimer = 0;
+let searchSeq = 0;
 
 const iconCache = new Map();
+let rowEls = [];
+
+const MAX_APPS = 10;
+const MAX_DIRS = 8;
+const MAX_FILES = 24;
 
 if (!invoke) {
   statusEl.textContent = "Tauri API unavailable. Rebuild and restart the app.";
@@ -24,21 +29,21 @@ async function refreshStatus() {
     const message = status.message || (status.ready ? "Ready" : "Indexing...");
     statusText.textContent = status.ready ? "" : message;
     progressFill.style.width = status.ready ? "100%" : `${18 + (Date.now() / 80) % 72}%`;
-    statusEl.style.display = input.value && items.length ? "none" : "block";
   } catch (error) {
     statusEl.textContent = `Backend unavailable: ${error}`;
-    statusEl.style.display = "block";
   }
 }
 
 async function runSearch() {
   if (!invoke) return;
   const query = input.value.trim();
+  const seq = ++searchSeq;
   if (!query) {
-    items = [];
+    const apps = await invoke("search_apps", { query });
+    if (seq !== searchSeq) return;
+    items = apps.slice(0, MAX_APPS);
     selected = 0;
     render();
-    await refreshStatus();
     return;
   }
 
@@ -46,14 +51,18 @@ async function runSearch() {
     invoke("search_apps", { query }),
     invoke("search_files", { query }),
   ]);
-  items = [...apps, ...files];
+  if (seq !== searchSeq) return;
+  items = [...apps.slice(0, MAX_APPS)];
+  for (const f of files) {
+    items.push(f);
+  }
   selected = 0;
   render();
 }
 
 function scheduleSearch() {
-  clearTimeout(timer);
-  timer = setTimeout(runSearch, 10);
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(runSearch, 90);
 }
 
 function groupItems() {
@@ -67,67 +76,88 @@ function groupItems() {
   }
   const groups = [];
   if (apps.length) groups.push({ label: "Applications", rows: apps });
-  if (dirs.length) groups.push({ label: "Folders", rows: dirs });
-  if (files.length) groups.push({ label: "Files", rows: files });
+  if (dirs.length) groups.push({ label: "Folders", rows: dirs.slice(0, MAX_DIRS) });
+  if (files.length) groups.push({ label: "Files", rows: files.slice(0, MAX_FILES) });
   return groups;
 }
 
-function lazyIcon(row, item) {
-  const img = row.querySelector(".icon");
-  const key = (item.kind === "app" ? item.path : item.path).toLowerCase();
-  if (iconCache.has(key)) {
-    img.src = iconCache.get(key);
-    return;
+function requestIcons(rows) {
+  const wanted = [];
+  for (const item of rows) {
+    const key = item.path.toLowerCase();
+    if (!iconCache.has(key)) wanted.push(item.path);
   }
-  invoke("get_icon", { path: item.path }).then((uri) => {
-    if (uri) {
-      iconCache.set(key, uri);
-      if (img.isConnected) img.src = uri;
+  if (!wanted.length) return;
+  invoke("get_icons", { paths: wanted }).then((map) => {
+    if (!map) return;
+    for (const [path, uri] of Object.entries(map)) {
+      iconCache.set(path.toLowerCase(), uri);
+      const img = rowEls.find((el) => el && el.dataset.path === path)?.querySelector(".icon");
+      if (img) img.src = uri;
     }
-  });
+  }).catch(() => {});
 }
 
 function render() {
   resultsEl.innerHTML = "";
+  rowEls = [];
   const groups = groupItems();
-  statusEl.style.display = items.length || input.value ? "none" : "block";
+  statusEl.style.display = "none";
 
+  const fragment = document.createDocumentFragment();
   let flatIndex = 0;
+
   for (const group of groups) {
     const header = document.createElement("div");
     header.className = "group-label";
     header.textContent = group.label;
-    resultsEl.appendChild(header);
+    fragment.appendChild(header);
 
     for (const item of group.rows) {
       const row = document.createElement("div");
-      row.className = `result${flatIndex === selected ? " selected" : ""}`;
+      row.className = "result";
       row.dataset.index = flatIndex;
-      row.innerHTML = `
-        <img class="icon" alt="" />
-        <div>
-          <div class="name"></div>
-          <div class="path"></div>
-        </div>
-        <span class="badge">${item.kind === "app" ? "⌘" : item.kind === "dir" ? "DIR" : "FILE"}</span>
-      `;
-      row.querySelector(".name").textContent = item.name || item.path;
-      row.querySelector(".path").textContent = item.path;
-      lazyIcon(row, item);
-      row.addEventListener("mouseenter", () => {
-        selected = flatIndex;
-        render();
-      });
-      row.addEventListener("click", () => {
-        selected = flatIndex;
-        openSelected(false);
-      });
-      resultsEl.appendChild(row);
+      row.dataset.path = item.path;
+
+      const img = document.createElement("img");
+      img.className = "icon";
+      img.alt = "";
+      const iconKey = item.path.toLowerCase();
+      if (iconCache.has(iconKey)) img.src = iconCache.get(iconKey);
+
+      const text = document.createElement("div");
+      const name = document.createElement("div");
+      name.className = "name";
+      name.textContent = item.name || item.path;
+      const path = document.createElement("div");
+      path.className = "path";
+      path.textContent = item.kind === "app" ? "" : item.path;
+      text.appendChild(name);
+      text.appendChild(path);
+
+      row.appendChild(img);
+      row.appendChild(text);
+      fragment.appendChild(row);
+      rowEls[flatIndex] = row;
       flatIndex += 1;
     }
   }
 
-  resultsEl.scrollTop = 0;
+  resultsEl.appendChild(fragment);
+  requestIcons(items.slice(0, flatIndex));
+  updateSelection();
+}
+
+function updateSelection() {
+  for (let i = 0; i < rowEls.length; i++) {
+    const el = rowEls[i];
+    if (!el) continue;
+    el.classList.toggle("selected", i === selected);
+  }
+  const active = rowEls[selected];
+  if (active && active.scrollIntoView) {
+    active.scrollIntoView({ block: "nearest" });
+  }
 }
 
 async function openSelected(parent) {
@@ -154,9 +184,6 @@ async function openSelected(parent) {
 }
 
 input.addEventListener("input", scheduleSearch);
-input.addEventListener("focus", () => {
-  userInteracted = true;
-});
 
 window.addEventListener("keydown", async (event) => {
   if (event.key === "Escape") {
@@ -167,15 +194,19 @@ window.addEventListener("keydown", async (event) => {
 
   if (event.key === "ArrowDown") {
     event.preventDefault();
-    selected = Math.min(selected + 1, items.length - 1);
-    render();
+    if (selected < rowEls.length - 1) {
+      selected += 1;
+      updateSelection();
+    }
     return;
   }
 
   if (event.key === "ArrowUp") {
     event.preventDefault();
-    selected = Math.max(selected - 1, 0);
-    render();
+    if (selected > 0) {
+      selected -= 1;
+      updateSelection();
+    }
     return;
   }
 
@@ -191,12 +222,33 @@ window.addEventListener("keydown", async (event) => {
   }
 });
 
+resultsEl.addEventListener("mousemove", (event) => {
+  const row = event.target.closest(".result");
+  if (!row) return;
+  const idx = Number(row.dataset.index);
+  if (idx !== selected && Number.isInteger(idx)) {
+    selected = idx;
+    updateSelection();
+  }
+});
+
+resultsEl.addEventListener("click", (event) => {
+  const row = event.target.closest(".result");
+  if (!row) return;
+  selected = Number(row.dataset.index);
+  openSelected(event.ctrlKey);
+});
+
 window.addEventListener("focus", () => {
   input.focus();
   input.select();
   refreshStatus();
 });
 
-setInterval(refreshStatus, 1000);
+input.addEventListener("focus", () => {
+  if (!items.length) runSearch();
+});
+
+setInterval(refreshStatus, 1500);
 refreshStatus();
 input.focus();
