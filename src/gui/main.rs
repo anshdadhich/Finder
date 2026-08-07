@@ -36,8 +36,9 @@ use windows::Win32::UI::Shell::{
     Common::ITEMIDLIST, BHID_SFObject, BHID_SFUIObject, ILCombine, ILFree, IEnumIDList,
     IShellFolder, IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SHGetFileInfoW,
     SHGetNameFromIDList, SHParseDisplayName, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
-    SHGFI_USEFILEATTRIBUTES, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
+    SHGFI_PIDL, SHGFI_USEFILEATTRIBUTES, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
     SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    SHGSI_ICON, SHGSI_LARGEICON, SHGetStockIconInfo, SIID_APPLICATION, SHSTOCKICONINFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
@@ -64,6 +65,7 @@ struct AppState {
 struct AppEntry {
     name: String,
     path: String,
+    icon: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -212,10 +214,73 @@ fn get_icons(paths: Vec<String>, state: tauri::State<AppState>) -> HashMap<Strin
 }
 
 fn get_icon_data_uri(path: &str) -> Option<String> {
-    if let Some(rest) = path.strip_prefix("aumid:") {
-        return aumid_icon_data_uri(rest);
+    // Shell icon handlers require an STA thread with COM initialized.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
-    extract_icon_data_uri(path)
+
+    let uri = if let Some(rest) = path.strip_prefix("aumid:") {
+        aumid_icon_data_uri(rest).or_else(generic_icon_data_uri)
+    } else if path.starts_with("ms-") {
+        uri_icon_data_uri(path).or_else(generic_icon_data_uri)
+    } else {
+        extract_icon_data_uri(path).or_else(generic_icon_data_uri)
+    };
+    if uri.is_none() {
+        eprintln!("[icon] no icon for {}", path);
+    }
+    uri
+}
+
+/// Map known URI schemes to a real app icon.
+fn uri_icon_data_uri(uri: &str) -> Option<String> {
+    if uri.starts_with("ms-settings") {
+        return aumid_icon_data_uri(
+            "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel",
+        );
+    }
+    None
+}
+
+/// Fallback application icon so no row ever renders blank. Uses the shell's
+/// stock APPLICATION icon — never a blank document glyph.
+fn generic_icon_data_uri() -> Option<String> {
+    use std::sync::OnceLock;
+    static GENERIC: OnceLock<Option<String>> = OnceLock::new();
+    GENERIC
+        .get_or_init(|| {
+            unsafe {
+                let mut info: SHSTOCKICONINFO = std::mem::zeroed();
+                info.cbSize = size_of::<SHSTOCKICONINFO>() as u32;
+                if SHGetStockIconInfo(
+                    SIID_APPLICATION,
+                    SHGSI_ICON | SHGSI_LARGEICON,
+                    &mut info,
+                )
+                .is_ok()
+                    && !info.hIcon.is_invalid()
+                {
+                    if let Some(png) = icon_to_png(info.hIcon) {
+                        let _ = DestroyIcon(info.hIcon);
+                        return Some(format!(
+                            "data:image/png;base64,{}",
+                            B64.encode(&png)
+                        ));
+                    }
+                    let _ = DestroyIcon(info.hIcon);
+                }
+            }
+            for candidate in [
+                "C:\\Windows\\System32\\shell32.dll,3",
+                "C:\\Windows\\System32\\shell32.dll,220",
+            ] {
+                if let Some(uri) = extract_icon_data_uri(candidate) {
+                    return Some(uri);
+                }
+            }
+            None
+        })
+        .clone()
 }
 
 fn extract_icon_data_uri(path: &str) -> Option<String> {
@@ -288,29 +353,55 @@ fn icon_to_png(icon: HICON) -> Option<Vec<u8>> {
 }
 
 fn aumid_icon_data_uri(aumid: &str) -> Option<String> {
+    // SHGetFileInfoW resolves shell:AppsFolder\<AUMID> to the app's icon.
+    // NOTE: SHGFI_USEFILEATTRIBUTES must NOT be used here — it skips namespace
+    // resolution and returns a generic blank document icon for EVERY entry.
     let mut wide = "shell:appsFolder\\".encode_utf16().collect::<Vec<u16>>();
     wide.extend(aumid.encode_utf16());
     wide.push(0);
     unsafe {
-        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
-        let factory: IShellItemImageFactory = item
-            .BindToHandler(None, &BHID_SFUIObject)
-            .ok()?;
-        for size in [64, 32] {
-            let sb = SIZE { cx: size, cy: size };
-            if let Ok(hbmp) = factory.GetImage(sb, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK) {
-                if let Some(png) = hbitmap_to_png(hbmp) {
-                    let _ = DeleteObject(HGDIOBJ(hbmp.0));
-                    return Some(format!(
-                        "data:image/png;base64,{}",
-                        B64.encode(&png)
-                    ));
-                }
-                let _ = DeleteObject(HGDIOBJ(hbmp.0));
-            }
+        let mut sfi: SHFILEINFOW = std::mem::zeroed();
+        SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            FILE_ATTRIBUTE_NORMAL,
+            Some(&mut sfi),
+            size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        );
+        if sfi.hIcon.is_invalid() {
+            return None;
         }
+        let png = icon_to_png(sfi.hIcon)?;
+        let _ = DestroyIcon(sfi.hIcon);
+        Some(format!("data:image/png;base64,{}", B64.encode(&png)))
     }
-    None
+}
+
+/// Extract the real per-item icon using the item's absolute PIDL. This is the
+/// reliable way for AppsFolder (Store/UWP) entries: SHGetFileInfoW with
+/// SHGFI_PIDL resolves the actual shell item (not a file-type guess), and it
+/// avoids both the BindToHandler E_NOINTERFACE and the USEFILEATTRIBUTES
+/// "every icon looks like a document" problems.
+fn pidl_icon_data_uri(pidl: *mut ITEMIDLIST) -> Option<String> {
+    if pidl.is_null() {
+        return None;
+    }
+    unsafe {
+        let mut sfi: SHFILEINFOW = std::mem::zeroed();
+        let res = SHGetFileInfoW(
+            PCWSTR(pidl as *const u16),
+            FILE_ATTRIBUTE_NORMAL,
+            Some(&mut sfi),
+            size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON | SHGFI_PIDL,
+        );
+        if res == 0 || sfi.hIcon.is_invalid() {
+            return None;
+        }
+        let png = icon_to_png(sfi.hIcon)?;
+        let _ = DestroyIcon(sfi.hIcon);
+        Some(format!("data:image/png;base64,{}", B64.encode(&png)))
+    }
 }
 
 fn hbitmap_to_png(hbm: HBITMAP) -> Option<Vec<u8>> {
@@ -422,6 +513,7 @@ fn apps_from_shell() -> Vec<AppEntry> {
             let full = ILCombine(Some(abs_pidl), Some(pidl));
             let mut name = String::new();
             let mut parsing = String::new();
+            let mut icon = None;
             if !full.is_null() {
                 if let Ok(pw) = SHGetNameFromIDList(full, SIGDN_NORMALDISPLAY) {
                     name = pw.to_string().unwrap_or_default();
@@ -431,6 +523,7 @@ fn apps_from_shell() -> Vec<AppEntry> {
                     parsing = pw.to_string().unwrap_or_default();
                     CoTaskMemFree(Some(pw.0 as *const c_void));
                 }
+                icon = pidl_icon_data_uri(full);
                 let _ = ILFree(Some(full));
             }
             let _ = ILFree(Some(pidl));
@@ -444,6 +537,7 @@ fn apps_from_shell() -> Vec<AppEntry> {
                 out.push(AppEntry {
                     name,
                     path: format!("aumid:{}", aumid),
+                    icon,
                 });
             }
         }
@@ -517,10 +611,32 @@ fn looks_like_url(value: &str) -> bool {
 fn main() {
     if std::env::args().any(|a| a == "--dump-apps") {
         let apps = discover_apps();
-        println!("total={}", apps.len());
+        let mut real = 0usize;
+        let mut generic = 0usize;
+        print!("total={}\n", apps.len());
         for app in &apps {
-            println!("{}\t{}", app.name, app.path);
+            let primary = app.icon.clone().or_else(|| {
+                if app.path.starts_with("aumid:") {
+                    None
+                } else if app.path.starts_with("ms-") {
+                    uri_icon_data_uri(&app.path)
+                } else {
+                    extract_icon_data_uri(&app.path)
+                }
+            });
+            if primary.is_some() {
+                real += 1;
+            } else {
+                generic += 1;
+            }
+            print!(
+                "{}\t{}\t{}\n",
+                app.name,
+                app.path,
+                if primary.is_some() { "REAL" } else { "GENERIC" }
+            );
         }
+        eprintln!("[icon] REAL={} GENERIC={}", real, generic);
         std::process::exit(0);
     }
 
@@ -530,6 +646,14 @@ fn main() {
     let live_checkpoints: Arc<Mutex<Vec<JournalCheckpoint>>> = Arc::new(Mutex::new(Vec::new()));
     let apps = Arc::new(discover_apps());
     let icon_cache = Arc::new(Mutex::new(HashMap::new()));
+    {
+        let mut cache = icon_cache.lock();
+        for app in apps.iter() {
+            if let Some(ic) = &app.icon {
+                cache.insert(app.path.to_lowercase(), ic.clone());
+            }
+        }
+    }
 
     let state = AppState {
         index: Arc::clone(&index),
@@ -706,6 +830,7 @@ fn discover_apps() -> Vec<AppEntry> {
                 apps.push(AppEntry {
                     name: app.name,
                     path,
+                    icon: None,
                 });
             }
         }
@@ -761,6 +886,7 @@ fn discover_apps() -> Vec<AppEntry> {
             apps.push(AppEntry {
                 name,
                 path: target,
+                icon: None,
             });
         }
     }
@@ -909,6 +1035,7 @@ fn collect_shortcuts(dir: &str, out: &mut Vec<AppEntry>, seen: &mut std::collect
                             out.push(AppEntry {
                                 name,
                                 path: path.to_string_lossy().to_string(),
+                                icon: None,
                             });
                         }
                     }
