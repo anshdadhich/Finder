@@ -29,11 +29,14 @@ use windows::Win32::Graphics::Gdi::{
     HGDIOBJ, HBITMAP,
 };
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{
+    CoInitializeEx, CoTaskMemFree, IBindCtx, COINIT_APARTMENTTHREADED,
+};
 use windows::Win32::UI::Shell::{
-    Common::ITEMIDLIST, BHID_SFObject, BHID_SFUIObject, ILFree, IEnumIDList, IShellFolder, IShellItem,
-    IShellItemImageFactory, SHCreateItemFromParsingName, SHGetFileInfoW, SHGetNameFromIDList, SHFILEINFOW,
-    SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES, SHCONTF_FOLDERS, SHCONTF_NONFOLDERS,
+    Common::ITEMIDLIST, BHID_SFObject, BHID_SFUIObject, ILCombine, ILFree, IEnumIDList,
+    IShellFolder, IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SHGetFileInfoW,
+    SHGetNameFromIDList, SHParseDisplayName, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
+    SHGFI_USEFILEATTRIBUTES, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
     SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
@@ -216,6 +219,15 @@ fn get_icon_data_uri(path: &str) -> Option<String> {
 }
 
 fn extract_icon_data_uri(path: &str) -> Option<String> {
+    // Prefer the shell item image factory: cleaner, higher-res, no shortcut
+    // arrow overlay for .lnk, real app icon for .exe.
+    if let Some(uri) = shellitem_icon_data_uri(path, 64) {
+        return Some(uri);
+    }
+    if let Some(uri) = shellitem_icon_data_uri(path, 32) {
+        return Some(uri);
+    }
+
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     let mut sfi: SHFILEINFOW = unsafe { std::mem::zeroed() };
 
@@ -245,6 +257,23 @@ fn extract_icon_data_uri(path: &str) -> Option<String> {
     }
 }
 
+fn shellitem_icon_data_uri(path: &str, size: i32) -> Option<String> {
+    let wide = utf16_null(path);
+    unsafe {
+        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+        let factory: IShellItemImageFactory = item
+            .BindToHandler(None, &BHID_SFUIObject)
+            .ok()?;
+        let sb = SIZE { cx: size, cy: size };
+        let hbmp = factory
+            .GetImage(sb, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
+            .ok()?;
+        let png = hbitmap_to_png(hbmp)?;
+        let _ = DeleteObject(HGDIOBJ(hbmp.0));
+        Some(format!("data:image/png;base64,{}", B64.encode(&png)))
+    }
+}
+
 fn icon_to_png(icon: HICON) -> Option<Vec<u8>> {
     unsafe {
         let mut info: ICONINFO = std::mem::zeroed();
@@ -267,7 +296,7 @@ fn aumid_icon_data_uri(aumid: &str) -> Option<String> {
         let factory: IShellItemImageFactory = item
             .BindToHandler(None, &BHID_SFUIObject)
             .ok()?;
-        let size = SIZE { cx: 32, cy: 32 };
+        let size = SIZE { cx: 64, cy: 64 };
         let hbmp = factory
             .GetImage(size, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
             .ok()?;
@@ -351,10 +380,33 @@ fn apps_from_shell() -> Vec<AppEntry> {
         let Ok(folder) = item.BindToHandler::<_, IShellFolder>(None, &BHID_SFObject) else {
             return out;
         };
+
+        // Absolute pidl of shell:AppsFolder — child pidls from EnumObjects are
+        // relative, but SHGetNameFromIDList requires an absolute one.
+        let mut abs_pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        if SHParseDisplayName::<_, Option<&IBindCtx>>(
+            PCWSTR(w.as_ptr()),
+            None,
+            &mut abs_pidl,
+            0,
+            None,
+        )
+        .is_err()
+            || abs_pidl.is_null()
+        {
+            return out;
+        }
+
         let mut enums: Option<IEnumIDList> = None;
-        let flags = (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0) as u32;
-        let _ = folder.EnumObjects(HWND(std::ptr::null_mut()), flags, &mut enums);
-        let Some(ids) = enums else { return out };
+        let flags = (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0 | SHCONTF_INCLUDEHIDDEN.0) as u32;
+        if folder.EnumObjects(HWND(std::ptr::null_mut()), flags, &mut enums).is_err() {
+            let _ = ILFree(Some(abs_pidl));
+            return out;
+        }
+        let Some(ids) = enums else {
+            let _ = ILFree(Some(abs_pidl));
+            return out;
+        };
         loop {
             let mut pidls = [std::ptr::null_mut::<ITEMIDLIST>()];
             let mut fetched = 0u32;
@@ -363,23 +415,27 @@ fn apps_from_shell() -> Vec<AppEntry> {
                 break;
             }
             let pidl = pidls[0];
+            let full = ILCombine(Some(abs_pidl), Some(pidl));
             let mut name = String::new();
-            let mut aumid = String::new();
-            if let Ok(pw) = SHGetNameFromIDList(pidl, SIGDN_NORMALDISPLAY) {
-                name = pw.to_string().unwrap_or_default();
-                CoTaskMemFree(Some(pw.0 as *const c_void));
+            let mut parsing = String::new();
+            if !full.is_null() {
+                if let Ok(pw) = SHGetNameFromIDList(full, SIGDN_NORMALDISPLAY) {
+                    name = pw.to_string().unwrap_or_default();
+                    CoTaskMemFree(Some(pw.0 as *const c_void));
+                }
+                if let Ok(pw) = SHGetNameFromIDList(full, SIGDN_DESKTOPABSOLUTEPARSING) {
+                    parsing = pw.to_string().unwrap_or_default();
+                    CoTaskMemFree(Some(pw.0 as *const c_void));
+                }
+                let _ = ILFree(Some(full));
             }
-            if let Ok(pw) = SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEPARSING) {
-                aumid = pw.to_string().unwrap_or_default();
-                CoTaskMemFree(Some(pw.0 as *const c_void));
-            }
-            ILFree(Some(pidl));
-            if !name.is_empty() && !aumid.is_empty() {
-                let aumid = aumid
+            let _ = ILFree(Some(pidl));
+            if !name.is_empty() && !parsing.is_empty() {
+                let aumid = parsing
                     .strip_prefix("shell:appsFolder\\")
-                    .or_else(|| aumid.strip_prefix("shell:APPSFOLDER\\"))
-                    .or_else(|| aumid.strip_prefix("shell:AppsFolder\\"))
-                    .unwrap_or(&aumid)
+                    .or_else(|| parsing.strip_prefix("shell:APPSFOLDER\\"))
+                    .or_else(|| parsing.strip_prefix("shell:AppsFolder\\"))
+                    .unwrap_or(&parsing)
                     .to_string();
                 out.push(AppEntry {
                     name,
@@ -387,6 +443,7 @@ fn apps_from_shell() -> Vec<AppEntry> {
                 });
             }
         }
+        let _ = ILFree(Some(abs_pidl));
     }
     out
 }
@@ -454,6 +511,15 @@ fn looks_like_url(value: &str) -> bool {
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--dump-apps") {
+        let apps = discover_apps();
+        println!("total={}", apps.len());
+        for app in &apps {
+            println!("{}\t{}", app.name, app.path);
+        }
+        std::process::exit(0);
+    }
+
     let index = Arc::new(RwLock::new(IndexStore::new()));
     let ready = Arc::new(AtomicBool::new(false));
     let status = Arc::new(RwLock::new(String::from("Starting...")));
@@ -594,7 +660,7 @@ fn discover_apps() -> Vec<AppEntry> {
 
     // Store / UWP apps from the Shell AppsFolder (comes with real icons).
     for app in apps_from_shell() {
-        let key = app.name.to_lowercase();
+        let key = norm_app_name(&app.name);
         if seen.insert(key) {
             apps.push(app);
         }
@@ -627,7 +693,7 @@ fn discover_apps() -> Vec<AppEntry> {
     // fallback, the first .exe under InstallLocation. This surfaces installed
     // apps that have no Start Menu shortcut or Store entry.
     for app in unsafe { fastsearch::index::apps::get_installed_apps() } {
-        let key = app.name.to_lowercase();
+        let key = norm_app_name(&app.name);
         if seen.contains(&key) {
             continue;
         }
@@ -680,7 +746,7 @@ fn discover_apps() -> Vec<AppEntry> {
         ("Windows Explorer".to_string(), format!(r"{}\explorer.exe", sys32)),
     ];
     for (name, target) in sys_tools {
-        let key = name.to_lowercase();
+        let key = norm_app_name(&name);
         if seen.contains(&key) {
             continue;
         }
@@ -831,24 +897,34 @@ fn collect_shortcuts(dir: &str, out: &mut Vec<AppEntry>, seen: &mut std::collect
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                 let name = stem.trim().to_string();
                 if !name.is_empty() {
-                    let key = name.to_lowercase();
-                    if let Some(existing) = out.iter_mut().find(|a| a.name.to_lowercase() == key) {
-                        // A real .lnk beats the AppsFolder twin for icon/launch.
-                        if existing.path.starts_with("aumid:") {
-                            existing.path = path.to_string_lossy().to_string();
+                    let key = norm_app_name(&name);
+                    // Never replace a packaged AUMID entry with a shortcut —
+                    // the AUMID copy has the real app identity/icon.
+                    if !out.iter().any(|a| norm_app_name(&a.name) == key) {
+                        if seen.insert(key) {
+                            out.push(AppEntry {
+                                name,
+                                path: path.to_string_lossy().to_string(),
+                            });
                         }
-                        continue;
-                    }
-                    if seen.insert(key) {
-                        out.push(AppEntry {
-                            name,
-                            path: path.to_string_lossy().to_string(),
-                        });
                     }
                 }
             }
         }
     }
+}
+
+/// Normalized key for dedupe: lowercase alphanumerics only, so "SnippingTool"
+/// and "Snipping Tool" collapse to the same app (packaged twin wins, since
+/// shell:AppsFolder runs first).
+fn norm_app_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    out
 }
 
 fn find_exe(dir: &Path, app_name: &str) -> Option<std::path::PathBuf> {
