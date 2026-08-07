@@ -1188,9 +1188,12 @@ fn start_backend(
             });
         }
 
-        for event in rx {
+        for event in &rx {
+            let mut batch = Vec::with_capacity(64);
+            batch.push(event);
+            batch.extend(rx.try_iter());
             let mut store = index.write();
-            apply_event(&mut store, event);
+            store.apply_events(batch);
         }
     });
 }
@@ -1246,9 +1249,8 @@ fn load_cache_and_catch_up(
 
             drop(delta_tx);
             let mut store = index.write();
-            for event in delta_rx {
-                apply_event(&mut store, event);
-            }
+            let events: Vec<IndexEvent> = delta_rx.try_iter().collect();
+            store.apply_events(events);
             true
         }
         None => {
@@ -1348,22 +1350,5 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             let _ = std::fs::remove_file(path);
             std::fs::rename(&tmp, path)
         }
-    }
-}
-
-fn apply_event(store: &mut IndexStore, event: IndexEvent) {
-    match event {
-        IndexEvent::Created(r) => store.insert(r),
-        IndexEvent::Deleted(id) => store.remove(id),
-        IndexEvent::Renamed {
-            old_ref,
-            new_record,
-        } => store.rename(old_ref, new_record),
-        IndexEvent::Moved {
-            file_ref,
-            new_parent_ref,
-            name,
-            kind,
-        } => store.apply_move(file_ref, new_parent_ref, name, kind),
     }
 }

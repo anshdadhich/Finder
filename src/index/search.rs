@@ -1,6 +1,6 @@
 use rayon::prelude::*;
 use crate::index::store::IndexStore;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, BinaryHeap};
 
 const APP_EXTENSIONS: &[&str] = &["exe", "lnk", "msi", "appx", "msix"];
 const APP_PATH_MARKERS: &[&str] = &[
@@ -154,32 +154,112 @@ pub fn search(
     let q = if case_sensitive { query.to_string() } else { query.to_lowercase() };
 
     // ── Phase 1: lightweight name-only matching ──────────────────────────
+    // `entries` are kept sorted by lowercase name (see IndexStore::finalize /
+    // insert / apply_events), so every exact/prefix match forms one
+    // contiguous run. Find it with two binary searches and skip the
+    // full-index scan whenever it already covers the overshoot budget.
     let entries = &store.entries;
     let name_lower_arena = &store.name_lower_arena;
     let name_arena = &store.name_arena;
 
-    let mut candidates: Vec<(u32, u8)> = entries
-        .par_iter()
-        .enumerate()
-        .filter_map(|(idx, entry)| {
-            let name_cmp = if case_sensitive {
-                unsafe { std::str::from_utf8_unchecked(&name_arena[entry.name_off as usize..(entry.name_off as usize + entry.name_len as usize)]) }
-            } else {
-                unsafe { std::str::from_utf8_unchecked(&name_lower_arena[entry.name_lower_off as usize..(entry.name_lower_off as usize + entry.name_lower_len as usize)]) }
-            };
-
-            let rank = if name_cmp == q { 1u8 }
-                else if name_cmp.starts_with(&q) { 2 }
-                else if name_cmp.contains(q.as_str()) { 3 }
-                else { return None; };
-
-            Some((idx as u32, rank))
-        })
-        .collect();
-
-    // ── Phase 2: sort by rank, keep overshoot buffer ─────────────────
-    candidates.sort_unstable_by_key(|&(_, rank)| rank);
     let overshoot = (limit * 5).max(1000);
+    let mut candidates: Vec<(u32, u8)>;
+
+    if !case_sensitive {
+        let start = entries.partition_point(|e| store.name_lower(e) < q.as_str());
+        // From `start` onward, `starts_with(q)` is monotone (false,true,false
+        // before it is impossible), so partition the suffix to find the run end.
+        let run_len = entries[start..]
+            .partition_point(|e| store.name_lower(e).starts_with(q.as_str()));
+        let end = start + run_len;
+        let run = &entries[start..end];
+
+        candidates = Vec::with_capacity(overshoot.min(run.len()));
+        for (i, e) in run.iter().enumerate() {
+            if store.name_lower(e) == q {
+                candidates.push(((start + i) as u32, 1));
+            }
+        }
+        if candidates.len() < overshoot {
+            for (i, e) in run.iter().enumerate() {
+                if candidates.len() >= overshoot {
+                    break;
+                }
+                if store.name_lower(e) != q {
+                    candidates.push(((start + i) as u32, 2));
+                }
+            }
+        }
+
+        if candidates.len() < overshoot {
+            // Not enough prefix matches: top up with the best rank-3
+            // (contains) matches, kept in a bounded heap so short queries
+            // cannot materialize the full match list for the whole index.
+            let need = overshoot - candidates.len();
+            let rank3: Vec<(u8, u32)> = entries
+                .par_iter()
+                .enumerate()
+                .filter_map(|(idx, entry)| {
+                    let name_cmp = unsafe {
+                        std::str::from_utf8_unchecked(
+                            &name_lower_arena[entry.name_lower_off as usize
+                                ..(entry.name_lower_off as usize + entry.name_lower_len as usize)],
+                        )
+                    };
+                    if !name_cmp.starts_with(q.as_str()) && name_cmp.contains(q.as_str()) {
+                        Some((3u8, idx as u32))
+                    } else {
+                        None
+                    }
+                })
+                .fold(
+                    BinaryHeap::<(u8, u32)>::new,
+                    |mut heap, cand| {
+                        if heap.len() < need {
+                            heap.push(cand);
+                        } else if cand < *heap.peek().unwrap() {
+                            heap.pop();
+                            heap.push(cand);
+                        }
+                        heap
+                    },
+                )
+                .reduce(BinaryHeap::<(u8, u32)>::new, |mut a, b| {
+                    for cand in b {
+                        if a.len() < need {
+                            a.push(cand);
+                        } else if cand < *a.peek().unwrap() {
+                            a.pop();
+                            a.push(cand);
+                        }
+                    }
+                    a
+                })
+                .into_sorted_vec();
+            candidates.extend(rank3.into_iter().map(|(r, i)| (i, r)));
+        }
+    } else {
+        // Case-sensitive: sorted-name invariant doesn't help — full scan.
+        candidates = entries
+            .par_iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| {
+                let name_cmp = unsafe {
+                    std::str::from_utf8_unchecked(
+                        &name_arena[entry.name_off as usize..(entry.name_off as usize + entry.name_len as usize)]
+                    )
+                };
+
+                let rank = if name_cmp == q { 1u8 }
+                    else if name_cmp.starts_with(&q) { 2 }
+                    else if name_cmp.contains(q.as_str()) { 3 }
+                    else { return None; };
+
+                Some((idx as u32, rank))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|&(_, rank)| rank);
+    }
     candidates.truncate(overshoot);
 
     // ── Phase 3: build paths + exclusions + app promotion ────────────
@@ -194,7 +274,6 @@ pub fn search(
         }
 
         if !excluded_dirs.is_empty() {
-            let path_lower = full_path.to_string_lossy().to_lowercase();
             if excluded_dirs.iter().any(|ex| path_lower.starts_with(ex.as_str())) {
                 continue;
             }
@@ -322,6 +401,17 @@ mod tests {
             });
             s.ref_lookup.push((fr, i as u32));
         }
+        // Keep the same sorted-by-lowercase-name invariant the production
+        // store maintains (finalize / insert / apply_events).
+        let store_ptr = &s as *const IndexStore;
+        s.entries.sort_unstable_by(|a, b| {
+            let st = unsafe { &*store_ptr };
+            st.name_lower(a).cmp(st.name_lower(b))
+        });
+        s.ref_lookup.clear();
+        for (i, e) in s.entries.iter().enumerate() {
+            s.ref_lookup.push((e.file_ref, i as u32));
+        }
         s.ref_lookup.sort_unstable_by_key(|&(r, _)| r);
         s
     }
@@ -345,5 +435,66 @@ mod tests {
         assert_eq!(names[1], "report.txt");   // prefix match, root-level (shorter name)
         assert_eq!(names[2], "report_final.docx"); // boundary beat mid-word
         assert_eq!(names[3], "deptreport.pdf");
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_large_index() {
+        // Synthetic ~300k-entry index. Run with:
+        //   cargo test --lib perf_large_index -- --ignored --nocapture
+        use std::time::Instant;
+
+        let n = 300_000u32;
+        let mut s = IndexStore {
+            entries: Vec::new(),
+            name_arena: Vec::new(),
+            name_lower_arena: Vec::new(),
+            ref_lookup: Vec::new(),
+            drive_root: "C:\\".to_string(),
+            checkpoints: Vec::new(),
+        };
+        let base = 100u64;
+        for i in 0..n {
+            let stem = match i % 6 {
+                0 => "report",
+                1 => "desktop",
+                2 => "chrome",
+                3 => "asset_v2",
+                _ => "notes",
+            };
+            let dir = match i % 3 {
+                0 => "folder_a",
+                1 => "folder_b",
+                _ => "downloads",
+            };
+            let name = format!("{}_{}_{}.txt", stem, dir, i);
+            let lower = name.to_lowercase();
+            let n_off = s.name_arena.len() as u32;
+            let nl_off = s.name_lower_arena.len() as u32;
+            s.name_arena.extend_from_slice(name.as_bytes());
+            s.name_lower_arena.extend_from_slice(lower.as_bytes());
+            s.entries.push(IndexEntry {
+                file_ref: base + i as u64,
+                parent_ref: base,
+                name_off: n_off,
+                name_lower_off: nl_off,
+                name_len: name.len() as u16,
+                name_lower_len: lower.len() as u16,
+                flags: 0,
+            });
+        }
+        s.finalize();
+
+        let mut total_ms = 0.0f64;
+        for q in ["report", "desktop", "chrome", "notes", "asset", "zzzz"] {
+            let t0 = Instant::now();
+            let res = search(&s, q, 300, false, &[]);
+            let dt = t0.elapsed().as_secs_f64() * 1000.0;
+            total_ms += dt;
+            println!("query={:?} hits={} took {:.2}ms", q, res.len(), dt);
+        }
+        let avg = total_ms / 6.0;
+        println!("avg {:.2}ms over 6 queries (300k entries)", avg);
+        assert!(avg < 50.0, "search slower than expected: {:.1}ms avg", avg);
     }
 }

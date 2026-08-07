@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use serde::{Serialize, Deserialize};
-use crate::mft::types::{FileKind, FileRecord, JournalCheckpoint};
+use crate::mft::types::{FileKind, FileRecord, IndexEvent, JournalCheckpoint};
 use crate::mft::reader::ScanResult;
 
 // ── Cache format (disk) ──────────────────────────────────────────────
@@ -211,7 +211,8 @@ impl IndexStore {
 
     // ── Live mutations ───────────────────────────────────────────────
 
-    pub fn insert(&mut self, record: FileRecord) {
+    /// Append a record to the arenas and build its compact entry.
+    fn arena_entry(&mut self, record: &FileRecord) -> IndexEntry {
         let name_lower = record.name.to_lowercase();
 
         let n_off = self.name_arena.len() as u32;
@@ -227,7 +228,7 @@ impl IndexStore {
             FileKind::File => 0u8,
         };
 
-        let entry = IndexEntry {
+        IndexEntry {
             file_ref: record.file_ref,
             parent_ref: record.parent_ref,
             name_off: n_off,
@@ -235,13 +236,17 @@ impl IndexStore {
             name_len: n_len,
             name_lower_len: nl_len,
             flags,
-        };
+        }
+    }
 
+    pub fn insert(&mut self, record: FileRecord) {
+        let name_lower = record.name.to_lowercase();
         let store_ptr = self as *const IndexStore;
         let pos = self.entries.partition_point(|e| {
             let s = unsafe { &*store_ptr };
             s.name_lower(e) < name_lower.as_str()
         });
+        let entry = self.arena_entry(&record);
         self.entries.insert(pos, entry);
         self.rebuild_ref_lookup();
     }
@@ -260,6 +265,56 @@ impl IndexStore {
     pub fn apply_move(&mut self, file_ref: u64, new_parent_ref: u64, name: String, kind: FileKind) {
         self.remove(file_ref);
         self.insert(FileRecord { file_ref, parent_ref: new_parent_ref, name, kind });
+    }
+
+    /// Apply a batch of journal events under a single lock acquisition:
+    /// all mutations run first, then sorted-name order and ref_lookup are
+    /// restored once (instead of once per event).
+    pub fn apply_events(&mut self, events: Vec<IndexEvent>) {
+        if events.is_empty() {
+            return;
+        }
+
+        let mut pending: Vec<FileRecord> = Vec::with_capacity(events.len());
+        let mut removed = false;
+
+        for event in events {
+            match event {
+                IndexEvent::Created(r) => pending.push(r),
+                IndexEvent::Deleted(id) => {
+                    let before = self.entries.len();
+                    self.entries.retain(|e| e.file_ref != id);
+                    removed |= self.entries.len() != before;
+                }
+                IndexEvent::Renamed { old_ref, new_record } => {
+                    self.entries.retain(|e| e.file_ref != old_ref);
+                    pending.push(new_record);
+                }
+                IndexEvent::Moved { file_ref, new_parent_ref, name, kind } => {
+                    self.entries.retain(|e| e.file_ref != file_ref);
+                    pending.push(FileRecord { file_ref, parent_ref: new_parent_ref, name, kind });
+                }
+            }
+        }
+
+        if pending.is_empty() {
+            if removed {
+                self.rebuild_ref_lookup();
+            }
+            return;
+        }
+
+        self.entries.reserve(pending.len());
+        for record in &pending {
+            let entry = self.arena_entry(record);
+            self.entries.push(entry);
+        }
+        let store_ptr = self as *const IndexStore;
+        self.entries.sort_unstable_by(|a, b| {
+            let s = unsafe { &*store_ptr };
+            s.name_lower(a).cmp(s.name_lower(b))
+        });
+        self.rebuild_ref_lookup();
     }
 
     pub fn len(&self) -> usize {
