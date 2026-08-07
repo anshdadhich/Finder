@@ -38,9 +38,11 @@
     "windows": [
       {
         "title": "FastSeek",
-        "width": 900,
-        "height": 600,
-        "center": true,
+        "width": 560,
+        "height": 520,
+        "center": false,
+        "x": 100,
+        "y": 80,
         "resizable": false,
         "fullscreen": false,
         "decorations": false,
