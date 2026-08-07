@@ -446,6 +446,8 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                             name: store.name(entry).to_string(),
                             rank: 0,
                             is_dir: matches!(entry.kind(), fastsearch::mft::types::FileKind::Directory),
+                            modified_time: None,
+                            file_type_priority: 0,
                         })
                     }).take(300).collect()
                 } else {
