@@ -14,7 +14,7 @@ let searchSeq = 0;
 const iconCache = new Map();
 let rowEls = [];
 
-const MAX_APPS = 10;
+const MAX_APPS = 16;
 const MAX_DIRS = 8;
 const MAX_FILES = 24;
 

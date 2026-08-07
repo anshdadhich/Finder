@@ -622,25 +622,199 @@ fn discover_apps() -> Vec<AppEntry> {
         collect_shortcuts(&root, &mut apps, &mut seen);
     }
 
-    // Registry install locations: find the first .exe and add as fallback
+    // Registry Uninstall entries: any app with a DisplayName is listed; the
+    // launch/icon path comes from DisplayIcon (e.g. "C:\app\app.exe,0") or, as a
+    // fallback, the first .exe under InstallLocation. This surfaces installed
+    // apps that have no Start Menu shortcut or Store entry.
     for app in unsafe { fastsearch::index::apps::get_installed_apps() } {
-        if let Some(loc) = app.install_location {
-            let loc_path = Path::new(&loc);
-            let exe = find_exe(loc_path, &app.name);
-            if let Some(exe) = exe {
-                let key = exe.to_string_lossy().to_lowercase();
-                if seen.insert(key) {
-                    apps.push(AppEntry {
-                        name: app.name,
-                        path: exe.to_string_lossy().to_string(),
-                    });
-                }
+        let key = app.name.to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        if let Some(path) = registry_app_path(&app) {
+            if seen.insert(key) {
+                apps.push(AppEntry {
+                    name: app.name,
+                    path,
+                });
             }
+        }
+    }
+
+    // Curated system tools (Settings, Control Panel, admin consoles, ...).
+    // Added last with the same name-dedupe, so they only fill names no other
+    // source already provided.
+    let app_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let sys32 = format!(r"{}\System32", app_root);
+    let sys_tools: Vec<(String, String)> = vec![
+        ("Settings".to_string(), "ms-settings:".to_string()),
+        (
+            "Control Panel".to_string(),
+            "shell:::{21EC2020-3AEA-1069-A2DD-08002B30309D}".to_string(),
+        ),
+        (
+            "Run".to_string(),
+            "shell:::{2559a1f3-21d7-11d4-bdaf-00c04f60b9f0}".to_string(),
+        ),
+        ("Task Manager".to_string(), format!(r"{}\Taskmgr.exe", sys32)),
+        ("Device Manager".to_string(), format!(r"{}\devmgmt.msc", sys32)),
+        ("Event Viewer".to_string(), format!(r"{}\eventvwr.msc", sys32)),
+        ("Disk Management".to_string(), format!(r"{}\diskmgmt.msc", sys32)),
+        (
+            "Computer Management".to_string(),
+            format!(r"{}\compmgmt.msc", sys32),
+        ),
+        (
+            "Programs and Features".to_string(),
+            format!(r"{}\appwiz.cpl", sys32),
+        ),
+        (
+            "Network Connections".to_string(),
+            format!(r"{}\ncpa.cpl", sys32),
+        ),
+        (
+            "System Properties".to_string(),
+            format!(r"{}\sysdm.cpl", sys32),
+        ),
+        ("Registry Editor".to_string(), format!(r"{}\regedit.exe", sys32)),
+        ("Windows Explorer".to_string(), format!(r"{}\explorer.exe", sys32)),
+    ];
+    for (name, target) in sys_tools {
+        let key = name.to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        let usable = target.starts_with("ms-settings:")
+            || target.starts_with("shell:::{")
+            || Path::new(&target).exists();
+        if usable && seen.insert(key) {
+            apps.push(AppEntry {
+                name,
+                path: target,
+            });
         }
     }
 
     apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     apps
+}
+/// (strip a trailing ",icon-index" and expand env vars; only .exe/.lnk count —
+/// for .ico/.dll icons we hunt for an .exe in the same folder instead), else
+/// InstallLocation.
+fn registry_app_path(app: &fastsearch::index::apps::InstalledApp) -> Option<String> {
+    if let Some(icon) = &app.icon {
+        let raw = icon.split(',').next().unwrap_or(icon).trim().trim_matches('"');
+        if !raw.is_empty() {
+            let expanded = expand_env(raw);
+            if !expanded.is_empty() {
+                let p = Path::new(&expanded);
+                if p.is_file() {
+                    let is_exe = p
+                        .extension()
+                        .map(|e| e.eq_ignore_ascii_case("exe") || e.eq_ignore_ascii_case("lnk"))
+                        .unwrap_or(false);
+                    if is_exe {
+                        return Some(expanded);
+                    }
+                    if let Some(dir) = p.parent() {
+                        if let Some(exe) = find_exe(dir, &app.name) {
+                            return Some(exe.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(loc) = &app.install_location {
+        let exe = find_exe(Path::new(loc), &app.name)?;
+        return Some(exe.to_string_lossy().to_string());
+    }
+    // Last resort: an .exe path found in the uninstall command lines of the
+    // executable (InnoSetup/NSIS installers record their uninstaller there).
+    for uninstall in [&app.uninstall_string, &app.quiet_uninstall_string] {
+        if let Some(u) = uninstall {
+            if let Some(exe) = exe_from_uninstall_string(u, &app.name) {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+/// Pull an existing `.exe` out of an UninstallString/QuietUninstallString.
+/// Skips msiexec and obvious uninstaller modules (hunts for the app exe beside
+/// those instead).
+fn exe_from_uninstall_string(uninstall: &str, app_name: &str) -> Option<String> {
+    let s = uninstall.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let low = s.to_lowercase();
+    if low.starts_with("msiexec") || low.starts_with("wmic") {
+        return None;
+    }
+    let token = if let Some(rest) = s.strip_prefix('"') {
+        rest.split('"').next().unwrap_or_default()
+    } else {
+        s.split_whitespace().next().unwrap_or_default()
+    };
+    if token.is_empty() {
+        return None;
+    }
+    let expanded = expand_env(token);
+    let p = Path::new(&expanded);
+    if !p.is_file()
+        || !p
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("exe"))
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    let stem_low = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if stem_low.contains("unins")
+        || stem_low.contains("uninst")
+        || stem_low.contains("uninstall")
+        || stem_low == "setup"
+        || stem_low == "install"
+    {
+        return p
+            .parent()
+            .and_then(|dir| find_exe(dir, app_name))
+            .map(|e| e.to_string_lossy().to_string());
+    }
+    Some(expanded)
+}
+
+/// Expand %VAR% tokens (e.g. %ProgramFiles%, %SystemRoot%) in a registry path.
+fn expand_env(s: &str) -> String {
+    let mut out = s.to_string();
+    loop {
+        let start = match out.find('%') {
+            Some(i) => i,
+            None => break,
+        };
+        let after = &out[start + 1..];
+        let end = match after.find('%') {
+            Some(i) => start + 1 + i,
+            None => break,
+        };
+        let var = &out[start + 1..end];
+        if var.is_empty() {
+            out.remove(start);
+            continue;
+        }
+        match std::env::var_os(var) {
+            Some(val) => out.replace_range(start..=end, &val.to_string_lossy()),
+            None => {
+                out.remove(start);
+            }
+        }
+    }
+    out
 }
 
 fn collect_shortcuts(dir: &str, out: &mut Vec<AppEntry>, seen: &mut std::collections::HashSet<String>) {

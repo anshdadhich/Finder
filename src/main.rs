@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use crossbeam_channel::unbounded;
 
 use fastsearch::index::store::IndexStore;
-use fastsearch::index::search::{search, apps};
+use fastsearch::index::search::search;
 use fastsearch::mft::reader::MftReader;
 use fastsearch::mft::watcher::UsnWatcher;
 use fastsearch::mft::types::IndexEvent;
