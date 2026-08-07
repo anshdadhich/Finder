@@ -10,6 +10,7 @@ let items = [];
 let selected = 0;
 let debounceTimer = 0;
 let searchSeq = 0;
+let lastSearchAt = 0;
 
 const iconCache = new Map();
 let rowEls = [];
@@ -17,6 +18,9 @@ let rowEls = [];
 const MAX_APPS = 16;
 const MAX_DIRS = 8;
 const MAX_FILES = 24;
+
+const SEARCH_GAP_MS = 120;
+const MIN_FILE_QUERY_LEN = 2;
 
 if (!invoke) {
   statusEl.textContent = "Tauri API unavailable. Rebuild and restart the app.";
@@ -38,22 +42,23 @@ async function runSearch() {
   if (!invoke) return;
   const query = input.value.trim();
   const seq = ++searchSeq;
-  if (!query) {
-    const apps = await invoke("search_apps", { query });
-    if (seq !== searchSeq) return;
-    items = apps.slice(0, MAX_APPS);
-    selected = 0;
-    render();
-    return;
-  }
 
-  const [apps, files] = await Promise.all([
-    invoke("search_apps", { query }),
-    invoke("search_files", { query }),
-  ]);
+  // Apps are cheap: show them immediately so results feel responsive while typing.
+  const appList = await invoke("search_apps", { query });
   if (seq !== searchSeq) return;
-  items = [...apps.slice(0, MAX_APPS)];
+  items = appList.slice(0, MAX_APPS);
+  selected = 0;
+  render();
+
+  // Files need a full index scan — skip it for too-short queries and only after
+  // the app list has already been rendered.
+  if (query.length < MIN_FILE_QUERY_LEN) return;
+
+  const files = await invoke("search_files", { query });
+  if (seq !== searchSeq) return;
+  items = [...appList.slice(0, MAX_APPS)];
   for (const f of files) {
+    if (items.length >= 60) break;
     items.push(f);
   }
   selected = 0;
@@ -62,7 +67,17 @@ async function runSearch() {
 
 function scheduleSearch() {
   clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(runSearch, 90);
+  const now = Date.now();
+  const idle = now - lastSearchAt;
+  if (idle >= SEARCH_GAP_MS) {
+    lastSearchAt = now;
+    runSearch();
+  } else {
+    debounceTimer = setTimeout(() => {
+      lastSearchAt = Date.now();
+      runSearch();
+    }, SEARCH_GAP_MS - idle);
+  }
 }
 
 function groupItems() {
