@@ -296,17 +296,21 @@ fn aumid_icon_data_uri(aumid: &str) -> Option<String> {
         let factory: IShellItemImageFactory = item
             .BindToHandler(None, &BHID_SFUIObject)
             .ok()?;
-        let size = SIZE { cx: 64, cy: 64 };
-        let hbmp = factory
-            .GetImage(size, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK)
-            .ok()?;
-        let png = hbitmap_to_png(hbmp)?;
-        let _ = DeleteObject(HGDIOBJ(hbmp.0));
-        Some(format!(
-            "data:image/png;base64,{}",
-            B64.encode(&png)
-        ))
+        for size in [64, 32] {
+            let sb = SIZE { cx: size, cy: size };
+            if let Ok(hbmp) = factory.GetImage(sb, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK) {
+                if let Some(png) = hbitmap_to_png(hbmp) {
+                    let _ = DeleteObject(HGDIOBJ(hbmp.0));
+                    return Some(format!(
+                        "data:image/png;base64,{}",
+                        B64.encode(&png)
+                    ));
+                }
+                let _ = DeleteObject(HGDIOBJ(hbmp.0));
+            }
+        }
     }
+    None
 }
 
 fn hbitmap_to_png(hbm: HBITMAP) -> Option<Vec<u8>> {
