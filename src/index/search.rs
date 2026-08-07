@@ -30,6 +30,57 @@ pub struct AppInfo {
     pub version: Option<String>,
 }
 
+/// Secondary sort key for results inside the same rank tier.
+/// Field order below also defines the ordering (lower = better).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ResultMeta {
+    rank: u8,
+    boundary: u8, // 0 = match starts at a word boundary
+    user: u8,     // 0 = located under a user folder
+    depth: u8,    // shallower path wins
+    name_len: u8, // shorter name wins
+    ext_prio: u8, // document/code extensions first
+}
+
+/// True when `q` appears in `name` at the start or right after a non-alphanumeric separator.
+fn word_prefix_match(name: &str, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let bytes = name.as_bytes();
+    let w = q.len();
+    let mut start = 0usize;
+    while start < name.len() {
+        match name[start..].find(q) {
+            Some(rel) => {
+                let abs = start + rel;
+                if abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric() {
+                    return true;
+                }
+                start = abs + w;
+            }
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Extension importance tiers: commonly searched document/code types first.
+fn ext_priority(name_lower: &str) -> u8 {
+    let ext = name_lower.rsplit('.').next().unwrap_or("");
+    match ext {
+        "txt" | "md" | "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
+        | "csv" | "rtf" | "html" | "css" | "js" | "ts" | "json" | "yml" | "yaml"
+        | "toml" | "ini" | "log" | "rs" | "c" | "h" | "cpp" | "hpp" | "py"
+        | "go" | "java" | "cs" | "rb" | "php" | "sql" | "bat" | "cmd" | "ps1"
+        | "ipynb" => 0,
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "svg" | "webp" | "ico"
+        | "mp3" | "mp4" | "mkv" | "avi" | "mov" | "wav" | "flac" => 1,
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "iso" => 2,
+        _ => 3,
+    }
+}
+
 pub fn get_installed_apps() -> Vec<AppInfo> {
     let mut apps = Vec::new();
     let mut seen = BTreeSet::new();
@@ -132,7 +183,7 @@ pub fn search(
     candidates.truncate(overshoot);
 
     // ── Phase 3: build paths + exclusions + app promotion ────────────
-    let mut results: Vec<SearchResult> = Vec::with_capacity(limit);
+    let mut ranked: Vec<(ResultMeta, SearchResult)> = Vec::with_capacity(candidates.len());
 
     for &(idx, base_rank) in &candidates {
         let entry = &entries[idx as usize];
@@ -150,6 +201,7 @@ pub fn search(
         }
 
         let name_lower = store.name_lower(entry);
+        let ext_prio = ext_priority(name_lower);
         let rank = if base_rank <= 2 {
             let ext = name_lower.rsplit('.').next().unwrap_or("");
             if APP_EXTENSIONS.contains(&ext) {
@@ -167,19 +219,33 @@ pub fn search(
             base_rank
         };
 
-        results.push(SearchResult {
-            full_path,
-            name: store.name(entry).to_string(),
-            rank,
-            is_dir: entry.is_dir(),
-            modified_time: None,
-            file_type_priority: 0,
-        });
+        let boundary = base_rank <= 2 || word_prefix_match(name_lower, &q);
+        let user = USER_PATH_MARKERS.iter().any(|m| path_lower.contains(m));
+        let depth = path_lower.matches('\\').count().min(15) as u8;
+        let name_len = (name_lower.len() as u32).min(255) as u8;
+
+        ranked.push((
+            ResultMeta {
+                rank,
+                boundary: if boundary { 0 } else { 1 },
+                user: if user { 0 } else { 1 },
+                depth,
+                name_len,
+                ext_prio,
+            },
+            SearchResult {
+                full_path,
+                name: store.name(entry).to_string(),
+                rank,
+                is_dir: entry.is_dir(),
+                modified_time: None,
+                file_type_priority: ext_prio,
+            },
+        ));
     }
 
-    results.sort_unstable_by_key(|r| r.rank);
-    results.truncate(limit);
-    results
+    ranked.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    ranked.into_iter().take(limit).map(|(_, r)| r).collect()
 }
 
 pub fn apps(_store: &IndexStore, _limit: usize) -> Vec<SearchResult> {
@@ -221,4 +287,63 @@ pub fn build_path(file_ref: u64, store: &IndexStore) -> std::path::PathBuf {
         path.push(comp);
     }
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::store::{IndexEntry, IndexStore};
+    use crate::mft::types::FileKind;
+
+    fn store(items: &[(u64, &str, u64, FileKind)]) -> IndexStore {
+        let mut s = IndexStore {
+            entries: Vec::new(),
+            name_arena: Vec::new(),
+            name_lower_arena: Vec::new(),
+            ref_lookup: Vec::new(),
+            drive_root: "C:\\".to_string(),
+            checkpoints: Vec::new(),
+        };
+        for &(fr, name, parent, ref kind) in items {
+            let lower = name.to_lowercase();
+            let n_off = s.name_arena.len() as u32;
+            let nl_off = s.name_lower_arena.len() as u32;
+            s.name_arena.extend_from_slice(name.as_bytes());
+            s.name_lower_arena.extend_from_slice(lower.as_bytes());
+            let i = s.entries.len();
+            s.entries.push(IndexEntry {
+                file_ref: fr,
+                parent_ref: parent,
+                name_off: n_off,
+                name_lower_off: nl_off,
+                name_len: name.len() as u16,
+                name_lower_len: lower.len() as u16,
+                flags: if *kind == FileKind::Directory { 1 } else { 0 },
+            });
+            s.ref_lookup.push((fr, i as u32));
+        }
+        s.ref_lookup.sort_unstable_by_key(|&(r, _)| r);
+        s
+    }
+
+    #[test]
+    fn ordering_brings_good_matches_first() {
+        // dirs: 30 = node_modules (junk), 40 = Users (user path marker)
+        let store = store(&[
+            (40, "Users", 0, FileKind::Directory),
+            (30, "node_modules", 0, FileKind::Directory),
+            (1, "Report.pdf", 40, FileKind::File),        // prefix + user dir
+            (2, "report.txt", 0, FileKind::File),          // prefix, root-level
+            (3, "report_final.docx", 0, FileKind::File),   // prefix match
+            (4, "deptreport.pdf", 0, FileKind::File),      // mid-word contains
+            (5, "report.js", 30, FileKind::File),          // junk, filtered
+        ]);
+        let results = search(&store, "report", 10, false, &[]);
+        let names: Vec<_> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.iter().all(|n| *n != "report.js"));
+        assert_eq!(names[0], "Report.pdf");   // prefix match first, in user dir
+        assert_eq!(names[1], "report.txt");   // prefix match, root-level (shorter name)
+        assert_eq!(names[2], "report_final.docx"); // boundary beat mid-word
+        assert_eq!(names[3], "deptreport.pdf");
+    }
 }
