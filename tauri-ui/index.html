@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -8,22 +8,61 @@
   </head>
   <body>
     <!-- ── State: ready (search palette) ─────────────────────────────── -->
-    <main class="spotlight" id="card">
-      <div class="search-row">
-        <svg class="search-icon" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
-        <input id="search" autocomplete="off" spellcheck="false" placeholder="Search apps and files" />
+    <main class="launcher-window" id="card">
+      <div class="search-header">
+        <svg class="search-icon" viewBox="0 0 24 24">
+          <path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/>
+        </svg>
+        <input id="search" autocomplete="off" spellcheck="false" placeholder="Search apps, files, folders…" />
+        <button id="previewToggle" class="theme-toggle-btn" title="Toggle preview pane" aria-pressed="true">
+          <svg class="btn-icon" viewBox="0 0 24 24">
+            <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/>
+          </svg>
+        </button>
       </div>
-      <div class="rule"></div>
+
       <div id="status"><span id="statusText">Indexing...</span><div class="progress"><div id="progressFill"></div></div></div>
-      <section id="results"></section>
-      <div id="empty" class="empty"><span>No results</span><span class="empty-sub">Press Enter to search the web</span></div>
-      <div id="hints">
-        <span><kbd>↵</kbd> Open</span>
-        <span><kbd>Ctrl+↵</kbd> Folder</span>
-        <span><kbd>Shift+↵</kbd> Run as admin</span>
-        <span><kbd>Alt+↵</kbd> Properties</span>
-        <span><kbd>Ctrl+C</kbd> Copy path</span>
-        <span><kbd>Esc</kbd> Clear / Close</span>
+
+      <div class="body-container">
+        <section id="results"></section>
+        <div id="empty" class="empty"><span>No results</span><span class="empty-sub">Press Enter to search the web</span></div>
+        <aside id="previewPane" class="preview-pane">
+          <div class="preview-inner">
+            <div class="preview-header">
+              <div id="pvIcon" class="preview-large-icon"></div>
+              <div id="pvTitle" class="preview-title"></div>
+              <div id="pvType" class="preview-type"></div>
+            </div>
+            <div class="preview-metadata">
+              <div class="meta-row meta-where">
+                <span class="meta-label">Where</span>
+                <span id="pvPath" class="meta-value"></span>
+              </div>
+              <div class="meta-row">
+                <span class="meta-label">Size</span>
+                <span id="pvSize" class="meta-value"></span>
+              </div>
+              <div class="meta-row">
+                <span class="meta-label">Modified</span>
+                <span id="pvModified" class="meta-value"></span>
+              </div>
+            </div>
+            <div class="preview-snippet" id="pvSnippet"></div>
+          </div>
+          <div id="pvEmpty" class="preview-empty">Select a result to preview</div>
+        </aside>
+      </div>
+
+      <div id="hints" class="footer-bar">
+        <div class="shortcuts-group">
+          <span class="shortcut-item"><kbd>↵</kbd> Open</span>
+          <span class="shortcut-item"><kbd>Ctrl+↵</kbd> Folder</span>
+          <span class="shortcut-item"><kbd>Shift+↵</kbd> Admin</span>
+          <span class="shortcut-item"><kbd>Alt+↵</kbd> Properties</span>
+          <span class="shortcut-item"><kbd>Ctrl+C</kbd> Copy</span>
+          <span class="shortcut-item"><kbd>Esc</kbd> Clear / Close</span>
+        </div>
+        <span class="brand">FastSeek</span>
       </div>
     </main>
 

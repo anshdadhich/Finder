@@ -44,10 +44,11 @@ const MAX_FILE_CACHE = 6;
 // query paints from the previous answer while the server backfills.
 const appPool = [];
 let appPoolLoaded = false;
+let appPoolRev = -1;
 const fileCache = new Map();
 
-async function loadApps() {
-  if (appPoolLoaded) return;
+async function loadApps(force) {
+  if (!force && appPoolLoaded) return;
   try {
     const all = await invoke("get_all_apps");
     if (all && all.length) {
@@ -90,7 +91,9 @@ function fuzzyApp(nameLower, q) {
 
 function clientApps(query) {
   const q = query.trim().toLowerCase();
-  if (!q) return appPool.slice(0, MAX_APPS);
+  // Empty query = "browse all installed apps" — no 16-item cap, just the
+  // hard list guard. Typed queries keep the ranked top-16.
+  if (!q) return appPool.slice(0, MAX_ITEMS);
   const scored = [];
   for (const app of appPool) {
     const name = app.name.toLowerCase();
@@ -178,8 +181,9 @@ async function runSearch() {
 
   if (query.length < MIN_FILE_QUERY_LEN) {
     // Apps-only answer (or fallback when the pool wasn't ready in time).
+    // Empty query keeps the FULL app list, not the ranked top-16.
     fileTotal = 0;
-    items = appList.slice(0, MAX_APPS);
+    items = appList.slice(0, query ? MAX_APPS : MAX_ITEMS);
     render();
     return;
   }
@@ -456,15 +460,19 @@ function renderNow() {
         name.className = "name";
         const path = document.createElement("div");
         path.className = "path";
+        const tag = document.createElement("span");
+        tag.className = "tag";
         text.appendChild(name);
         text.appendChild(path);
         el.appendChild(chip);
         el.appendChild(img);
         el.appendChild(text);
+        el.appendChild(tag);
         el._chip = chip;
         el._img = img;
         el._nameEl = name;
         el._pathEl = path;
+        el._tag = tag;
         rowPool.set(item.path, el);
       }
       rendered.add(item.path);
@@ -492,6 +500,11 @@ function renderNow() {
       if (el._path !== pathText) {
         el._pathEl.textContent = pathText;
         el._path = pathText;
+      }
+      const tagText = item.kind === "app" ? "App" : item.kind === "more" ? "More" : item.is_dir ? "Folder" : "File";
+      if (el._tagText !== tagText) {
+        el._tag.textContent = tagText;
+        el._tagText = tagText;
       }
       const iconKey = item.path.toLowerCase();
       const uri = iconCache.get(iconKey);
@@ -554,6 +567,147 @@ function updateSelection() {
   if (active && active.scrollIntoView) {
     active.scrollIntoView({ block: "nearest" });
   }
+  renderPreview();
+}
+
+/* ── Preview pane ───────────────────────────────────────────────────────── */
+const previewToggle = document.getElementById("previewToggle");
+const previewPaneEl = document.getElementById("previewPane");
+const pvSize = document.getElementById("pvSize");
+const pvModified = document.getElementById("pvModified");
+let previewHidden = localStorage.getItem("fs-preview-hidden") === "1";
+let previewTimer = null;
+
+function applyPreviewVisibility() {
+  document.body.classList.toggle("preview-off", previewHidden);
+  if (previewToggle) previewToggle.setAttribute("aria-pressed", String(!previewHidden));
+}
+
+// Window width follows the pane: wide (820) with preview, compact (560)
+// without. JS steps the size frame-by-frame so the collapse is animated;
+// the Rust command clamps the range.
+let widthAnim = null;
+function setWindowWidth(wide) {
+  if (!invoke) return;
+  invoke("resize_palette", { width: wide ? 820 : 560 }).catch(() => {});
+}
+function animateWindowWidth(wide) {
+  if (widthAnim) cancelAnimationFrame(widthAnim);
+  if (!invoke) {
+    applyPreviewVisibility();
+    return;
+  }
+  const from = wide ? 560 : 820;
+  const to = wide ? 820 : 560;
+  const t0 = performance.now();
+  const DUR = 230;
+  const step = () => {
+    const p = Math.min(1, (performance.now() - t0) / DUR);
+    const e = 1 - Math.pow(1 - p, 3);
+    const w = Math.round(from + (to - from) * e);
+    invoke("resize_palette", { width: w }).catch(() => {});
+    if (p < 1) {
+      widthAnim = requestAnimationFrame(step);
+    } else {
+      widthAnim = null;
+    }
+  };
+  step();
+}
+
+applyPreviewVisibility();
+if (previewHidden) setWindowWidth(false);
+
+if (previewToggle) {
+  previewToggle.addEventListener("click", () => {
+    previewHidden = !previewHidden;
+    localStorage.setItem("fs-preview-hidden", previewHidden ? "1" : "0");
+    applyPreviewVisibility();
+    renderPreview();
+    animateWindowWidth(!previewHidden);
+  });
+}
+
+function fmtSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`;
+  return `${(bytes / 1073741824).toFixed(2)} GB`;
+}
+
+function fmtRelative(secs) {
+  const age = Math.max(0, Date.now() / 1000 - secs);
+  if (age < 45) return "just now";
+  if (age < 3600) return `${Math.floor(age / 60)} min ago`;
+  if (age < 86400) return `${Math.floor(age / 3600)} hr ago`;
+  return `${Math.floor(age / 86400)} days ago`;
+}
+
+async function previewMeta(path) {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(async () => {
+    if (previewHidden || !path || !invoke) return;
+    try {
+      const info = await invoke("file_preview", { path });
+      pvSize.textContent = info && info.is_dir ? "—" : fmtSize(info.size);
+      pvModified.textContent = info && info.modified_secs ? fmtRelative(info.modified_secs) : "—";
+    } catch (error) {
+      pvSize.textContent = "—";
+      pvModified.textContent = "—";
+    }
+  }, 60);
+}
+
+function renderPreview() {
+  // Called on every selection change (and on search re-render). All DOM
+  // work is confined to the pane; the stat itself is debounced + skipped
+  // entirely while the pane is hidden.
+  const row = rowEls[selected];
+  const item = row && row._item;
+  const pane = previewPaneEl;
+  if (!pane) return;
+  if (previewHidden || !item) {
+    pane.classList.add("empty-preview");
+    return;
+  }
+  pane.classList.remove("empty-preview");
+
+  const title = document.getElementById("pvTitle");
+  const type = document.getElementById("pvType");
+  const path = document.getElementById("pvPath");
+  const iconEl = document.getElementById("pvIcon");
+  const snippet = document.getElementById("pvSnippet");
+
+  title.textContent = item.name || item.path;
+  type.textContent =
+    item.kind === "app" ? "Application" : item.kind === "more" ? "More results" : item.is_dir ? "Folder" : "File";
+  pane.classList.toggle("pv-app", item.kind === "app");
+  path.textContent = item.path || "";
+  path.title = item.path || "";
+
+  if (row.classList.contains("has-icon") && row._img && row._img.src) {
+    iconEl.textContent = "";
+    const img = new Image();
+    img.src = row._img.src;
+    img.classList.add("pv-img");
+    iconEl.appendChild(img);
+  } else if (row._chip) {
+    iconEl.innerHTML = "";
+    const chipText = document.createElement("span");
+    chipText.className = "pv-initial";
+    chipText.textContent = row._chip.textContent;
+    iconEl.appendChild(chipText);
+    iconEl.style.setProperty("--chip-hue", row._chip.style.getPropertyValue("--chip-hue"));
+  }
+
+  const hasStat = item.kind === "file" || item.kind === "dir" || item.kind === "app";
+  snippet.textContent = item.kind === "file" || item.kind === "dir" ? item.path || "" : "";
+  if (hasStat && item.path) {
+    previewMeta(item.path);
+  } else {
+    pvSize.textContent = "—";
+    pvModified.textContent = "—";
+  }
 }
 
 // The displayed row order (grouped: Applications → Folders → Files) is NOT
@@ -613,6 +767,12 @@ async function refreshStatus() {
   if (!invoke) return;
   try {
     const status = await invoke("get_index_status");
+    // The app pool lives on the backend and only changes on install or
+    // uninstall; the rev counter tells us when to re-fetch it (cheap).
+    if (status && typeof status.apps_rev === "number" && status.apps_rev !== appPoolRev) {
+      appPoolRev = status.apps_rev;
+      loadApps(true);
+    }
     // Scanning (first install or cache rebuild): ONLY the scanning page.
     if (!status || !status.ready) {
       setState("scan");

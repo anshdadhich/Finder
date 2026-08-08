@@ -63,7 +63,10 @@ struct AppState {
     index: Arc<RwLock<IndexStore>>,
     ready: Arc<AtomicBool>,
     status: Arc<RwLock<String>>,
-    apps: Arc<Vec<AppEntry>>,
+    apps: Arc<RwLock<Vec<AppEntry>>>,
+    /// Bumped whenever the app pool is swapped (install/uninstall detected),
+    /// so the UI knows to re-fetch without polling the full list down.
+    app_rev: Arc<AtomicU64>,
     icon_cache: Arc<Mutex<HashMap<String, String>>>,
     icon_gate: Arc<IconGate>,
     freq: Arc<Mutex<std::collections::HashMap<String, u32>>>,
@@ -122,6 +125,8 @@ struct IndexStatus {
     /// True only while the very first (fresh-cache) scan is running, so the
     /// UI can show the one-time "first run" indexing screen.
     first_scan: bool,
+    /// App pool version; the UI re-fetches get_all_apps when it moves.
+    apps_rev: u64,
 }
 
 #[tauri::command]
@@ -131,6 +136,7 @@ fn get_index_status(state: tauri::State<AppState>) -> IndexStatus {
         count: state.index.read().len(),
         message: state.status.read().clone(),
         first_scan: state.first_scan.load(Ordering::Relaxed),
+        apps_rev: state.app_rev.load(Ordering::Relaxed),
     }
 }
 
@@ -138,6 +144,7 @@ fn get_index_status(state: tauri::State<AppState>) -> IndexStatus {
 fn get_all_apps(state: tauri::State<AppState>) -> Vec<UiResult> {
     state
         .apps
+        .read()
         .iter()
         .map(|app| UiResult {
             name: app.name.clone(),
@@ -191,17 +198,14 @@ fn search_files(query: String, offset: usize, state: tauri::State<AppState>) -> 
 fn search_apps(query: String, state: tauri::State<AppState>) -> Vec<UiResult> {
     let q = query.trim().to_lowercase();
     let freq = state.freq.lock();
+    let apps = state.apps.read();
 
     let mut scored: Vec<(u8, u32, &AppEntry)> = if q.is_empty() {
-        state
-            .apps
-            .iter()
+        apps.iter()
             .map(|app| (1u8, freq.get(&app.path.to_lowercase()).copied().unwrap_or(0), app))
             .collect()
     } else {
-        state
-            .apps
-            .iter()
+        apps.iter()
             .filter_map(|app| {
                 app_rank(&app.name.to_lowercase(), &q)
                     .map(|rank| (rank, freq.get(&app.path.to_lowercase()).copied().unwrap_or(0), app))
@@ -227,6 +231,38 @@ fn search_apps(query: String, state: tauri::State<AppState>) -> Vec<UiResult> {
             rank,
         })
         .collect()
+}
+
+/// Periodic re-discovery of installed apps (Start Menu, AppsFolder, Uninstall
+/// registry). Runs forever on a worker thread; swaps the pool in place when
+/// the set of app paths changed and bumps the revision so the UI refreshes.
+/// Never swaps on empty results — a transient enumeration failure must not
+/// blank the launcher.
+fn apps_refresh_loop(apps: Arc<RwLock<Vec<AppEntry>>>, rev: Arc<AtomicU64>) {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        let fresh = discover_apps();
+        if fresh.is_empty() {
+            continue;
+        }
+        let same = {
+            let cur = apps.read();
+            if cur.len() != fresh.len() {
+                false
+            } else {
+                let cur_keys: std::collections::HashSet<String> =
+                    cur.iter().map(|a| a.path.to_lowercase()).collect();
+                let new_keys: std::collections::HashSet<String> =
+                    fresh.iter().map(|a| a.path.to_lowercase()).collect();
+                cur_keys == new_keys
+            }
+        };
+        if !same {
+            *apps.write() = fresh;
+            rev.fetch_add(1, Ordering::Relaxed);
+            log_line("apps: pool refreshed — install/uninstall picked up");
+        }
+    }
 }
 
 fn app_rank(name_lower: &str, q: &str) -> Option<u8> {
@@ -900,11 +936,12 @@ fn main() {
     let ready = Arc::new(AtomicBool::new(false));
     let status = Arc::new(RwLock::new(String::from("Starting...")));
     let first_scan = Arc::new(AtomicBool::new(false));
-    let apps = Arc::new(discover_apps());
+    let apps = Arc::new(RwLock::new(discover_apps()));
+    let app_rev = Arc::new(AtomicU64::new(0));
     let icon_cache = Arc::new(Mutex::new(HashMap::new()));
     {
         let mut cache = icon_cache.lock();
-        for app in apps.iter() {
+        for app in apps.read().iter() {
             if let Some(ic) = &app.icon {
                 cache.insert(app.path.to_lowercase(), ic.clone());
             }
@@ -916,11 +953,21 @@ fn main() {
         ready: Arc::clone(&ready),
         status: Arc::clone(&status),
         apps: Arc::clone(&apps),
+        app_rev: Arc::clone(&app_rev),
         icon_cache: Arc::clone(&icon_cache),
         icon_gate: Arc::new(IconGate::new(8)),
         freq: Arc::new(Mutex::new(std::collections::HashMap::new())),
         first_scan: Arc::clone(&first_scan),
     };
+
+    // Live app pool: re-scan Start Menu / AppsFolder / Uninstall registry
+    // every minute; swap + bump the rev only when the list actually changed
+    // (an install or uninstall), so search_apps picks it up without a restart.
+    {
+        let apps_loop = Arc::clone(&apps);
+        let rev_loop = Arc::clone(&app_rev);
+        std::thread::spawn(move || apps_refresh_loop(apps_loop, rev_loop));
+    }
     let setup_index = Arc::clone(&index);
     let setup_ready = Arc::clone(&ready);
     let setup_status = Arc::clone(&status);
@@ -1024,7 +1071,9 @@ fn main() {
             open_web_search,
             rebuild_index,
             copy_path,
-            quit_app
+            quit_app,
+            file_preview,
+            resize_palette
         ])
         .build(tauri::generate_context!())
         .expect("error while building FastSeek");
@@ -1775,6 +1824,42 @@ fn rebuild_index_impl(state: &AppState) {
 fn copy_path(path: String, app: tauri::AppHandle) -> Result<(), String> {
     app.clipboard_manager()
         .write_text(path)
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct PreviewInfo {
+    size: u64,
+    modified_secs: u64,
+    is_dir: bool,
+}
+
+/// Cheap metadata for the preview pane — one stat() per selection change,
+/// called only while the pane is visible and debounced from the UI.
+#[tauri::command]
+fn file_preview(path: String) -> Option<PreviewInfo> {
+    let md = std::fs::metadata(&path).ok()?;
+    let modified_secs = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(PreviewInfo {
+        size: md.len(),
+        modified_secs,
+        is_dir: md.is_dir(),
+    })
+}
+
+/// Animates the palette between the wide (preview) and compact (results-only)
+/// widths. JS steps this command frame-by-frame; the clamp keeps a glitchy
+/// caller from blowing the window past its authored sizes.
+#[tauri::command]
+fn resize_palette(window: tauri::Window, width: u32) -> Result<(), String> {
+    let width = width.clamp(560, 820);
+    window
+        .set_size(tauri::LogicalSize::new(width as f64, 520.0))
         .map_err(|e| e.to_string())
 }
 
