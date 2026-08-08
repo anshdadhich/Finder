@@ -7,6 +7,7 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
+    <!-- ── State: ready (search palette) ─────────────────────────────── -->
     <main class="spotlight" id="card">
       <div class="search-row">
         <svg class="search-icon" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
@@ -15,7 +16,35 @@
       <div class="rule"></div>
       <div id="status"><span id="statusText">Indexing...</span><div class="progress"><div id="progressFill"></div></div></div>
       <section id="results"></section>
+      <div id="empty" class="empty"><span>No results</span><span class="empty-sub">Press Enter to search the web</span></div>
+      <div id="hints">
+        <span><kbd>↵</kbd> Open</span>
+        <span><kbd>Ctrl+↵</kbd> Folder</span>
+        <span><kbd>Shift+↵</kbd> Run as admin</span>
+        <span><kbd>Alt+↵</kbd> Properties</span>
+        <span><kbd>Ctrl+C</kbd> Copy path</span>
+        <span><kbd>Esc</kbd> Clear / Close</span>
+      </div>
     </main>
+
+    <!-- ── State: scan (index is being built) — exclusive with #card ── -->
+    <div id="scanState" class="scan">
+      <div class="fr-card">
+        <div class="fr-logo">
+          <svg viewBox="0 0 24 24" width="40" height="40"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+        </div>
+        <h1 id="scanTitle" class="fr-title">Indexing files</h1>
+        <p id="scanSub" class="fr-sub">FastSeek is scanning and indexing your drives…</p>
+        <div class="fr-progress"><div class="fr-fill"></div></div>
+        <p id="scanStatusText" class="fr-status"></p>
+        <div class="scan-clock">elapsed <span id="scanElapsed">00:00</span></div>
+        <div class="scan-actions">
+          <button id="scanRetry" class="scan-btn">Try again</button>
+          <button id="scanQuit" class="scan-btn secondary">Quit</button>
+        </div>
+      </div>
+    </div>
+
     <script src="./main.js"></script>
   </body>
 </html>

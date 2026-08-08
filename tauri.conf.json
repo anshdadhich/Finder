@@ -21,6 +21,9 @@
       },
       "globalShortcut": {
         "all": true
+      },
+      "clipboard": {
+        "writeText": true
       }
     },
     "bundle": {

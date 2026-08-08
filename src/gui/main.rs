@@ -5,25 +5,26 @@ use std::{
     ffi::c_void,
     io::{self, Write},
     mem::size_of,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::unbounded;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tauri::{
-    CustomMenuItem, GlobalShortcutManager, Manager, SystemTray, SystemTrayEvent, SystemTrayMenu,
+    ClipboardManager, CustomMenuItem, GlobalShortcutManager, Manager, SystemTray, SystemTrayEvent,
+    SystemTrayMenu,
 };
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, SIZE};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, SIZE};
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BI_RGB, DIB_RGB_COLORS,
     HGDIOBJ, HBITMAP,
@@ -41,14 +42,17 @@ use windows::Win32::UI::Shell::{
     SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY, SHGSI_ICON, SHGSI_LARGEICON, SHGetStockIconInfo,
     SIID_APPLICATION, SHSTOCKICONINFO, SHIL_JUMBO,
 };
-use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DestroyIcon, FindWindowW, GetIconInfo, HICON, ICONINFO, SetForegroundWindow, ShowWindow, SW_RESTORE,
+};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 
 use fastsearch::{
     index::{search, store::IndexStore},
     mft::{
         reader::MftReader,
-        types::{IndexEvent, JournalCheckpoint},
+        types::IndexEvent,
         watcher::UsnWatcher,
     },
     utils::drives::get_ntfs_drives,
@@ -61,6 +65,37 @@ struct AppState {
     status: Arc<RwLock<String>>,
     apps: Arc<Vec<AppEntry>>,
     icon_cache: Arc<Mutex<HashMap<String, String>>>,
+    icon_gate: Arc<IconGate>,
+    freq: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    first_scan: Arc<AtomicBool>,
+}
+
+/// Simple counting semaphore so concurrent shell icon extractors never hammer
+/// the COM/SHGetFileInfo plumbing from many render cycles at once.
+struct IconGate {
+    gate: std::sync::Mutex<u32>,
+    cv: std::sync::Condvar,
+}
+
+impl IconGate {
+    fn new(permits: u32) -> Self {
+        Self {
+            gate: std::sync::Mutex::new(permits),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+    fn acquire(&self) {
+        let mut g = self.gate.lock().unwrap();
+        while *g == 0 {
+            g = self.cv.wait(g).unwrap();
+        }
+        *g -= 1;
+    }
+    fn release(&self) {
+        let mut g = self.gate.lock().unwrap();
+        *g += 1;
+        self.cv.notify_one();
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -84,6 +119,9 @@ struct IndexStatus {
     ready: bool,
     count: usize,
     message: String,
+    /// True only while the very first (fresh-cache) scan is running, so the
+    /// UI can show the one-time "first run" indexing screen.
+    first_scan: bool,
 }
 
 #[tauri::command]
@@ -92,51 +130,96 @@ fn get_index_status(state: tauri::State<AppState>) -> IndexStatus {
         ready: state.ready.load(Ordering::Relaxed),
         count: state.index.read().len(),
         message: state.status.read().clone(),
+        first_scan: state.first_scan.load(Ordering::Relaxed),
     }
 }
 
 #[tauri::command]
-fn search_files(query: String, state: tauri::State<AppState>) -> Vec<UiResult> {
+fn get_all_apps(state: tauri::State<AppState>) -> Vec<UiResult> {
+    state
+        .apps
+        .iter()
+        .map(|app| UiResult {
+            name: app.name.clone(),
+            path: app.path.clone(),
+            is_dir: false,
+            kind: "app".to_string(),
+            rank: 0,
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+struct FileResults {
+    items: Vec<UiResult>,
+    /// Exact match count for extension-class queries (".py" lists ALL files
+    /// with that extension); 0 = unknown for ordinary queries.
+    total: usize,
+}
+
+#[tauri::command]
+fn search_files(query: String, offset: usize, state: tauri::State<AppState>) -> FileResults {
     if !state.ready.load(Ordering::Relaxed) || query.trim().is_empty() {
-        return Vec::new();
+        return FileResults { items: Vec::new(), total: 0 };
+    }
+
+    // Extension buckets can be stale after live journal mutations; refresh
+    // once under the write lock before serving an extension search.
+    if state.index.read().ext_dirty {
+        state.index.write().rebuild_ext_index();
     }
 
     let store = state.index.read();
-    search::search(&store, query.trim(), 300, false, &[])
-        .into_iter()
-        .take(300)
-        .map(|r| UiResult {
-            name: r.name,
-            path: r.full_path.to_string_lossy().to_string(),
-            is_dir: r.is_dir,
-            kind: if r.is_dir { "dir".to_string() } else { "file".to_string() },
-            rank: r.rank,
-        })
-        .collect()
+    let page = search::search_paged(&store, query.trim(), 100, offset, false, &[]);
+    FileResults {
+        total: page.total,
+        items: page
+            .results
+            .into_iter()
+            .map(|r| UiResult {
+                name: r.name,
+                path: r.full_path.to_string_lossy().to_string(),
+                is_dir: r.is_dir,
+                kind: if r.is_dir { "dir".to_string() } else { "file".to_string() },
+                rank: r.rank,
+            })
+            .collect(),
+    }
 }
 
 #[tauri::command]
 fn search_apps(query: String, state: tauri::State<AppState>) -> Vec<UiResult> {
     let q = query.trim().to_lowercase();
+    let freq = state.freq.lock();
 
-    let mut scored: Vec<(u8, &AppEntry)> = if q.is_empty() {
+    let mut scored: Vec<(u8, u32, &AppEntry)> = if q.is_empty() {
         state
             .apps
             .iter()
-            .map(|app| (1u8, app))
+            .map(|app| (1u8, freq.get(&app.path.to_lowercase()).copied().unwrap_or(0), app))
             .collect()
     } else {
         state
             .apps
             .iter()
-            .filter_map(|app| app_rank(&app.name.to_lowercase(), &q).map(|rank| (rank, app)))
+            .filter_map(|app| {
+                app_rank(&app.name.to_lowercase(), &q)
+                    .map(|rank| (rank, freq.get(&app.path.to_lowercase()).copied().unwrap_or(0), app))
+            })
             .collect()
     };
-    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase())));
+    drop(freq);
+    // Frecency: equally-ranked apps sort by how often you actually launch
+    // them this session, so "the app I open every day" floats to the top.
+    scored.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.2.name.to_lowercase().cmp(&b.2.name.to_lowercase()))
+    });
     scored
         .into_iter()
         .take(if q.is_empty() { 16 } else { 10 })
-        .map(|(rank, app)| UiResult {
+        .map(|(rank, _, app)| UiResult {
             name: app.name.clone(),
             path: app.path.clone(),
             is_dir: false,
@@ -164,10 +247,40 @@ fn app_rank(name_lower: &str, q: &str) -> Option<u8> {
 }
 
 #[tauri::command]
-fn launch_app(path: String) -> Result<(), String> {
+fn launch_app(path: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let mut freq = state.freq.lock();
+    let entry = freq.entry(path.to_lowercase()).or_insert(0);
+    *entry = entry.saturating_add(1);
+    drop(freq);
+    launch_with_verb(&path, "open")
+}
+
+#[tauri::command]
+fn launch_admin(path: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let mut freq = state.freq.lock();
+    let entry = freq.entry(path.to_lowercase()).or_insert(0);
+    *entry = entry.saturating_add(1);
+    drop(freq);
+    launch_with_verb(&path, "runas")
+}
+
+#[tauri::command]
+fn open_properties(path: String) -> Result<(), String> {
+    launch_with_verb(&path, "properties")
+}
+
+fn launch_with_verb(path: &str, verb: &str) -> Result<(), String> {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     use windows::core::PCWSTR;
+
+    // Namespace / virtual paths (UWP, ms-settings, control-panel CLSIDs) can't
+    // take elevated or properties verbs — fall back to a plain open.
+    if verb != "open"
+        && (path.starts_with("aumid:") || path.starts_with("ms-") || path.starts_with("shell:::"))
+    {
+        return launch_with_verb(path, "open");
+    }
 
     if let Some(rest) = path.strip_prefix("aumid:") {
         let target = format!("shell:appsFolder\\{}", rest);
@@ -178,7 +291,7 @@ fn launch_app(path: String) -> Result<(), String> {
     }
 
     let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-    let operation: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let operation: Vec<u16> = verb.encode_utf16().chain(std::iter::once(0)).collect();
     let result = unsafe {
         ShellExecuteW(
             None,
@@ -196,21 +309,61 @@ fn launch_app(path: String) -> Result<(), String> {
     }
 }
 
+fn icon_cache_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("FastSeek").join("icons")
+}
+
+fn icon_disk_path(path: &str) -> std::path::PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.to_lowercase().hash(&mut h);
+    icon_cache_dir().join(format!("{:016x}.png", h.finish()))
+}
+
+fn png_to_uri(png: &[u8]) -> String {
+    format!("data:image/png;base64,{}", B64.encode(png))
+}
+
+fn uri_png_bytes(uri: &str) -> Option<Vec<u8>> {
+    let b64 = uri.strip_prefix("data:image/png;base64,")?;
+    B64.decode(b64).ok()
+}
+
 #[tauri::command]
 fn get_icons(paths: Vec<String>, state: tauri::State<AppState>) -> HashMap<String, String> {
     let mut out = HashMap::with_capacity(paths.len());
     let mut cache = state.icon_cache.lock();
     for path in paths {
         let key = path.to_lowercase();
+        let disk = icon_disk_path(&key);
         let uri = if let Some(v) = cache.get(&key) {
-            v.clone()
-        } else if let Some(v) = get_icon_data_uri(&path) {
-            cache.insert(key, v.clone());
-            v
+            Some(v.clone())
+        } else if let Ok(png) = std::fs::read(&disk) {
+            // Persistent disk cache: extraction hit once, reused forever.
+            let uri = png_to_uri(&png);
+            cache.insert(key, uri.clone());
+            Some(uri)
         } else {
-            continue;
+            state.icon_gate.acquire();
+            let v = get_icon_data_uri(&path);
+            state.icon_gate.release();
+            if let Some(uri) = v {
+                cache.insert(key, uri.clone());
+                if let Some(png) = uri_png_bytes(&uri) {
+                    let _ = std::fs::create_dir_all(icon_cache_dir());
+                    let _ = std::fs::write(&disk, png);
+                }
+                Some(uri)
+            } else {
+                None
+            }
         };
-        out.insert(path, uri);
+        if let Some(uri) = uri {
+            out.insert(path, uri);
+        }
     }
     out
 }
@@ -659,7 +812,47 @@ fn looks_like_url(value: &str) -> bool {
         || lower.contains(".org")
 }
 
+/// Append a lifecycle line to %LOCALAPPDATA%\FastSeek\log.txt — the tray
+/// app has no console, so this file is the only place panic/exit evidence
+/// survives.
+fn log_line(msg: &str) {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    if let Some(dir) = base.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base.join("FastSeek").join("log.txt"))
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(
+                f,
+                "[{}] pid={} {}",
+                chrono_like_now(),
+                std::process::id(),
+                msg
+            )
+        });
+}
+
+/// Cheap RFC-3339-ish timestamp (std only; avoids a chrono dependency).
+fn chrono_like_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("+{:.3}s", d.as_secs_f64())
+}
+
 fn main() {
+    // Everything hits the log file, panics included — the window has no
+    // console and silent exits are impossible to debug otherwise.
+    std::panic::set_hook(Box::new(|info| {
+        log_line(&format!("PANIC: {}", info));
+    }));
+    log_line("main: start");
     if std::env::args().any(|a| a == "--dump-apps") {
         let apps = discover_apps();
         let mut real = 0usize;
@@ -691,10 +884,22 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Single instance: a second launch just wakes and focuses the running
+    // window, so double-clicking the exe never spawns a second index or a
+    // second hotkey registration.
+    if let Some(hwnd) = ensure_single_instance() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+        std::process::exit(0);
+    }
+    log_line("main: single-instance owner");
+
     let index = Arc::new(RwLock::new(IndexStore::new()));
     let ready = Arc::new(AtomicBool::new(false));
     let status = Arc::new(RwLock::new(String::from("Starting...")));
-    let live_checkpoints: Arc<Mutex<Vec<JournalCheckpoint>>> = Arc::new(Mutex::new(Vec::new()));
+    let first_scan = Arc::new(AtomicBool::new(false));
     let apps = Arc::new(discover_apps());
     let icon_cache = Arc::new(Mutex::new(HashMap::new()));
     {
@@ -712,21 +917,23 @@ fn main() {
         status: Arc::clone(&status),
         apps: Arc::clone(&apps),
         icon_cache: Arc::clone(&icon_cache),
+        icon_gate: Arc::new(IconGate::new(8)),
+        freq: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        first_scan: Arc::clone(&first_scan),
     };
     let setup_index = Arc::clone(&index);
     let setup_ready = Arc::clone(&ready);
     let setup_status = Arc::clone(&status);
-    let setup_live_checkpoints = Arc::clone(&live_checkpoints);
     let close_index = Arc::clone(&index);
-    let close_live_checkpoints = Arc::clone(&live_checkpoints);
     let close_window: Arc<Mutex<Option<tauri::Window>>> = Arc::new(Mutex::new(None));
     let setup_close_window = Arc::clone(&close_window);
     let event_close_window = Arc::clone(&close_window);
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .system_tray(SystemTray::new().with_menu(
             SystemTrayMenu::new()
                 .add_item(CustomMenuItem::new("show".to_string(), "Show Search"))
+                .add_item(CustomMenuItem::new("reindex".to_string(), "Re-Index Files"))
                 .add_item(CustomMenuItem::new("quit".to_string(), "Quit")),
         ))
         .manage(state)
@@ -739,24 +946,32 @@ fn main() {
 
             register_shortcut(app, "Super+Space", window.clone());
             register_shortcut(app, "Ctrl+Space", window.clone());
+            // Fallback that never collides with Win+Space (language switch)
+            // or Ctrl+Space (IME); registered last so the common ones win.
+            register_shortcut(app, "Ctrl+Alt+Space", window.clone());
 
             start_backend(
                 Arc::clone(&setup_index),
                 Arc::clone(&setup_ready),
                 Arc::clone(&setup_status),
-                Arc::clone(&setup_live_checkpoints),
+                Arc::clone(&first_scan),
             );
             Ok(())
         })
         .on_window_event({
             move |event| {
                 match event.event() {
-                    tauri::WindowEvent::CloseRequested { .. } => {
-                        save_cache_with_checkpoints(
-                            &close_index,
-                            &close_live_checkpoints,
-                            &std::env::temp_dir().join("fastseek_cache.bin"),
-                        );
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        // The window is a launcher — "close" means "hide".
+                        // Unhandled closes destroy the window and (with the
+                        // loop exiting on the last window) take the whole
+                        // app down, tray and all.
+                        log_line("window: CloseRequested → save+hide");
+                        save_cache(&close_index, &index_cache_path());
+                        if let Some(window) = event_close_window.lock().as_ref() {
+                            let _ = window.hide();
+                        }
+                        api.prevent_close();
                     }
                     tauri::WindowEvent::Focused(false) => {
                         if let Some(window) = event_close_window.lock().as_ref() {
@@ -780,8 +995,17 @@ fn main() {
                     show_spotlight(&window);
                 }
             }
+            SystemTrayEvent::MenuItemClick { id, .. } if id.as_str() == "reindex" => {
+                let state = app.state::<AppState>();
+                rebuild_index_impl(&state);
+            }
             SystemTrayEvent::MenuItemClick { id, .. } if id.as_str() == "quit" => {
-                std::process::exit(0);
+                // Save explicitly: plain exit() skips the window-close handler
+                // and would lose the latest journal checkpoints.
+                log_line("exit: tray quit");
+                let state = app.state::<AppState>();
+                save_cache(&state.index, &index_cache_path());
+                app.exit(0);
             }
             _ => {}
         })
@@ -789,15 +1013,36 @@ fn main() {
             get_index_status,
             search_files,
             search_apps,
+            get_all_apps,
             get_icons,
             launch_app,
+            launch_admin,
+            open_properties,
             hide_window,
             open_path,
             open_parent,
-            open_web_search
+            open_web_search,
+            rebuild_index,
+            copy_path,
+            quit_app
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running FastSeek");
+        .build(tauri::generate_context!())
+        .expect("error while building FastSeek");
+
+    log_line("run: event loop starting");
+    app.run(|_handle, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            // A closed window must never be able to take the tray app
+            // down (the window itself now intercepts close; this catches
+            // every other exit-request origin). The tray Quit and the
+            // scan page's Quit button remain the only way out.
+            log_line("run: ExitRequested prevented");
+            api.prevent_exit();
+        }
+        tauri::RunEvent::Exit => log_line("run: loop exited"),
+        _ => {}
+    });
+    log_line("run: finished");
 }
 
 fn position_spotlight(window: &tauri::Window) {
@@ -1152,7 +1397,7 @@ fn start_backend(
     index: Arc<RwLock<IndexStore>>,
     ready: Arc<AtomicBool>,
     status: Arc<RwLock<String>>,
-    live_checkpoints: Arc<Mutex<Vec<JournalCheckpoint>>>,
+    first_scan: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
         *status.write() = String::from("Finding NTFS drives...");
@@ -1164,37 +1409,150 @@ fn start_backend(
         }
 
         let (tx, rx) = unbounded();
-        let cache_path = std::env::temp_dir().join("fastseek_cache.bin");
+        let cache_path = index_cache_path();
+        if let Some(dir) = cache_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Migrate the old %TEMP% cache once — TEMP is regularly wiped, which
+        // used to silently force a full rescan on the next boot.
+        if !cache_path.exists() {
+            let old = std::env::temp_dir().join("fastseek_cache.bin");
+            if old.exists() {
+                let _ = std::fs::rename(&old, &cache_path);
+            }
+        }
+
+        // One-time "install" marker: the full-screen welcome/scanning overlay
+        // shows only on the very first launch. If the cache is later missing
+        // or corrupt, the rescan still happens but through the status bar.
+        let first_run = {
+            let marker = first_run_marker();
+            let fresh = !marker.exists();
+            if fresh {
+                if let Some(dir) = marker.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(&marker, b"1");
+            }
+            fresh
+        };
+
         *status.write() = String::from("Loading cached index...");
         let cache_loaded = load_cache_and_catch_up(&index, &drives, &cache_path);
 
         if !cache_loaded {
+            if first_run {
+                first_scan.store(true, Ordering::Relaxed);
+            }
             build_full_index(&index, &drives, &cache_path, &status);
+            first_scan.store(false, Ordering::Relaxed);
+        }
+
+        // Never present a working-looking palette over an empty index: if the
+        // MFT couldn't be read (missing admin rights), stay on the scan page
+        // with an actionable message instead of silently searching nothing.
+        if index.read().len() == 0 {
+            *status.write() = String::from(
+                "No files were indexed — FastSeek needs administrator rights to read the NTFS journal. Relaunch as Administrator and press \"Try again\".",
+            );
+            eprintln!("Error: index has 0 files — running elevated? NTFS readable?");
+            return;
         }
 
         ready.store(true, Ordering::Relaxed);
+        log_line("index ready — watchers starting");
         *status.write() = format!("{} files indexed", index.read().len());
 
-        *live_checkpoints.lock() = index.read().checkpoints.clone();
+        // Watcher heartbeats: the watchdog below flips the app back to the
+        // scan state if a journal dies mid-session (chkdsk, defrag, USN
+        // journal reset) instead of silently serving stale results forever.
+        let heartbeats: std::collections::HashMap<char, Arc<std::sync::atomic::AtomicU64>> =
+            drives
+                .iter()
+                .map(|d| (d.letter, Arc::new(AtomicU64::new(now_millis() as u64))))
+                .collect();
 
         for drive in &drives {
             let tx_clone = tx.clone();
             let drive_clone = drive.clone();
-            let cps = Arc::clone(&live_checkpoints);
+            let hb = heartbeats.get(&drive.letter).cloned().expect("heartbeat");
             thread::spawn(move || {
-                if let Ok(mut watcher) = UsnWatcher::new(&drive_clone, tx_clone) {
-                    watcher.run_shared(cps);
-                }
+                let Ok(mut watcher) = UsnWatcher::new(&drive_clone, tx_clone) else {
+                    hb.store(0, Ordering::Relaxed);
+                    return;
+                };
+                watcher.run_shared(hb);
             });
         }
 
-        for event in &rx {
-            let mut batch = Vec::with_capacity(64);
-            batch.push(event);
-            batch.extend(rx.try_iter());
-            let mut store = index.write();
-            store.apply_events(batch);
-        }
+        // Live event applier: batches data events, and only stores a
+        // Checkpoint in `store.checkpoints` once every prior event on the
+        // ordered channel has been applied. Saving that checkpoint is always a
+        // consistent snapshot, so nothing is lost or duplicated on restart.
+        let dirty: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let applier_index = Arc::clone(&index);
+        let applier_dirty = Arc::clone(&dirty);
+        thread::spawn(move || {
+            let mut pending: Vec<IndexEvent> = Vec::with_capacity(64);
+            for event in &rx {
+                match event {
+                    IndexEvent::Checkpoint(cp) => {
+                        if !pending.is_empty() {
+                            applier_index.write().apply_events(std::mem::take(&mut pending));
+                        }
+                        let mut store = applier_index.write();
+                        store.checkpoints.retain(|c| c.drive_letter != cp.drive_letter);
+                        store.checkpoints.push(cp.clone());
+                        applier_dirty.store(true, Ordering::Relaxed);
+                    }
+                    other => {
+                        pending.push(other);
+                        if pending.len() >= 64 {
+                            applier_index.write().apply_events(std::mem::take(&mut pending));
+                            applier_dirty.store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Watchdog: if a drive's watcher heartbeat went dark (>60s), mark the
+        // index stale and surface the scan page with a re-index hint.
+        let wd_hb = heartbeats.clone();
+        let wd_status = Arc::clone(&status);
+        let wd_ready = Arc::clone(&ready);
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(15));
+                let now = now_millis();
+                for (letter, hb) in &wd_hb {
+                    let last = hb.load(Ordering::Relaxed);
+                    if last != 0 && now.saturating_sub(last) > 60_000 {
+                        hb.store(0, Ordering::Relaxed);
+                        wd_ready.store(false, Ordering::Relaxed);
+                        *wd_status.write() = format!(
+                            "File watcher on {} stopped — results may be stale. Use \"Try again\" to re-index.",
+                            letter
+                        );
+                    }
+                }
+            }
+        });
+
+        // Periodic cache persistence so a hard kill never loses the USN
+        // checkpoints. Only writes when the index changed since last save.
+        let saver_index = Arc::clone(&index);
+        let saver_dirty = Arc::clone(&dirty);
+        let saver_path = cache_path.clone();
+        thread::spawn(move || {
+            let interval = Duration::from_secs(30);
+            loop {
+                thread::sleep(interval);
+                if saver_dirty.swap(false, Ordering::Relaxed) {
+                    save_cache(&saver_index, &saver_path);
+                }
+            }
+        });
     });
 }
 
@@ -1268,6 +1626,7 @@ fn build_full_index(
     status: &Arc<RwLock<String>>,
 ) {
     *index.write() = IndexStore::new();
+    log_line(&format!("scan begin: {} drive(s)", drives.len()));
     {
         let mut store = index.write();
         for drive in drives {
@@ -1279,8 +1638,15 @@ fn build_full_index(
     }
 
     let total_start = Instant::now();
-    for drive in drives {
-        *status.write() = format!("Scanning {}:...", drive.letter);
+    let total_drives = drives.len();
+    let mut indexed = 0usize;
+    for (i, drive) in drives.iter().enumerate() {
+        *status.write() = format!(
+            "Scanning {}: (drive {}/{})...",
+            drive.letter,
+            i + 1,
+            total_drives
+        );
         let reader: MftReader = match MftReader::open(drive) {
             Ok(r) => r,
             Err(e) => {
@@ -1293,10 +1659,20 @@ fn build_full_index(
             Some(scan) if !scan.records.is_empty() => scan,
             _ => reader.scan(),
         };
+        indexed += scan.records.len();
+        *status.write() = format!(
+            "Indexing {} records (drive {}/{})...",
+            scan.records.len(),
+            i + 1,
+            total_drives
+        );
         index.write().populate_from_scan(scan, &drive.root);
+        *status.write() = format!("Indexed {indexed} files so far...");
     }
 
+    *status.write() = "Optimizing index (sorting + buckets)...".to_string();
     index.write().finalize();
+    *status.write() = "Saving cache...".to_string();
     save_cache(index, cache_path);
     *status.write() = format!("{} files indexed", index.read().len());
     let _ = writeln!(
@@ -1319,30 +1695,108 @@ fn save_cache(index: &Arc<RwLock<IndexStore>>, cache_path: &Path) {
     }
 }
 
-fn save_cache_with_checkpoints(
-    index: &Arc<RwLock<IndexStore>>,
-    live_checkpoints: &Arc<Mutex<Vec<JournalCheckpoint>>>,
-    cache_path: &Path,
-) {
-    {
-        let mut store = index.write();
-        if store.entries.is_empty() {
+/// Path of the one-time install marker that gates the first-run overlay.
+/// Serializes every cache write (30s saver, window-close, explicit save):
+/// two writers can never race over the temp file, and the rename only ever
+/// publishes a fully-written cache.
+static SAVE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Path of the index cache. Lives in LOCALAPPDATA (survives Disk Cleanup),
+/// not %TEMP% (which tools wipe and would silently force a full rescan).
+fn index_cache_path() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("FastSeek").join("index").join("fastseek_cache.bin")
+}
+
+/// Millis since epoch — used for watcher heartbeats.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Returns the existing FastSeek window when an instance is already running.
+fn ensure_single_instance() -> Option<HWND> {
+    let mut name: Vec<u16> = "FastSeek_SingleInstance"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let name_ptr = PCWSTR(name.as_mut_ptr());
+    let Ok(mutex) = (unsafe { CreateMutexW(None, true.into(), name_ptr) }) else {
+        return None; // could not even create the mutex; proceed anyway
+    };
+    let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    std::mem::forget(mutex); // keep the name owned until process exit
+    if !already_running {
+        return None;
+    }
+    let mut title: Vec<u16> = "FastSeek".encode_utf16().chain(std::iter::once(0)).collect();
+    let title_ptr = PCWSTR(title.as_mut_ptr());
+    unsafe { FindWindowW(PCWSTR::null(), title_ptr).ok() }
+}
+
+#[tauri::command]
+fn rebuild_index(state: tauri::State<AppState>) {
+    rebuild_index_impl(&state);
+}
+
+fn rebuild_index_impl(state: &AppState) {
+    state.ready.store(false, Ordering::Relaxed);
+    state.first_scan.store(false, Ordering::Relaxed);
+    *state.status.write() = String::from("Rebuilding index...");
+    let index = Arc::clone(&state.index);
+    let ready = Arc::clone(&state.ready);
+    let status = Arc::clone(&state.status);
+    thread::spawn(move || {
+        let cache_path = index_cache_path();
+        let _ = std::fs::remove_file(&cache_path);
+        let drives = get_ntfs_drives();
+        if drives.is_empty() {
+            *status.write() = String::from("No NTFS drives found. Run as Administrator.");
             return;
         }
-
-        let checkpoints = live_checkpoints.lock().clone();
-        if !checkpoints.is_empty() {
-            store.checkpoints = checkpoints;
+        build_full_index(&index, &drives, &cache_path, &status);
+        if index.read().len() == 0 {
+            *status.write() = String::from(
+                "Rebuild finished but nothing could be read — run as Administrator and try again.",
+            );
+            return;
         }
-    }
-    save_cache(index, cache_path);
+        ready.store(true, Ordering::Relaxed);
+        *status.write() = format!("{} files indexed", index.read().len());
+    });
+}
+
+#[tauri::command]
+fn copy_path(path: String, app: tauri::AppHandle) -> Result<(), String> {
+    app.clipboard_manager()
+        .write_text(path)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    log_line("exit: quit_app (scan page or UI)");
+    let state = app.state::<AppState>();
+    save_cache(&state.index, &index_cache_path());
+    app.exit(0);
+}
+
+fn first_run_marker() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("FastSeek").join("first-run-complete")
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!(
-        "tmp.{}",
-        std::process::id()
-    ));
+    let _guard = SAVE_LOCK.lock();
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
     std::fs::write(&tmp, bytes)?;
     match std::fs::rename(&tmp, path) {
         Ok(_) => Ok(()),

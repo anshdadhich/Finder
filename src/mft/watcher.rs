@@ -224,6 +224,7 @@
 
 
 use std::mem;
+use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;
 use crossbeam_channel::Sender;
 use windows::{
@@ -244,6 +245,13 @@ use windows::{
 use crate::mft::types::{FileKind, FileRecord, IndexEvent, JournalCheckpoint, NtfsDrive};
 
 const BUFFER_SIZE: usize = 64 * 1024;
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 pub struct UsnWatcher {
     handle: HANDLE,
@@ -336,18 +344,38 @@ impl UsnWatcher {
         let mut buffer = vec![0u8; BUFFER_SIZE];
         loop {
             std::thread::sleep(Duration::from_millis(500));
-            self.poll(&mut buffer);
+            let _ = self.poll(&mut buffer);
         }
     }
 
-    pub fn run_shared(&mut self, shared: std::sync::Arc<parking_lot::Mutex<Vec<JournalCheckpoint>>>) {
+    pub fn run_shared(&mut self, heartbeat: Arc<std::sync::atomic::AtomicU64>) {
         let mut buffer = vec![0u8; BUFFER_SIZE];
+        let mut last: Option<JournalCheckpoint> = None;
+        let mut consecutive_fails = 0u32;
         loop {
             std::thread::sleep(Duration::from_millis(500));
-            self.poll(&mut buffer);
-            let mut cps = shared.lock();
-            cps.retain(|c| c.drive_letter != self.drive.letter);
-            cps.push(self.checkpoint());
+            let ok = self.poll(&mut buffer);
+            if ok {
+                consecutive_fails = 0;
+                heartbeat.store(now_millis(), Ordering::Relaxed);
+            } else {
+                consecutive_fails += 1;
+                // ~4s of failing reads = the USN journal is gone or the
+                // handle broke (chkdsk/defrag/full/no journal). Stop the
+                // thread so the GUI watchdog flips the app back into the
+                // scan state instead of silently serving stale results.
+                if consecutive_fails >= 8 {
+                    heartbeat.store(0, Ordering::Relaxed);
+                    return;
+                }
+            }
+            let cp = self.checkpoint();
+            // Only push a checkpoint when it actually advanced, so idle runs
+            // don't wake the consumer or mark the cache dirty on every tick.
+            if last.as_ref() != Some(&cp) {
+                let _ = self.sender.send(IndexEvent::Checkpoint(cp.clone()));
+                last = Some(cp);
+            }
         }
     }
 
@@ -357,7 +385,7 @@ impl UsnWatcher {
         let mut count = 0;
         loop {
             let before = self.next_usn;
-            self.poll(&mut buffer);
+            let _ = self.poll(&mut buffer);
             if self.next_usn == before {
                 break;
             }
@@ -366,7 +394,9 @@ impl UsnWatcher {
         count
     }
 
-    fn poll(&mut self, buffer: &mut Vec<u8>) {
+    /// Returns false when the journal read itself failed (not when it is
+    /// merely idle — an idle read returning no records is a success).
+    fn poll(&mut self, buffer: &mut Vec<u8>) -> bool {
         let read_data = READ_USN_JOURNAL_DATA_V0 {
             StartUsn: self.next_usn,
             ReasonMask: USN_REASON_FILE_CREATE
@@ -393,26 +423,41 @@ impl UsnWatcher {
             )
         };
 
-        if ok.is_err() || bytes_returned <= 8 {
-            return;
+        if ok.is_err() {
+            return false;
+        }
+        if bytes_returned <= 8 {
+            return true; // no new records — healthy, idle
         }
 
         self.next_usn = i64::from_ne_bytes(buffer[0..8].try_into().unwrap());
 
+        let returned = bytes_returned as usize;
         let mut offset = 8usize;
-        while offset + mem::size_of::<USN_RECORD_V2>() <= bytes_returned as usize {
+        while offset + mem::size_of::<USN_RECORD_V2>() <= returned {
             let record = unsafe {
                 &*(buffer.as_ptr().add(offset) as *const USN_RECORD_V2)
             };
-            if record.RecordLength == 0 { break; }
-            self.process_record(record, buffer, offset);
-            offset += record.RecordLength as usize;
+            let rec_len = record.RecordLength as usize;
+            // Malformed/partial tail: never walk past the returned buffer and
+            // never trust a name pointer that extends past its own record.
+            if rec_len < mem::size_of::<USN_RECORD_V2>() || offset + rec_len > returned {
+                break;
+            }
+            self.process_record(record, buffer, offset, rec_len);
+            offset += rec_len;
         }
+
+        true
     }
 
-    fn process_record(&self, record: &USN_RECORD_V2, buffer: &[u8], offset: usize) {
+    fn process_record(&self, record: &USN_RECORD_V2, buffer: &[u8], offset: usize, rec_len: usize) {
         let name_offset = record.FileNameOffset as usize;
-        let name_len = record.FileNameLength as usize / 2;
+        let name_bytes = record.FileNameLength as usize;
+        if name_bytes == 0 || name_offset > rec_len || name_bytes > rec_len - name_offset {
+            return; // out-of-bounds name field — ignore this record
+        }
+        let name_len = name_bytes / 2;
         let name_ptr = unsafe {
             buffer.as_ptr().add(offset + name_offset) as *const u16
         };

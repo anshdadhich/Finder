@@ -1,27 +1,11 @@
 use rayon::prelude::*;
 use crate::index::store::IndexStore;
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::BTreeSet;
 
-const APP_EXTENSIONS: &[&str] = &["exe", "lnk", "msi", "appx", "msix"];
-const APP_PATH_MARKERS: &[&str] = &[
-    "\\program files\\", "\\program files (x86)\\",
-    "\\start menu\\", "\\desktop\\", "\\appdata\\",
-];
-
-const JUNK_PATH_MARKERS: &[&str] = &[
-   "\\windows\\", "\\program files\\", "\\program files (x86)\\",
-    "\\$recycle.bin\\", "\\prefetch\\", "\\appdata\\local\\temp\\",
-    "\\appdata\\local\\microsoft\\windows\\temporary internet files\\",
-    "\\perflogs\\", "\\debug\\", "\\bin\\", "\\obj\\",
-    "\\node_modules\\", "\\.git\\", "\\__pycache__\\"
-];
-
-// Add these constants
 const USER_PATH_MARKERS: &[&str] = &[
-    "\\users\\", "\\documents\\", "\\downloads\\", 
+    "\\users\\", "\\documents\\", "\\downloads\\",
     "\\desktop\\", "\\pictures\\", "\\videos\\", "\\music\\"
 ];
-
 
 #[derive(Debug, Clone)]
 pub struct AppInfo {
@@ -140,6 +124,137 @@ pub struct SearchResult {
     pub file_type_priority: u8, // New field
 }
 
+/// Paged search outcome. `total` is the exact match count for extension
+/// queries (the whole class is knowable in one hash lookup); generic
+/// queries report 0 ("unknown"), matching their one-shot cap.
+pub struct PagedSearch {
+    pub results: Vec<SearchResult>,
+    pub total: usize,
+}
+
+/// Extension implied by `query`: a literal dot-extension (".py") or a bare
+/// short word that happens to be an extension present in the index ("py",
+/// "md", "ini"). Dot-prefixed queries may be any length.
+fn extension_of(store: &IndexStore, q: &str) -> Option<String> {
+    let ext = if q.starts_with('.') && q.len() >= 3 {
+        Some(&q[1..])
+    } else if !q.contains('.') && q.len() >= 2 && q.len() <= 6 {
+        Some(q)
+    } else {
+        None
+    }?;
+    store.ext_index.contains_key(ext).then(|| ext.to_string())
+}
+
+/// Extension-class search: every file with that extension is a match, so the
+/// whole bucket is ranked once (parallel), sorted, and sliced by page. This
+/// is what makes ".py" return *all* python files instead of the first 500
+/// name-containment hits the generic path can afford.
+fn search_by_ext(
+    store: &IndexStore,
+    ext: &str,
+    q: &str,
+    limit: usize,
+    skip: usize,
+    excluded_dirs: &[String],
+) -> (Vec<SearchResult>, usize) {
+    let Some(bucket) = store.ext_index.get(ext) else {
+        return (Vec::new(), 0);
+    };
+
+    let mut ranked: Vec<(ResultMeta, SearchResult)> = bucket
+        .par_iter()
+        .filter_map(|&idx| {
+            let entry = &store.entries[idx as usize];
+            if is_junk_chain(store, entry) {
+                return None;
+            }
+            let full_path = build_path(entry.file_ref, store);
+            let path_lower = full_path.to_string_lossy().to_lowercase();
+            if !excluded_dirs.is_empty()
+                && excluded_dirs.iter().any(|ex| path_lower.starts_with(ex.as_str()))
+            {
+                return None;
+            }
+
+            let name_lower = store.name_lower(entry);
+            let base_rank = if name_lower == q {
+                1u8
+            } else if name_lower.starts_with(q) {
+                2
+            } else {
+                3
+            };
+            let boundary = base_rank <= 2 || word_prefix_match(name_lower, q);
+            let user = USER_PATH_MARKERS.iter().any(|m| path_lower.contains(m));
+            let depth = path_lower.matches('\\').count().min(15) as u8;
+            let name_len = (name_lower.len() as u32).min(255) as u8;
+
+            Some((
+                ResultMeta {
+                    rank: base_rank,
+                    boundary: if boundary { 0 } else { 1 },
+                    user: if user { 0 } else { 1 },
+                    depth,
+                    name_len,
+                    ext_prio: 0, // every row shares the queried extension
+                },
+                SearchResult {
+                    full_path,
+                    name: store.name(entry).to_string(),
+                    rank: base_rank,
+                    is_dir: entry.is_dir(),
+                    modified_time: None,
+                    file_type_priority: 0,
+                },
+            ))
+        })
+        .collect();
+
+    ranked.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let total = ranked.len(); // filtered total — junk rows never counted
+    let results = ranked
+        .into_iter()
+        .skip(skip)
+        .take(limit)
+        .map(|(_, r)| r)
+        .collect();
+    (results, total)
+}
+
+/// `search` plus extension-class paging. See `PagedSearch`.
+pub fn search_paged(
+    store: &IndexStore,
+    query: &str,
+    limit: usize,
+    skip: usize,
+    case_sensitive: bool,
+    excluded_dirs: &[String],
+) -> PagedSearch {
+    let q = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
+    if q.is_empty() {
+        return PagedSearch {
+            results: Vec::new(),
+            total: 0,
+        };
+    }
+
+    if !case_sensitive {
+        if let Some(ext) = extension_of(store, &q) {
+            let (results, total) = search_by_ext(store, &ext, &q, limit, skip, excluded_dirs);
+            return PagedSearch { results, total };
+        }
+    }
+
+    // ── Generic path: whole-index ranking with totals & real pagination ──
+    generic_paged(store, &q, limit, skip, excluded_dirs)
+}
+
+/// Backward-compatible single-page wrapper (tests / callers that don't page).
 pub fn search(
     store: &IndexStore,
     query: &str,
@@ -147,192 +262,215 @@ pub fn search(
     case_sensitive: bool,
     excluded_dirs: &[String],
 ) -> Vec<SearchResult> {
-    if query.is_empty() {
-        return Vec::new();
-    }
-
-    let q = if case_sensitive { query.to_string() } else { query.to_lowercase() };
-
-    // ── Phase 1: lightweight name-only matching ──────────────────────────
-    // `entries` are kept sorted by lowercase name (see IndexStore::finalize /
-    // insert / apply_events), so every exact/prefix match forms one
-    // contiguous run. Find it with two binary searches and skip the
-    // full-index scan whenever it already covers the overshoot budget.
-    let entries = &store.entries;
-    let name_lower_arena = &store.name_lower_arena;
-    let name_arena = &store.name_arena;
-
-    let overshoot = (limit * 5).max(1000);
-    let mut candidates: Vec<(u32, u8)>;
-
-    if !case_sensitive {
-        let start = entries.partition_point(|e| store.name_lower(e) < q.as_str());
-        // From `start` onward, `starts_with(q)` is monotone (false,true,false
-        // before it is impossible), so partition the suffix to find the run end.
-        let run_len = entries[start..]
-            .partition_point(|e| store.name_lower(e).starts_with(q.as_str()));
-        let end = start + run_len;
-        let run = &entries[start..end];
-
-        candidates = Vec::with_capacity(overshoot.min(run.len()));
-        for (i, e) in run.iter().enumerate() {
-            if store.name_lower(e) == q {
-                candidates.push(((start + i) as u32, 1));
-            }
-        }
-        if candidates.len() < overshoot {
-            for (i, e) in run.iter().enumerate() {
-                if candidates.len() >= overshoot {
-                    break;
-                }
-                if store.name_lower(e) != q {
-                    candidates.push(((start + i) as u32, 2));
-                }
-            }
-        }
-
-        if candidates.len() < overshoot {
-            // Not enough prefix matches: top up with the best rank-3
-            // (contains) matches, kept in a bounded heap so short queries
-            // cannot materialize the full match list for the whole index.
-            let need = overshoot - candidates.len();
-            let rank3: Vec<(u8, u32)> = entries
-                .par_iter()
-                .enumerate()
-                .filter_map(|(idx, entry)| {
-                    let name_cmp = unsafe {
-                        std::str::from_utf8_unchecked(
-                            &name_lower_arena[entry.name_lower_off as usize
-                                ..(entry.name_lower_off as usize + entry.name_lower_len as usize)],
-                        )
-                    };
-                    if !name_cmp.starts_with(q.as_str()) && name_cmp.contains(q.as_str()) {
-                        Some((3u8, idx as u32))
-                    } else {
-                        None
-                    }
-                })
-                .fold(
-                    BinaryHeap::<(u8, u32)>::new,
-                    |mut heap, cand| {
-                        if heap.len() < need {
-                            heap.push(cand);
-                        } else if cand < *heap.peek().unwrap() {
-                            heap.pop();
-                            heap.push(cand);
-                        }
-                        heap
-                    },
-                )
-                .reduce(BinaryHeap::<(u8, u32)>::new, |mut a, b| {
-                    for cand in b {
-                        if a.len() < need {
-                            a.push(cand);
-                        } else if cand < *a.peek().unwrap() {
-                            a.pop();
-                            a.push(cand);
-                        }
-                    }
-                    a
-                })
-                .into_sorted_vec();
-            candidates.extend(rank3.into_iter().map(|(r, i)| (i, r)));
-        }
-    } else {
-        // Case-sensitive: sorted-name invariant doesn't help — full scan.
-        candidates = entries
-            .par_iter()
-            .enumerate()
-            .filter_map(|(idx, entry)| {
-                let name_cmp = unsafe {
-                    std::str::from_utf8_unchecked(
-                        &name_arena[entry.name_off as usize..(entry.name_off as usize + entry.name_len as usize)]
-                    )
-                };
-
-                let rank = if name_cmp == q { 1u8 }
-                    else if name_cmp.starts_with(&q) { 2 }
-                    else if name_cmp.contains(q.as_str()) { 3 }
-                    else { return None; };
-
-                Some((idx as u32, rank))
-            })
-            .collect();
-        candidates.sort_unstable_by_key(|&(_, rank)| rank);
-    }
-    candidates.truncate(overshoot);
-
-    // ── Phase 3: build paths + exclusions + app promotion ────────────
-    let mut ranked: Vec<(ResultMeta, SearchResult)> = Vec::with_capacity(candidates.len());
-
-    for &(idx, base_rank) in &candidates {
-        let entry = &entries[idx as usize];
-        let full_path = build_path(entry.file_ref, store);
-        let path_lower = full_path.to_string_lossy().to_lowercase();
-        if JUNK_PATH_MARKERS.iter().any(|m| path_lower.contains(m)) {
-            continue;
-        }
-
-        if !excluded_dirs.is_empty() {
-            if excluded_dirs.iter().any(|ex| path_lower.starts_with(ex.as_str())) {
-                continue;
-            }
-        }
-
-        let name_lower = store.name_lower(entry);
-        let ext_prio = ext_priority(name_lower);
-        let rank = if base_rank <= 2 {
-            let ext = name_lower.rsplit('.').next().unwrap_or("");
-            if APP_EXTENSIONS.contains(&ext) {
-                if APP_PATH_MARKERS.iter().any(|m| path_lower.contains(m)) {
-                    0  // Installed app - top priority
-                } else if !JUNK_PATH_MARKERS.iter().any(|m| path_lower.contains(m)) {
-                    1  // App file but not in standard path
-                } else {
-                    base_rank  // App file in junk path, don't promote
-                }
-            } else {
-                base_rank
-            }
-        } else {
-            base_rank
-        };
-
-        let boundary = base_rank <= 2 || word_prefix_match(name_lower, &q);
-        let user = USER_PATH_MARKERS.iter().any(|m| path_lower.contains(m));
-        let depth = path_lower.matches('\\').count().min(15) as u8;
-        let name_len = (name_lower.len() as u32).min(255) as u8;
-
-        ranked.push((
-            ResultMeta {
-                rank,
-                boundary: if boundary { 0 } else { 1 },
-                user: if user { 0 } else { 1 },
-                depth,
-                name_len,
-                ext_prio,
-            },
-            SearchResult {
-                full_path,
-                name: store.name(entry).to_string(),
-                rank,
-                is_dir: entry.is_dir(),
-                modified_time: None,
-                file_type_priority: ext_prio,
-            },
-        ));
-    }
-
-    ranked.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    ranked.into_iter().take(limit).map(|(_, r)| r).collect()
+    search_paged(store, query, limit, 0, case_sensitive, excluded_dirs).results
 }
 
-pub fn apps(_store: &IndexStore, _limit: usize) -> Vec<SearchResult> {
-    let installed = get_installed_apps();
-    installed.into_iter().take(_limit).map(|app| {
+/// Junk-empty without building a full path string: walk the parent chain
+/// through the sorted file_ref lookup and compare each ancestor directory's
+/// lowercased name against the compact junk list. Deterministic, allocation
+/// free, ~1µs per row — so page windows of 100 rows cost microseconds.
+fn is_junk_chain(store: &IndexStore, entry: &crate::index::store::IndexEntry) -> bool {
+    let mut current = entry.parent_ref;
+    for _ in 0..32 {
+        // Parents pruned at scan time are not in the lookup; recognize them
+        // through the recorded junk ref set.
+        if store.junk_refs.contains(&current) {
+            return true;
+        }
+        let Some(idx) = store.lookup_idx(current) else {
+            break;
+        };
+        let e = &store.entries[idx as usize];
+        if !e.is_dir() {
+            break;
+        }
+        let name = store.name_lower(e);
+        if crate::index::store::JUNK_DIR_NAMES.iter().any(|j| *j == name) {
+            return true;
+        }
+        let next = e.parent_ref;
+        if next == current || next == 0 {
+            break;
+        }
+        current = next;
+    }
+    false
+}
+
+/// Generic (non-extension) paged search.
+///
+/// The Raycast part: one parallel scan ranks *every* match into a compact
+/// u64 key (tier | boundary | name length | entry index), the top of the
+/// ranked list is sorted once, and pages are deterministic slices of that
+/// same order. There is no "first 500 contains hits" window anymore — every
+/// query has a real total and every page walks the same ranked list.
+fn generic_paged(
+    store: &IndexStore,
+    q: &str,
+    limit: usize,
+    skip: usize,
+    excluded_dirs: &[String],
+) -> PagedSearch {
+    let entries = &store.entries;
+    let name_lower_arena = &store.name_lower_arena;
+
+    let mut keys: Vec<u64> = entries
+        .par_iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            let n = unsafe {
+                std::str::from_utf8_unchecked(
+                    &name_lower_arena[entry.name_lower_off as usize
+                        ..(entry.name_lower_off as usize + entry.name_lower_len as usize)],
+                )
+            };
+            let tier: Option<u64> = if n == q {
+                Some(1u64)
+            } else if n.starts_with(q) {
+                Some(2u64)
+            } else if word_prefix_match(n, q) {
+                Some(3u64)
+            } else if n.contains(q) {
+                Some(4u64)
+            } else {
+                None
+            };
+            tier.map(|t| {
+                (t << 44) | ((n.len().min(255) as u64) << 32) | (idx as u32 as u64)
+            })
+        })
+        .collect();
+
+    let total = keys.len();
+    keys.par_sort_unstable();
+
+    // Page: clean rows only. Junk ancestors are skipped but never counted,
+    // so the offset for the next page stays consistent.
+    let mut results: Vec<SearchResult> = Vec::with_capacity(limit);
+    let mut used_refs: std::collections::HashSet<u64> =
+        std::collections::HashSet::with_capacity(limit + 16);
+    let mut clean_seen = 0usize;
+
+    for &key in &keys {
+        if results.len() >= limit {
+            break;
+        }
+        let idx = (key & 0xFFFF_FFFF) as usize;
+        let entry = &entries[idx];
+        if is_junk_chain(store, entry) {
+            continue;
+        }
+        let full_path = build_path(entry.file_ref, store);
+        let path_lower = full_path.to_string_lossy().to_lowercase();
+        if !excluded_dirs.is_empty()
+            && excluded_dirs.iter().any(|ex| path_lower.starts_with(ex.as_str()))
+        {
+            continue;
+        }
+        if clean_seen < skip {
+            clean_seen += 1;
+            continue;
+        }
+        let name_lower = store.name_lower(entry);
+        let ext_prio = ext_priority(name_lower);
+        used_refs.insert(entry.file_ref);
+        results.push(SearchResult {
+            full_path,
+            name: store.name(entry).to_string(),
+            rank: ((key >> 40) & 0xF) as u8,
+            is_dir: entry.is_dir(),
+            modified_time: None,
+            file_type_priority: ext_prio,
+        });
+    }
+
+    // Fuzzy bottom pass, only when the short search ran dry (abbreviations
+    // like "vsc" never appear as substring matches). Page 1 only: the fuzzy
+    // candidate stream is ranked per query, so later pages would re-select
+    // the same rows and duplicate them; page 1 already surfaces everything
+    // worth seeing, and plain (deterministic) rows serve the rest.
+    if q.len() >= 2 && skip == 0 && results.len() < limit {
+        fuzzy_fill(store, q, excluded_dirs, &used_refs, &mut results, limit);
+    }
+
+    PagedSearch { results, total }
+}
+
+/// Lay a fuzzy (fzy) ranking over the whole name arena, appending the best
+/// non-duplicate, non-junk, non-excluded candidates as a bottom rank tier.
+fn fuzzy_fill(
+    store: &IndexStore,
+    q: &str,
+    excluded_dirs: &[String],
+    used_refs: &std::collections::HashSet<u64>,
+    results: &mut Vec<SearchResult>,
+    limit: usize,
+) {
+    use fuzzy_matcher::FuzzyMatcher;
+    let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+
+    let need = (limit - results.len()).min(200);
+    if need == 0 {
+        return;
+    }
+
+    let entries = &store.entries;
+    let name_lower_arena = &store.name_lower_arena;
+
+    let mut best: Vec<(i64, u32)> = entries
+        .par_iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            if used_refs.contains(&entry.file_ref) {
+                return None;
+            }
+            let n = unsafe {
+                std::str::from_utf8_unchecked(
+                    &name_lower_arena[entry.name_lower_off as usize
+                        ..(entry.name_lower_off as usize + entry.name_lower_len as usize)],
+                )
+            };
+            matcher.fuzzy_match(n, q).map(|score| (score, idx as u32))
+        })
+        .collect();
+    best.par_sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    best.truncate(need);
+
+    for (_, idx) in best {
+        if results.len() >= limit {
+            break;
+        }
+        let entry = &entries[idx as usize];
+        if is_junk_chain(store, entry) {
+            continue;
+        }
+        let full_path = build_path(entry.file_ref, store);
+        let path_lower = full_path.to_string_lossy().to_lowercase();
+        if !excluded_dirs.is_empty()
+            && excluded_dirs.iter().any(|ex| path_lower.starts_with(ex.as_str()))
+        {
+            continue;
+        }
+        results.push(SearchResult {
+            full_path,
+            name: store.name(entry).to_string(),
+            rank: 5,
+            is_dir: entry.is_dir(),
+            modified_time: None,
+            file_type_priority: ext_priority(store.name_lower(entry)),
+        });
+    }
+}
+
+pub fn apps(_store: &IndexStore, limit: usize) -> Vec<SearchResult> {
+    // Enumerating the registry is expensive (~tens of ms). Cache the result
+    // for the process lifetime so repeated calls are instant.
+    static CACHE: std::sync::OnceLock<Vec<AppInfo>> = std::sync::OnceLock::new();
+    let installed = CACHE.get_or_init(get_installed_apps);
+    installed.iter().take(limit).map(|app| {
         SearchResult {
-            full_path: std::path::PathBuf::from(app.path.unwrap_or_default()),
-            name: app.name,
+            full_path: std::path::PathBuf::from(app.path.clone().unwrap_or_default()),
+            name: app.name.clone(),
             rank: 0,
             is_dir: false,
             modified_time: None,
@@ -382,6 +520,9 @@ mod tests {
             ref_lookup: Vec::new(),
             drive_root: "C:\\".to_string(),
             checkpoints: Vec::new(),
+            junk_refs: std::collections::HashSet::new(),
+            ext_index: std::collections::HashMap::new(),
+            ext_dirty: true,
         };
         for &(fr, name, parent, ref kind) in items {
             let lower = name.to_lowercase();
@@ -438,6 +579,125 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_fallback_surfaces_abbreviations() {
+        // "vsc" is an abbreviation — no literal name contains it, so only the
+        // fuzzy fallback can surface Visual Studio Code.
+        let store = store(&[
+            (1, "Visual Studio Code.lnk", 0, FileKind::File),
+            (2, "Vim.exe", 0, FileKind::File),
+            (3, "somethingelse.txt", 0, FileKind::File),
+        ]);
+        let results = search(&store, "vsc", 10, false, &[]);
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"Visual Studio Code.lnk"));
+    }
+
+    #[test]
+    fn fuzzy_never_bumps_literal_matches() {
+        // Prefix matches must stay in front of any fuzzy-filled results.
+        let store = store(&[
+            (1, "Visual Studio Code.lnk", 0, FileKind::File),
+            (2, "visualstudio.exe", 0, FileKind::File),
+            (3, "Vim.exe", 0, FileKind::File),
+        ]);
+        let results = search(&store, "vis", 10, false, &[]);
+        let names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        // Both literal prefix matches lead the list.
+        assert!(names.contains(&"Visual Studio Code.lnk"));
+        assert!(names.contains(&"visualstudio.exe"));
+        assert!(names[0] == "Visual Studio Code.lnk" || names[0] == "visualstudio.exe");
+        assert!(names[1] == "Visual Studio Code.lnk" || names[1] == "visualstudio.exe");
+    }
+
+    #[test]
+    fn ext_search_returns_all_matches_with_paging() {
+        let names: Vec<String> = (0..300).map(|i| format!("mod_{:03}.py", i)).collect();
+        let mut items: Vec<(u64, &str, u64, FileKind)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (1000 + i as u64, n.as_str(), 40, FileKind::File))
+            .collect();
+        items.push((99, "notes.txt", 40, FileKind::File));
+
+        let mut s = store(&items);
+        s.rebuild_ext_index();
+
+        let p1 = search_paged(&s, ".py", 100, 0, false, &[]);
+        assert_eq!(p1.total, 300);
+        assert_eq!(p1.results.len(), 100);
+
+        let p2 = search_paged(&s, ".py", 100, 100, false, &[]);
+        assert_eq!(p2.results.len(), 100);
+
+        let p3 = search_paged(&s, ".py", 100, 200, false, &[]);
+        assert_eq!(p3.results.len(), 100);
+
+        let names1: std::collections::HashSet<String> =
+            p1.results.iter().map(|r| r.name.clone()).collect();
+        let names2: std::collections::HashSet<String> =
+            p2.results.iter().map(|r| r.name.clone()).collect();
+        let names3: std::collections::HashSet<String> =
+            p3.results.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(names1.len(), 100);
+        assert!(names1.is_disjoint(&names2));
+        assert!(names1.is_disjoint(&names3));
+        assert!(names2.is_disjoint(&names3));
+
+        // Bare extension word behaves the same.
+        let bare = search_paged(&s, "py", 100, 0, false, &[]);
+        assert_eq!(bare.total, 300);
+        assert_eq!(bare.results.len(), 100);
+
+        // Unrelated extension still works and reports its exact total.
+        let txt = search_paged(&s, ".txt", 100, 0, false, &[]);
+        assert_eq!(txt.total, 1);
+        assert_eq!(txt.results.len(), 1);
+        assert_eq!(txt.results[0].name, "notes.txt");
+    }
+
+    #[test]
+    fn ext_search_is_ranked_and_dotfiles_do_not_leak() {
+        let items = [
+            (1, "setup.py", 40, FileKind::File),
+            (2, "PyGame.py", 40, FileKind::File),
+            (3, ".pyproject", 40, FileKind::File), // dotfile: no extension bucket
+            (4, "init.py", 40, FileKind::File),
+        ];
+        let mut s = store(&items);
+        s.rebuild_ext_index();
+
+        let page = search_paged(&s, ".py", 10, 0, false, &[]);
+        // ".pyproject" is not a .py file — only 3 true matches.
+        assert_eq!(page.total, 3);
+        assert_eq!(page.results.len(), 3);
+
+        // Bare form: names starting with the query ("PyGame") rank first.
+        let bare = search_paged(&s, "py", 10, 0, false, &[]);
+        assert_eq!(bare.total, 3);
+        assert_eq!(bare.results[0].name, "PyGame.py");
+    }
+
+    #[test]
+    fn ext_index_covers_all_files_but_skips_junk() {
+        let items = [
+            (40, "Users", 0, FileKind::Directory),
+            (30, "node_modules", 0, FileKind::Directory),
+            (1, "app.py", 40, FileKind::File),
+            (2, "tool.py", 30, FileKind::File), // under node_modules (junk)
+        ];
+        let mut s = store(&items);
+        s.rebuild_ext_index();
+
+        // Total counts only searchable rows; junk is filtered from both the
+        // count and the page so "N more" math stays honest.
+        let page = search_paged(&s, ".py", 10, 0, false, &[]);
+        assert_eq!(page.total, 1);
+        assert_eq!(page.results.len(), 1);
+        assert_eq!(page.results[0].name, "app.py");
+        assert_eq!(page.results[0].name, "app.py");
+    }
+
+    #[test]
     #[ignore]
     fn perf_large_index() {
         // Synthetic ~300k-entry index. Run with:
@@ -452,6 +712,9 @@ mod tests {
             ref_lookup: Vec::new(),
             drive_root: "C:\\".to_string(),
             checkpoints: Vec::new(),
+            junk_refs: std::collections::HashSet::new(),
+            ext_index: std::collections::HashMap::new(),
+            ext_dirty: true,
         };
         let base = 100u64;
         for i in 0..n {

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::{self, Write};
 use parking_lot::RwLock;
 use crossbeam_channel::unbounded;
@@ -100,20 +101,10 @@ fn main() {
                                     drop(delta_tx);
 
                                     if journal_ok {
-                                        let mut applied = 0usize;
-                                        let mut store = index.write();
-                                        for event in delta_rx {
-                                            match event {
-                                                IndexEvent::Created(r) => store.insert(r),
-                                                IndexEvent::Deleted(id) => store.remove(id),
-                                                IndexEvent::Renamed { old_ref, new_record } => {
-                                                    store.rename(old_ref, new_record)
-                                                }
-                                                IndexEvent::Moved { file_ref, new_parent_ref, name, kind } => {
-                                                    store.apply_move(file_ref, new_parent_ref, name, kind);
-                                                }
-                                            }
-                                            applied += 1;
+                                        let events: Vec<IndexEvent> = delta_rx.into_iter().collect();
+                                        let applied = events.len();
+                                        if !events.is_empty() {
+                                            index.write().apply_events(events);
                                         }
                                         println!("{} change(s) applied", applied);
                                         println!();
@@ -217,19 +208,8 @@ fn main() {
             if store.entries.is_empty() {
                 eprintln!("Not saving empty cache.");
             } else {
-            let cache = store.to_cache();
-            match bincode::serialize(&cache) {
-                Ok(bytes) => {
-                    let raw_mb = bytes.len() as f64 / 1_048_576.0;
-                    let compressed = lz4_flex::compress_prepend_size(&bytes);
-                    let comp_mb = compressed.len() as f64 / 1_048_576.0;
-                    match std::fs::write(&cache_path, &compressed) {
-                        Ok(_) => println!("Cache saved — {:.1}MB compressed ({:.1}MB raw)", comp_mb, raw_mb),
-                        Err(e) => eprintln!("Could not save cache: {}", e),
-                    }
-                }
-                Err(e) => eprintln!("Could not serialize: {}", e),
-            }
+                let cache = store.to_cache();
+                persist_cache(&cache, &cache_path, true);
             }
         }
 
@@ -239,53 +219,86 @@ fn main() {
     }
 
     // --- USN watchers for live updates while running ---
-    let live_checkpoints: Arc<parking_lot::Mutex<Vec<fastsearch::mft::types::JournalCheckpoint>>> =
-        Arc::new(parking_lot::Mutex::new(index.read().checkpoints.clone()));
-
     for drive in &drives {
         let tx_clone = tx.clone();
         let drive_clone = drive.clone();
-        let cps = Arc::clone(&live_checkpoints);
         std::thread::spawn(move || {
             if let Ok(mut watcher) = UsnWatcher::new(&drive_clone, tx_clone) {
-                watcher.run_shared(cps);
+                watcher.run_shared(Arc::new(std::sync::atomic::AtomicU64::new(0)));
             }
         });
     }
 
-    // --- Live index updates ---
+    // --- Live index updates + checkpoint tracking ---
+    // The applier consumes both data events and Checkpoint markers off the
+    // same ordered channel. A Checkpoint is only stored in `store.checkpoints`
+    // after every event that precedes it has been applied, so persisting that
+    // checkpoint is always a consistent snapshot of the index.
+    let dirty: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let index_live: Arc<RwLock<IndexStore>> = Arc::clone(&index);
+    let dirty_live = Arc::clone(&dirty);
     std::thread::spawn(move || {
+        let mut pending: Vec<IndexEvent> = Vec::with_capacity(64);
         for event in rx {
-            let mut store = index_live.write();
             match event {
-                IndexEvent::Created(r) => store.insert(r),
-                IndexEvent::Deleted(id) => store.remove(id),
-                IndexEvent::Renamed { old_ref, new_record } => store.rename(old_ref, new_record),
-                IndexEvent::Moved { file_ref, new_parent_ref, name, kind } => {
-                    store.apply_move(file_ref, new_parent_ref, name, kind);
+                IndexEvent::Checkpoint(cp) => {
+                    if !pending.is_empty() {
+                        index_live.write().apply_events(std::mem::take(&mut pending));
+                    }
+                    let mut store = index_live.write();
+                    store.checkpoints.retain(|c| c.drive_letter != cp.drive_letter);
+                    store.checkpoints.push(cp.clone());
+                    dirty_live.store(true, Ordering::Relaxed);
+                }
+                other => {
+                    pending.push(other);
+                    if pending.len() >= 64 {
+                        index_live.write().apply_events(std::mem::take(&mut pending));
+                        dirty_live.store(true, Ordering::Relaxed);
+                    }
                 }
             }
         }
     });
 
-    // Save updated cache on exit with latest checkpoints from live watchers
+    // --- Periodic cache persistence ---
+    // The cache is only written on a clean exit today; a hard kill (Task
+    // Manager / crash) would lose the USN checkpoints and force a full rescan.
+    // Persist it on an interval, but only when the index actually changed.
+    {
+        let index_saver = Arc::clone(&index);
+        let dirty_saver = Arc::clone(&dirty);
+        let cache_path_saver = cache_path.clone();
+        std::thread::spawn(move || {
+            let interval = std::time::Duration::from_secs(30);
+            loop {
+                std::thread::sleep(interval);
+                if dirty_saver.swap(false, Ordering::Relaxed) {
+                    let cache = {
+                        let store = index_saver.read();
+                        if store.entries.is_empty() {
+                            continue;
+                        }
+                        store.to_cache()
+                    };
+                    persist_cache(&cache, &cache_path_saver, false);
+                }
+            }
+        });
+    }
+
+    // Save updated cache on exit; `store.to_cache()` carries the latest
+    // checkpoints maintained by the live applier above.
     let index_for_save = Arc::clone(&index);
-    let cps_for_save = Arc::clone(&live_checkpoints);
     ctrlc::set_handler(move || {
-        let mut store = index_for_save.write();
-        if store.entries.is_empty() {
-            std::process::exit(0);
-        }
-        store.checkpoints = cps_for_save.lock().clone();
-        let cache = store.to_cache();
-        if let Ok(bytes) = bincode::serialize(&cache) {
-            let compressed = lz4_flex::compress_prepend_size(&bytes);
-            let _ = std::fs::write(
-                std::env::temp_dir().join("fastseek_cache.bin"),
-                &compressed,
-            );
-        }
+        let cache = {
+            let store = index_for_save.write();
+            if store.entries.is_empty() {
+                std::process::exit(0);
+            }
+            store.to_cache()
+        };
+        persist_cache(&cache, &std::env::temp_dir().join("fastseek_cache.bin"), false);
         std::process::exit(0);
     }).ok();
 
@@ -539,6 +552,29 @@ fn load_exclusions(path: &std::path::Path) -> Vec<String> {
 fn save_exclusions(path: &std::path::Path, dirs: &[String]) {
     let content: String = dirs.join("\n");
     let _ = std::fs::write(path, content);
+}
+
+fn persist_cache(
+    cache: &fastsearch::index::store::CacheData,
+    cache_path: &std::path::Path,
+    verbose: bool,
+) {
+    match bincode::serialize(cache) {
+        Ok(bytes) => {
+            let compressed = lz4_flex::compress_prepend_size(&bytes);
+            match std::fs::write(cache_path, &compressed) {
+                Ok(_) => {
+                    if verbose {
+                        let raw_mb = bytes.len() as f64 / 1_048_576.0;
+                        let comp_mb = compressed.len() as f64 / 1_048_576.0;
+                        println!("Cache saved — {:.1}MB compressed ({:.1}MB raw)", comp_mb, raw_mb);
+                    }
+                }
+                Err(e) => eprintln!("Could not save cache: {}", e),
+            }
+        }
+        Err(e) => eprintln!("Could not serialize cache: {}", e),
+    }
 }
 
 

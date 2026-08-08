@@ -54,13 +54,17 @@ ctrlc = "3.5"
 memmap2 = "0.9"
 winreg = "0.52"
 serde_json = "1"
-tauri = { version = "1", features = ["global-shortcut-all", "system-tray", "window-hide", "window-show", "window-set-focus"] }
+tauri = { version = "1", features = ["global-shortcut-all", "system-tray", "window-hide", "window-show", "window-set-focus", "clipboard-write-text"] }
 image = { version = "0.24", default-features = false, features = ["png"] }
 base64 = "0.21"
 
 [build-dependencies]
 tauri-build = { version = "1", features = [] }
-winres = "0.1"
+
+[features]
+# Builds requiring an elevated manifest (the shipped exe) opt in explicitly:
+#   cargo build --release --features embed-resources
+embed-resources = []
 
 [profile.release]
 opt-level = 3

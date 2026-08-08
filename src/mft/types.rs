@@ -68,9 +68,14 @@ pub enum IndexEvent {
     Deleted(u64),
     Renamed { old_ref: u64, new_record: FileRecord },
     Moved { file_ref: u64, new_parent_ref: u64, name: String, kind: FileKind },
+    /// A USN journal checkpoint emitted by the live watcher *after* all events
+    /// that occurred before it on the same channel. Once applied, every prior
+    /// event is guaranteed to be reflected in the index, so persisting this
+    /// checkpoint can never lose or duplicate changes on a restart.
+    Checkpoint(JournalCheckpoint),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JournalCheckpoint {
     pub next_usn: i64,
     pub journal_id: u64,

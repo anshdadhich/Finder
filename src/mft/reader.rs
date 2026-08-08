@@ -22,6 +22,7 @@ const FALLBACK_BUF: usize = 4 * 1024 * 1024;
 const DIRECT_BUF: usize = 4 * 1024 * 1024;
 
 /// Compact MFT record — no heap allocations per file.
+#[derive(Clone, Copy)]
 pub struct CompactRecord {
     pub file_ref: u64,
     pub parent_ref: u64,
