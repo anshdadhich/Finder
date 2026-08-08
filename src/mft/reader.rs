@@ -7,7 +7,8 @@ use windows::{
     Win32::Foundation::HANDLE,
     Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, SetFilePointerEx,
-        FILE_BEGIN, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_SEQUENTIAL_SCAN,
+        FILE_BEGIN, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_SEQUENTIAL_SCAN,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     },
     Win32::System::Ioctl::{
@@ -18,8 +19,18 @@ use windows::{
 
 use crate::mft::types::NtfsDrive;
 
-const FALLBACK_BUF: usize = 4 * 1024 * 1024;
-const DIRECT_BUF: usize = 4 * 1024 * 1024;
+const FALLBACK_BUF: usize = 16 * 1024 * 1024;
+const DIRECT_BUF: usize = 16 * 1024 * 1024;
+
+/// Records parsed per parallel task; each core owns its slice of the buffer.
+const PARSE_SEG_RECS: usize = 512;
+
+/// One core's slice of a parsed MFT chunk. name offsets are part-relative
+/// until the driver shifts them while merging parts in order.
+struct ParsedPart {
+    records: Vec<CompactRecord>,
+    names: Vec<u16>,
+}
 
 /// Compact MFT record — no heap allocations per file.
 #[derive(Clone, Copy)]
@@ -72,38 +83,52 @@ impl MftReader {
     //  Primary: direct $MFT file read  (falls back to FSCTL if fails)
     // ---------------------------------------------------------------
 
-    /// Try direct sequential read of $MFT for maximum speed.
-    /// Returns None if direct access is unavailable.
-    pub fn scan_direct(&self) -> Option<ScanResult> {
-        let record_size = self.read_mft_record_size()?;
+    /// Read one disjoint, record-aligned range of $MFT from a dedicated
+    /// handle and parse it into (records, names) with range-local offsets.
+    /// Sequential within the stream; streams run in parallel, so the NVMe's
+    /// queue depth is used instead of one ~120 MB/s serial stream.
+    fn read_record_range(
+        mft_wide: &[u16],
+        start_rec: u64,
+        end_rec: u64,
+        record_size: usize,
+    ) -> (Vec<CompactRecord>, Vec<u16>) {
+        let mut records: Vec<CompactRecord> = Vec::with_capacity((end_rec - start_rec) as usize);
+        let mut name_data: Vec<u16> = Vec::new();
 
-        let mft_path = format!("{}$MFT", self.drive.root);
-        let mft_wide: Vec<u16> = mft_path.encode_utf16().chain(Some(0)).collect();
-
-        let mft_handle = unsafe {
+        let handle = unsafe {
             CreateFileW(
                 PCWSTR(mft_wide.as_ptr()),
                 0x80000000u32,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 None,
                 OPEN_EXISTING,
+                // NOTE: FILE_FLAG_NO_BUFFERING was tried here and the open is
+                // rejected by NTFS on $MFT (CreateFileW fails on every
+                // attempt) — the FSCTL enumeration below is the fast path
+                // and this buffered direct read only remains as a fallback.
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_SEQUENTIAL_SCAN,
                 None,
             )
-            .ok()?
+        };
+        let Ok(handle) = handle else {
+            return (records, name_data);
         };
 
-        let mut records: Vec<CompactRecord> = Vec::with_capacity(3_000_000);
-        let mut name_data: Vec<u16> = Vec::with_capacity(40_000_000);
+        // The handle starts at byte 0; this stream owns bytes
+        // [start_rec*RS, end_rec*RS) of the MFT.
+        let pos = start_rec as i64 * record_size as i64;
+        let _ = unsafe { SetFilePointerEx(handle, pos, None, FILE_BEGIN) };
+
+        let mut rec_index = start_rec;
         let mut buffer = vec![0u8; DIRECT_BUF];
-        let mut mft_index: u64 = 0;
         let mut leftover = 0usize;
 
         loop {
             let mut bytes_read = 0u32;
             let ok = unsafe {
                 ReadFile(
-                    mft_handle,
+                    handle,
                     Some(&mut buffer[leftover..]),
                     Some(&mut bytes_read),
                     None,
@@ -114,53 +139,106 @@ impl MftReader {
             }
 
             let total = leftover + bytes_read as usize;
-            let mut offset = 0usize;
+            let rem = ((end_rec - rec_index) as usize) * record_size;
+            let usable = total.min(rem);
+            let aligned = usable - (usable % record_size);
 
-            while offset + record_size <= total {
-                let applied =
-                    Self::apply_fixup(&mut buffer[offset..offset + record_size], record_size);
-            
-                if applied {
-                    Self::parse_file_record(
-                        &buffer[offset..offset + record_size],
-                        mft_index,
-                        &mut records,
-                        &mut name_data,
-                    );
+            let seg_bytes = PARSE_SEG_RECS * record_size;
+            let n_segs = aligned.div_ceil(seg_bytes);
+            let mut base = name_data.len() as u32;
+            for s in 0..n_segs {
+                let start = s * seg_bytes;
+                let end = ((s + 1) * seg_bytes).min(aligned);
+                let mut part =
+                    Self::parse_segment(&buffer[start..end], record_size, rec_index + (start / record_size) as u64);
+                for r in &mut part.records {
+                    r.name_off += base;
                 }
-            
-                mft_index += 1;
-                offset += record_size;
+                if !part.names.is_empty() {
+                    name_data.extend_from_slice(&part.names);
+                    base += part.names.len() as u32;
+                }
+                for r in part.records.drain(..) {
+                    records.push(r);
+                }
             }
 
-            offset = total - (total % record_size);
+            rec_index += (aligned / record_size) as u64;
 
-            leftover = total - offset;
+            if usable < total {
+                // Read past this stream's range (next stream owns those
+                // bytes) — discard and finish.
+                break;
+            }
+            leftover = total - aligned;
             if leftover > 0 {
                 unsafe {
                     std::ptr::copy(
-                        buffer.as_ptr().add(offset),
+                        buffer.as_ptr().add(aligned),
                         buffer.as_mut_ptr(),
                         leftover,
                     );
                 }
             }
-
-            // for (mut recs, mut names) in results {
-            //     records.append(&mut recs);
-            //     name_data.append(&mut names);
-            // }
         }
 
         unsafe {
-            windows::Win32::Foundation::CloseHandle(mft_handle).ok();
+            windows::Win32::Foundation::CloseHandle(handle).ok();
+        }
+        (records, name_data)
+    }
+
+    /// Try direct sequential read of $MFT for maximum speed.
+    /// Returns None if direct access is unavailable.
+    pub fn scan_direct(&self) -> Option<ScanResult> {
+        let record_size = self.read_mft_record_size()?;
+
+        let mft_path = format!("{}$MFT", self.drive.root);
+        let mft_size = std::fs::metadata(&mft_path).ok()?.len();
+        if mft_size < record_size as u64 {
+            return None;
+        }
+        let mft_wide: Vec<u16> = mft_path.encode_utf16().chain(Some(0)).collect();
+
+        let total_recs = mft_size / record_size as u64;
+        let streams = (total_recs / 400_000).clamp(1, 8) as usize;
+        let chunk_recs = (total_recs as usize).div_ceil(streams);
+
+        // Each stream reads + parses its own slice of the MFT on its own
+        // handle; ranges are record-aligned so no record is split.
+        let parts: Vec<(Vec<CompactRecord>, Vec<u16>)> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(streams);
+            for s in 0..streams {
+                let wide = mft_wide.clone();
+                handles.push(scope.spawn(move || {
+                    let start_rec = s as u64 * chunk_recs as u64;
+                    let end_rec = ((s + 1) as u64 * chunk_recs as u64).min(total_recs);
+                    Self::read_record_range(&wide, start_rec, end_rec, record_size)
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let mut records: Vec<CompactRecord> = Vec::with_capacity(total_recs as usize);
+        let mut name_data: Vec<u16> = Vec::with_capacity(40_000_000);
+        let mut base = 0u32;
+        for (mut recs, names) in parts {
+            for r in &mut recs {
+                r.name_off += base;
+            }
+            name_data.extend_from_slice(&names);
+            base += names.len() as u32;
+            records.extend(recs);
         }
 
-        Some(ScanResult { records, name_data })
+        Some(ScanResult {
+            records,
+            name_data,
+        })
     }
 
     // ---------------------------------------------------------------
-    //  Fallback: FSCTL_ENUM_USN_DATA  (4 MB buffer)
+    //  Fallback: FSCTL_ENUM_USN_DATA  (16 MB buffer)
     // ---------------------------------------------------------------
 
     pub fn scan(&self) -> ScanResult {
@@ -240,7 +318,10 @@ impl MftReader {
             }
         }
 
-        ScanResult { records, name_data }
+        ScanResult {
+            records,
+            name_data,
+        }
     }
 
     // ---------------------------------------------------------------
@@ -273,6 +354,31 @@ impl MftReader {
         };
 
         Some(record_size)
+    }
+
+    /// Parse one record-aligned slice: each record is copied out of the
+    /// shared read buffer (fixups mutate bytes), then parsed into the part's
+    /// own arenas. Name offsets stay part-relative until the merge step.
+    fn parse_segment(buf: &[u8], record_size: usize, first_index: u64) -> ParsedPart {
+        let mut part = ParsedPart {
+            records: Vec::with_capacity(PARSE_SEG_RECS),
+            names: Vec::new(),
+        };
+        let mut scratch = vec![0u8; record_size];
+        let count = buf.len() / record_size;
+        for i in 0..count {
+            let src = &buf[i * record_size..(i + 1) * record_size];
+            scratch.copy_from_slice(src);
+            if MftReader::apply_fixup(&mut scratch, record_size) {
+                MftReader::parse_file_record(
+                    &scratch,
+                    first_index + i as u64,
+                    &mut part.records,
+                    &mut part.names,
+                );
+            }
+        }
+        part
     }
 
     /// Apply NTFS multi-sector fixup. Returns false if the record is invalid.

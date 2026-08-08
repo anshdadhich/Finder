@@ -1705,9 +1705,26 @@ fn build_full_index(
         };
 
         let t_read = Instant::now();
-        let scan = match reader.scan_direct() {
-            Some(scan) if !scan.records.is_empty() => scan,
-            _ => reader.scan(),
+        // FSCTL_ENUM_USN enumeration (active records only, 16 MB IOCTL
+        // buffers) is the fast scan path (~6s for a 4 GB MFT). The raw
+        // $MFT file read is slower and kept only as a fallback, so a
+        // drive where the IOCTL misbehaves still indexes.
+        let forced_direct = std::env::var_os("FASTSEEK_DIRECT").is_some();
+        let (scan, method): (_, &str) = if forced_direct {
+            match reader.scan_direct() {
+                Some(scan) if !scan.records.is_empty() => (scan, "direct"),
+                _ => (reader.scan(), "ioctl"),
+            }
+        } else {
+            let scan = reader.scan();
+            if scan.records.is_empty() {
+                match reader.scan_direct() {
+                    Some(direct) if !direct.records.is_empty() => (direct, "direct-fallback"),
+                    _ => (scan, "ioctl"),
+                }
+            } else {
+                (scan, "ioctl")
+            }
         };
         let read_secs = t_read.elapsed().as_secs_f64();
         indexed += scan.records.len();
@@ -1721,8 +1738,13 @@ fn build_full_index(
         index.write().populate_from_scan(scan, &drive.root);
         let index_secs = t_index.elapsed().as_secs_f64();
         log_line(&format!(
-            "scan drive {}: {} records (read {:.2}s, index {:.2}s)",
-            drive.letter, indexed, read_secs, index_secs
+            "scan drive {}: {} records via {} (read+parse {:.2}s, index {:.2}s; workers {})",
+            drive.letter,
+            indexed,
+            method,
+            read_secs,
+            index_secs,
+            rayon::current_num_threads()
         ));
         *status.write() = format!("Indexed {indexed} files so far...");
     }
