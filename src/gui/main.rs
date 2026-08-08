@@ -1704,10 +1704,12 @@ fn build_full_index(
             }
         };
 
+        let t_read = Instant::now();
         let scan = match reader.scan_direct() {
             Some(scan) if !scan.records.is_empty() => scan,
             _ => reader.scan(),
         };
+        let read_secs = t_read.elapsed().as_secs_f64();
         indexed += scan.records.len();
         *status.write() = format!(
             "Indexing {} records (drive {}/{})...",
@@ -1715,20 +1717,31 @@ fn build_full_index(
             i + 1,
             total_drives
         );
+        let t_index = Instant::now();
         index.write().populate_from_scan(scan, &drive.root);
+        let index_secs = t_index.elapsed().as_secs_f64();
+        log_line(&format!(
+            "scan drive {}: {} records (read {:.2}s, index {:.2}s)",
+            drive.letter, indexed, read_secs, index_secs
+        ));
         *status.write() = format!("Indexed {indexed} files so far...");
     }
 
     *status.write() = "Optimizing index (sorting + buckets)...".to_string();
+    let t_fin = Instant::now();
     index.write().finalize();
+    let fin_secs = t_fin.elapsed().as_secs_f64();
     *status.write() = "Saving cache...".to_string();
+    let t_save = Instant::now();
     save_cache(index, cache_path);
+    let save_secs = t_save.elapsed().as_secs_f64();
     *status.write() = format!("{} files indexed", index.read().len());
-    let _ = writeln!(
-        io::stderr(),
-        "FastSeek index ready in {:.2}s",
-        total_start.elapsed().as_secs_f64()
-    );
+    let total_secs = total_start.elapsed().as_secs_f64();
+    log_line(&format!(
+        "index ready in {:.2}s (finalize {:.2}s, save {:.2}s, drives {})",
+        total_secs, fin_secs, save_secs, total_drives
+    ));
+    let _ = writeln!(io::stderr(), "FastSeek index ready in {:.2}s", total_secs);
 }
 
 fn save_cache(index: &Arc<RwLock<IndexStore>>, cache_path: &Path) {
@@ -1854,13 +1867,17 @@ fn file_preview(path: String) -> Option<PreviewInfo> {
 
 /// Animates the palette between the wide (preview) and compact (results-only)
 /// widths. JS steps this command frame-by-frame; the clamp keeps a glitchy
-/// caller from blowing the window past its authored sizes.
+/// caller from blowing the window past its authored sizes. Resizing anchors
+/// the LEFT edge, so every step re-centers on the monitor — this also fixes
+/// the boot case where the hidden-by-default preview shrinks an 820px window.
 #[tauri::command]
 fn resize_palette(window: tauri::Window, width: u32) -> Result<(), String> {
     let width = width.clamp(560, 820);
     window
         .set_size(tauri::LogicalSize::new(width as f64, 520.0))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    position_spotlight(&window);
+    Ok(())
 }
 
 #[tauri::command]

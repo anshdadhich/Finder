@@ -4,6 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FastSeek</title>
+    <script>
+      // Theme is FOLLOWED from the OS, not chosen by the user. Read it before
+      // first paint so there is no flash of the wrong scheme.
+      document.documentElement.setAttribute(
+        "data-theme",
+        matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"
+      );
+    </script>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>

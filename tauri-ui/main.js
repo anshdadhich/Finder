@@ -1,5 +1,16 @@
 const invoke = window.__TAURI__?.tauri?.invoke || window.__TAURI__?.invoke;
 
+// Follow the OS theme live (head inline script handles first paint).
+const themeQuery = window.matchMedia("(prefers-color-scheme: light)");
+function applySystemTheme() {
+  document.documentElement.setAttribute(
+    "data-theme",
+    themeQuery.matches ? "light" : "dark"
+  );
+}
+if (themeQuery.addEventListener) themeQuery.addEventListener("change", applySystemTheme);
+else if (themeQuery.addListener) themeQuery.addListener(applySystemTheme);
+
 const cardEl = document.querySelector("#card");
 const input = document.querySelector("#search");
 const statusEl = document.querySelector("#status");
@@ -583,18 +594,19 @@ function applyPreviewVisibility() {
   if (previewToggle) previewToggle.setAttribute("aria-pressed", String(!previewHidden));
 }
 
-// Window width follows the pane: wide (820) with preview, compact (560)
-// without. JS steps the size frame-by-frame so the collapse is animated;
-// the Rust command clamps the range.
+// The window width follows the pane: wide (820) with preview, compact (560)
+// without. JS steps the size frame-by-frame via IPC so the growth reads as
+// one motion; onDone fires after the final frame.
 let widthAnim = null;
 function setWindowWidth(wide) {
   if (!invoke) return;
   invoke("resize_palette", { width: wide ? 820 : 560 }).catch(() => {});
 }
-function animateWindowWidth(wide) {
+function animateWindowWidth(wide, onDone) {
   if (widthAnim) cancelAnimationFrame(widthAnim);
+  widthAnim = null;
   if (!invoke) {
-    applyPreviewVisibility();
+    if (onDone) onDone();
     return;
   }
   const from = wide ? 560 : 820;
@@ -610,6 +622,7 @@ function animateWindowWidth(wide) {
       widthAnim = requestAnimationFrame(step);
     } else {
       widthAnim = null;
+      if (onDone) onDone();
     }
   };
   step();
@@ -620,11 +633,23 @@ if (previewHidden) setWindowWidth(false);
 
 if (previewToggle) {
   previewToggle.addEventListener("click", () => {
-    previewHidden = !previewHidden;
-    localStorage.setItem("fs-preview-hidden", previewHidden ? "1" : "0");
-    applyPreviewVisibility();
-    renderPreview();
-    animateWindowWidth(!previewHidden);
+    const hiding = !previewHidden;
+    previewHidden = hiding;
+    localStorage.setItem("fs-preview-hidden", hiding ? "1" : "0");
+    previewToggle.setAttribute("aria-pressed", String(!hiding));
+    if (!hiding) {
+      // Expanding: the pane appears right away and grows with the window.
+      document.body.classList.remove("preview-off");
+      renderPreview();
+      animateWindowWidth(true);
+    } else {
+      // Collapsing: keep the pane laid out so the shrinking window clips it
+      // away naturally; only then switch to full-width results.
+      animateWindowWidth(false, () => {
+        document.body.classList.add("preview-off");
+        renderPreview();
+      });
+    }
   });
 }
 

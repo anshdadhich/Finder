@@ -3,7 +3,6 @@
    Fonts: Segoe UI Variable Display ≈ SF Pro; Cascadia Mono ≈ SF Mono
 --------------------------------------------------------------- */
 :root {
-  color-scheme: dark;
   --font-mac: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
   --font-mono: "Cascadia Mono", Consolas, "Courier New", monospace;
 
@@ -11,13 +10,19 @@
   --radius-window: 16px;
   --radius-item: 8px;
   --radius-badge: 5px;
+}
 
+/* ── Dark (system default) ─────────────────────────────────────────────── */
+[data-theme="dark"] {
+  color-scheme: dark;
   --bg-body: #121214;
   --bg-window: rgba(26, 27, 29, 0.96);
   --bg-preview: rgba(23, 24, 26, 0.95);
   --bg-card: rgba(255, 255, 255, 0.08);
   --bg-hover: rgba(255, 255, 255, 0.08);
   --bg-selected: rgba(10, 132, 255, 0.3);
+  --track: rgba(255, 255, 255, 0.08);
+  --footer-bg: rgba(0, 0, 0, 0.18);
 
   --border-window: rgba(255, 255, 255, 0.12);
   --border-subtle: rgba(255, 255, 255, 0.08);
@@ -25,9 +30,36 @@
   --text-primary: #ffffff;
   --text-secondary: rgba(235, 235, 245, 0.65);
   --text-tertiary: rgba(235, 235, 245, 0.4);
+  --text-on-selected: #ffffff;
+  --path-on-selected: rgba(255, 255, 255, 0.55);
 
   --shadow-mac: 0 24px 60px rgba(0, 0, 0, 0.6), 0 0 0 0.5px var(--border-window);
   --snippet-bg: rgba(0, 0, 0, 0.3);
+}
+
+/* ── Light (follows the OS theme) ──────────────────────────────────────── */
+[data-theme="light"] {
+  color-scheme: light;
+  --bg-body: #e7e7ea;
+  --bg-window: rgba(248, 248, 250, 0.96);
+  --bg-preview: rgba(241, 241, 244, 0.95);
+  --bg-card: rgba(0, 0, 0, 0.06);
+  --bg-hover: rgba(0, 0, 0, 0.06);
+  --bg-selected: rgba(0, 122, 255, 0.2);
+  --track: rgba(0, 0, 0, 0.08);
+  --footer-bg: rgba(0, 0, 0, 0.1);
+
+  --border-window: rgba(0, 0, 0, 0.12);
+  --border-subtle: rgba(0, 0, 0, 0.08);
+
+  --text-primary: #1c1c1e;
+  --text-secondary: rgba(60, 60, 67, 0.75);
+  --text-tertiary: rgba(60, 60, 67, 0.45);
+  --text-on-selected: #1c1c1e;
+  --path-on-selected: rgba(60, 60, 67, 0.6);
+
+  --shadow-mac: 0 20px 50px rgba(0, 0, 0, 0.18), 0 0 0 0.5px var(--border-window);
+  --snippet-bg: rgba(0, 0, 0, 0.05);
 }
 
 * {
@@ -173,7 +205,7 @@ input#search::placeholder {
   flex: 0 0 140px;
   height: 3px;
   border-radius: 3px;
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--track);
   overflow: hidden;
 }
 
@@ -299,11 +331,11 @@ input#search::placeholder {
 }
 
 .result.selected .name {
-  color: #ffffff;
+  color: var(--text-on-selected);
 }
 
 .result.selected .name .hl {
-  color: #ffffff;
+  color: var(--text-on-selected);
   font-weight: 600;
 }
 
@@ -318,7 +350,7 @@ input#search::placeholder {
 }
 
 .result.selected .path {
-  color: rgba(255, 255, 255, 0.55);
+  color: var(--path-on-selected);
 }
 
 .result .tag {
@@ -528,7 +560,7 @@ body.preview-off #results {
 .footer-bar {
   flex: 0 0 auto;
   height: 34px;
-  background: rgba(0, 0, 0, 0.18);
+  background: var(--footer-bg);
   border-top: 1px solid var(--border-subtle);
   display: none;
   align-items: center;
