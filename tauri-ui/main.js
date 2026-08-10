@@ -1005,6 +1005,105 @@ if (scanQuitBtn) {
   });
 }
 
+// ── Updater (Tauri built-in) — auto-check for updates once per week ── ──
+// The backend push side is publish-update.ps1 + latest.json (signed NSIS
+// installer). This client listens for update events, checks the feed at most
+// once per 7 days (timestamp kept in localStorage), and lets the user install.
+const updater = window.__TAURI__?.updater;
+const updateBanner = document.querySelector("#updateBanner");
+const updateVersionEl = document.querySelector("#updateVersion");
+const updateBtnEl = document.querySelector("#updateBtn");
+const updateDismissEl = document.querySelector("#updateDismiss");
+const updateProgressEl = document.querySelector("#updateProgress");
+const UPDATE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const UPDATE_KEY = "fastseek_last_update_check";
+let updateInProgress = false;
+
+function hideUpdateBanner() {
+  if (updateBanner) updateBanner.classList.remove("show");
+}
+function showUpdateBanner() {
+  if (updateBanner) updateBanner.classList.add("show");
+}
+
+async function installUpdateNow() {
+  if (!updater || updateInProgress) return;
+  updateInProgress = true;
+  if (updateBtnEl) {
+    updateBtnEl.disabled = true;
+    updateBtnEl.textContent = "Downloading…";
+  }
+  if (updateProgressEl) updateProgressEl.hidden = false;
+  try {
+    await updater.installUpdate();
+    hideUpdateBanner();
+  } catch (error) {
+    console.error("update install failed:", error);
+    if (updateBtnEl && updateBtnEl.textContent !== "Installing…") {
+      updateBtnEl.textContent = "Retry update";
+      updateBtnEl.disabled = false;
+    }
+    if (updateProgressEl) updateProgressEl.hidden = true;
+    updateInProgress = false;
+  }
+}
+
+function setupUpdater() {
+  if (!updater || !updateBanner) return; // dev build without global API: no-op
+
+  // Permanent action handlers first, so events that arrive during the first
+  // check are already wired up.
+  if (updateBtnEl) updateBtnEl.addEventListener("click", installUpdateNow);
+  if (updateDismissEl) updateDismissEl.addEventListener("click", hideUpdateBanner);
+
+  updater
+    .onUpdaterEvent((event) => {
+      const status = event && event.status;
+      if (status === "UPDATE_AVAILABLE") {
+        const v = event.body && event.body.version ? event.body.version : "";
+        if (updateVersionEl) updateVersionEl.textContent = v ? `v${v}` : "";
+        if (updateProgressEl) updateProgressEl.hidden = true;
+        showUpdateBanner();
+      } else if (status === "UPTODATE" || status === "UPDATE_NOT_AVAILABLE") {
+        // Quiet by design — no nag when there's nothing new.
+      } else if (status === "ERROR") {
+        console.error("updater error:", event.error || event);
+        // Only hide when nothing was in flight; keep the banner if we were
+        // mid-install so the user can retry.
+        if (!updateInProgress) hideUpdateBanner();
+      } else if (status === "DOWNLOAD_PROGRESS") {
+        if (updateProgressEl && event.data) {
+          const total = event.data.contentLength;
+          const got = event.data.chunkLength;
+          const pct = total ? Math.round((got / total) * 100) : 0;
+          updateProgressEl.textContent = `Downloading… ${pct}%`;
+        }
+      } else if (status === "DOWNLOADED" || status === "INSTALLING") {
+        if (updateBtnEl) updateBtnEl.textContent = "Installing…";
+        if (updateProgressEl) updateProgressEl.textContent = "Installing…";
+      } else if (status === "INSTALLED" || status === "DONE") {
+        hideUpdateBanner();
+        updateInProgress = false;
+      }
+    })
+    .catch((error) => console.error("updater listener failed:", error));
+
+  // Once per week: touch the network only when a full week has passed since
+  // the last check (empty/missing mark counts as "overdue", so the very first
+  // run after this ships checks too). Persisted so restarts don't re-check.
+  let last = 0;
+  try {
+    last = Number(localStorage.getItem(UPDATE_KEY)) || 0;
+  } catch (error) {}
+  if (Date.now() - last < UPDATE_WEEK_MS) return;
+  try {
+    localStorage.setItem(UPDATE_KEY, String(Date.now()));
+  } catch (error) {}
+  updater.checkUpdate().catch((error) => console.error("update check failed:", error));
+}
+
+setupUpdater();
+
 setInterval(refreshStatus, 1500);
 refreshStatus();
 loadApps();

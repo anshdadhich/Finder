@@ -35,6 +35,16 @@
       "iconPath": "icons/icon.ico",
       "iconAsTemplate": false
     },
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/anshdadhich/Finder/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhDQzhDOTQ3NDU5MjkzREQKUldUZGs1SkZSOG5JakJWVHR1RTZGUVhZRWIyZ3dNTVViRGs4RVcxTmdyZmRLSUx6K0UvRVRMUUsK",
+      "windows": {
+        "installMode": "passive"
+      }
+    },
     "security": {
       "csp": null
     },
