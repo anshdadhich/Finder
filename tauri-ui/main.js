@@ -600,49 +600,24 @@ const pvModified = document.getElementById("pvModified");
 let previewHidden = localStorage.getItem("fs-preview-hidden") === "1";
 let previewTimer = null;
 
+// The pane is a flex sibling of #results (see styles.css): toggling the
+// `preview-off` class animates its width/padding/opacity with a pure CSS
+// transition. No native window resize, no overlay — the results column
+// flexes to fill, so there is nothing to glitch and closing animates too.
 function applyPreviewVisibility() {
   document.body.classList.toggle("preview-off", previewHidden);
   if (previewToggle) previewToggle.setAttribute("aria-pressed", String(!previewHidden));
 }
 
-// The window width follows the pane: wide (910) with preview, compact (560)
-// without. The pane is an absolute overlay that slides with a GPU-only
-// transform (see styles.css), and #results keeps a fixed 540px in both
-// states — so the toggle causes zero content reflow. The native resize is
-// ONE one-shot call, issued only after the pane finished sliding in (and
-// before it slides out), never frame-by-frame.
-const PREVIEW_W = 910;
-const COMPACT_W = 560;
-const PANE_SLIDE_MS = 240;
-let paneTimer = 0;
-function setWindowWidth(wide) {
-  if (!invoke) return;
-  invoke("resize_palette", { width: wide ? PREVIEW_W : COMPACT_W }).catch(() => {});
-}
-
 applyPreviewVisibility();
-if (previewHidden) setWindowWidth(false);
 
 if (previewToggle) {
   previewToggle.addEventListener("click", () => {
-    const hiding = !previewHidden;
-    previewHidden = hiding;
-    localStorage.setItem("fs-preview-hidden", hiding ? "1" : "0");
-    previewToggle.setAttribute("aria-pressed", String(!hiding));
-    clearTimeout(paneTimer);
-    if (!hiding) {
-      // Expand: pane glides in over the results, then the window grows so
-      // the pane lands in its own rail. No reflow, no per-frame resize.
-      document.body.classList.remove("preview-off");
-      renderPreview();
-      paneTimer = setTimeout(() => setWindowWidth(true), PANE_SLIDE_MS + 40);
-    } else {
-      // Collapse: shrink the window first (results stay 540px), then the
-      // pane slides out, clipped by the window edge.
-      setWindowWidth(false);
-      document.body.classList.add("preview-off");
-      renderPreview();
-    }
+    previewHidden = !previewHidden;
+    localStorage.setItem("fs-preview-hidden", previewHidden ? "1" : "0");
+    document.body.classList.toggle("preview-off", previewHidden);
+    if (previewToggle) previewToggle.setAttribute("aria-pressed", String(!previewHidden));
+    renderPreview();
   });
 }
 

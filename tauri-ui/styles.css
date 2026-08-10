@@ -285,12 +285,10 @@ input#search::placeholder {
 }
 
 #results {
-  /* Fixed width in BOTH states: the pane is an absolute overlay that never
-     takes flex space, so toggling it causes zero layout change here. The
-     window itself grows/shrinks (560 ↔ 910) to give the pane its rail. */
-  flex: 0 0 540px;
-  width: 540px;
-  max-width: 540px;
+  /* Flex column that grows/shrinks with the pane — no native window resize,
+     no overlay. Toggling the preview animates the pane's width (see below)
+     and the results simply take the space that frees up. */
+  flex: 1 1 auto;
   min-width: 0;
   padding: 8px;
   overflow-y: auto;
@@ -437,14 +435,12 @@ input#search::placeholder {
 }
 
 /* ── Preview pane ──────────────────────────────────────────────────────── */
+/* Flex sibling of #results: animates width + padding + opacity (Raycast
+   style). No transform, no overlay, no native window resize — the results
+   column flexes to fill whatever space the pane doesn't use, so open and
+   close are a single smooth CSS transition. */
 .preview-pane {
-  /* Absolute overlay pinned to the right edge of the results area. The slide
-     animates transform + opacity ONLY — both GPU-composited — so the pane
-     glides over the results without ever forcing a layout or repaint pass. */
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
+  flex: 0 0 auto;
   width: 350px;
   padding: 22px 18px;
   display: flex;
@@ -452,20 +448,19 @@ input#search::placeholder {
   background: var(--bg-preview);
   overflow-x: hidden;
   overflow-y: auto;
-  transform: translateX(0);
-  will-change: transform;
-  transition: transform 0.24s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
-  box-shadow: -10px 0 24px rgba(0, 0, 0, 0.18);
+  opacity: 1;
+  transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), padding 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
 }
 
 body.preview-off .preview-pane {
-  transform: translateX(100%);
+  width: 0;
+  padding: 22px 0;
   opacity: 0;
   pointer-events: none;
 }
 
 body.preview-off #results {
-  border-right: 0;
+  border-right-color: transparent;
 }
 
 .preview-inner {

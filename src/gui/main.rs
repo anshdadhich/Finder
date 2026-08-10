@@ -1123,7 +1123,6 @@ fn main() {
             copy_path,
             quit_app,
             file_preview,
-            resize_palette,
             backdrop_ok
         ])
         .build(tauri::generate_context!())
@@ -2066,22 +2065,6 @@ fn file_preview(path: String) -> Option<PreviewInfo> {
         modified_secs,
         is_dir: md.is_dir(),
     })
-}
-
-/// Animates the palette between the wide (preview) and compact (results-only)
-/// widths. JS calls this at most once per toggle — never per frame — and the
-/// clamp keeps a glitchy caller from blowing the window past its authored
-/// sizes. Resizing anchors the LEFT edge, so every step re-centers on the
-/// monitor — this also fixes the boot case where the hidden-by-default
-/// preview shrinks a 910px window.
-#[tauri::command]
-fn resize_palette(window: tauri::Window, width: u32) -> Result<(), String> {
-    let width = width.clamp(560, 910);
-    window
-        .set_size(tauri::LogicalSize::new(width as f64, 520.0))
-        .map_err(|e| e.to_string())?;
-    position_spotlight(&window);
-    Ok(())
 }
 
 #[tauri::command]
