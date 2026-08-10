@@ -1163,7 +1163,12 @@ fn position_spotlight(window: &tauri::Window) {
             s.height as f64 / scale,
         )).unwrap_or(tauri::LogicalSize::new(700.0, 460.0));
         let x = (size.width as f64 - win.width * scale) / 2.0;
-        let y = size.height as f64 * 0.12;
+        // Spotlight-style top placement (12% of the screen), clamped so the
+        // window always fits on the display (small screens, low resolutions):
+        // the bottom must stay on-screen with a small margin.
+        let top = size.height as f64 * 0.12;
+        let max_top = (size.height as f64 - win.height * scale - 12.0).max(0.0);
+        let y = top.min(max_top);
         let _ = window.set_position(tauri::LogicalPosition::new(x / scale, y / scale));
     }
 }
