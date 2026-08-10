@@ -16,8 +16,11 @@
 [data-theme="dark"] {
   color-scheme: dark;
   --bg-body: #121214;
-  --bg-window: rgba(26, 27, 29, 0.96);
-  --bg-preview: rgba(23, 24, 26, 0.95);
+  /* Translucent on purpose: real frosted glass (Mica/Acrylic) comes from the
+     OS behind the window. body.css-blur restores the near-opaque tints when
+     the OS backdrop could not be enabled. */
+  --bg-window: rgba(30, 31, 34, 0.6);
+  --bg-preview: rgba(24, 25, 28, 0.55);
   --bg-card: rgba(255, 255, 255, 0.08);
   --bg-hover: rgba(255, 255, 255, 0.08);
   --bg-selected: rgba(10, 132, 255, 0.3);
@@ -41,8 +44,8 @@
 [data-theme="light"] {
   color-scheme: light;
   --bg-body: #e7e7ea;
-  --bg-window: rgba(248, 248, 250, 0.96);
-  --bg-preview: rgba(241, 241, 244, 0.95);
+  --bg-window: rgba(250, 250, 252, 0.6);
+  --bg-preview: rgba(244, 244, 247, 0.55);
   --bg-card: rgba(0, 0, 0, 0.06);
   --bg-hover: rgba(0, 0, 0, 0.06);
   --bg-selected: rgba(0, 122, 255, 0.2);
@@ -92,8 +95,6 @@ body {
   width: 100%;
   height: 100%;
   background: var(--bg-window);
-  backdrop-filter: blur(40px) saturate(180%);
-  -webkit-backdrop-filter: blur(40px) saturate(180%);
   border-radius: var(--radius-window);
   box-shadow: var(--shadow-mac);
   display: flex;
@@ -101,6 +102,20 @@ body {
   position: relative;
   overflow: hidden;
   animation: popIn 0.16s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* CSS-only fallback when OS-level glass (Mica/Acrylic) is unavailable. */
+body.css-blur .launcher-window {
+  backdrop-filter: blur(40px) saturate(180%);
+  -webkit-backdrop-filter: blur(40px) saturate(180%);
+}
+body.css-blur {
+  --bg-window: rgba(26, 27, 29, 0.96);
+  --bg-preview: rgba(23, 24, 26, 0.95);
+}
+body.css-blur[data-theme="light"] {
+  --bg-window: rgba(248, 248, 250, 0.96);
+  --bg-preview: rgba(241, 241, 244, 0.95);
 }
 
 @keyframes popIn {
@@ -157,6 +172,9 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .launcher-window {
     animation: none;
+  }
+  .preview-pane {
+    transition: none;
   }
 }
 
@@ -267,7 +285,12 @@ input#search::placeholder {
 }
 
 #results {
-  flex: 1 1 auto;
+  /* Fixed width in BOTH states: the pane is an absolute overlay that never
+     takes flex space, so toggling it causes zero layout change here. The
+     window itself grows/shrinks (560 ↔ 910) to give the pane its rail. */
+  flex: 0 0 540px;
+  width: 540px;
+  max-width: 540px;
   min-width: 0;
   padding: 8px;
   overflow-y: auto;
@@ -415,32 +438,33 @@ input#search::placeholder {
 
 /* ── Preview pane ──────────────────────────────────────────────────────── */
 .preview-pane {
-  flex: 0 0 350px;
+  /* Absolute overlay pinned to the right edge of the results area. The slide
+     animates transform + opacity ONLY — both GPU-composited — so the pane
+     glides over the results without ever forcing a layout or repaint pass. */
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
   width: 350px;
-  min-width: 0;
   padding: 22px 18px;
   display: flex;
   flex-direction: column;
   background: var(--bg-preview);
   overflow-x: hidden;
   overflow-y: auto;
-  /* The pane slides out/in as a real rail: transform does the visual slide
-     while flex-basis/width surrender the layout space so #results grows
-     smoothly with it (no end-snap). */
   transform: translateX(0);
-  transition: flex-basis 0.24s ease, width 0.24s ease, transform 0.24s ease, opacity 0.2s ease;
+  will-change: transform;
+  transition: transform 0.24s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
+  box-shadow: -10px 0 24px rgba(0, 0, 0, 0.18);
 }
 
 body.preview-off .preview-pane {
-  flex-basis: 0;
-  width: 0;
   transform: translateX(100%);
   opacity: 0;
+  pointer-events: none;
 }
 
 body.preview-off #results {
-  flex: 1 1 auto;
-  width: auto;
   border-right: 0;
 }
 
@@ -678,10 +702,13 @@ body.preview-off #results {
   padding: 36px 34px 30px;
   border-radius: var(--radius-window);
   background: var(--bg-window);
-  backdrop-filter: blur(40px) saturate(180%);
-  -webkit-backdrop-filter: blur(40px) saturate(180%);
   border: 1px solid var(--border-window);
   box-shadow: var(--shadow-mac);
+}
+
+body.css-blur .fr-card {
+  backdrop-filter: blur(40px) saturate(180%);
+  -webkit-backdrop-filter: blur(40px) saturate(180%);
 }
 
 .fr-logo {

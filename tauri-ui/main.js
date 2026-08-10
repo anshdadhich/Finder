@@ -11,6 +11,17 @@ function applySystemTheme() {
 if (themeQuery.addEventListener) themeQuery.addEventListener("change", applySystemTheme);
 else if (themeQuery.addListener) themeQuery.addListener(applySystemTheme);
 
+// OS frosted glass (Mica/Acrylic) is applied from Rust at startup. If it
+// could not be enabled, fall back to CSS-only blur so the palette never
+// renders flat over an un-blurred desktop.
+if (invoke) {
+  invoke("backdrop_ok")
+    .then((ok) => {
+      if (!ok) document.body.classList.add("css-blur");
+    })
+    .catch(() => document.body.classList.add("css-blur"));
+}
+
 const cardEl = document.querySelector("#card");
 const input = document.querySelector("#search");
 const statusEl = document.querySelector("#status");
@@ -594,21 +605,19 @@ function applyPreviewVisibility() {
   if (previewToggle) previewToggle.setAttribute("aria-pressed", String(!previewHidden));
 }
 
-// The window width follows the pane: wide (820) with preview, compact (560)
-// without. Do it as ONE native resize+reposition — animating the OS window
-// frame-by-frame via IPC re-rasterizes the transparent blur window ~14x and
-// makes every component jitter. The pane's own CSS transition (flex-basis +
-// transform) supplies the smooth slide now.
-let widthAnim = null;
+// The window width follows the pane: wide (910) with preview, compact (560)
+// without. The pane is an absolute overlay that slides with a GPU-only
+// transform (see styles.css), and #results keeps a fixed 540px in both
+// states — so the toggle causes zero content reflow. The native resize is
+// ONE one-shot call, issued only after the pane finished sliding in (and
+// before it slides out), never frame-by-frame.
+const PREVIEW_W = 910;
+const COMPACT_W = 560;
+const PANE_SLIDE_MS = 240;
+let paneTimer = 0;
 function setWindowWidth(wide) {
   if (!invoke) return;
-  invoke("resize_palette", { width: wide ? 820 : 560 }).catch(() => {});
-}
-function animateWindowWidth(wide, onDone) {
-  if (widthAnim) cancelAnimationFrame(widthAnim);
-  widthAnim = null;
-  setWindowWidth(wide);
-  if (onDone) onDone();
+  invoke("resize_palette", { width: wide ? PREVIEW_W : COMPACT_W }).catch(() => {});
 }
 
 applyPreviewVisibility();
@@ -620,18 +629,19 @@ if (previewToggle) {
     previewHidden = hiding;
     localStorage.setItem("fs-preview-hidden", hiding ? "1" : "0");
     previewToggle.setAttribute("aria-pressed", String(!hiding));
+    clearTimeout(paneTimer);
     if (!hiding) {
-      // Expanding: pane slides in while the window grows to make room.
+      // Expand: pane glides in over the results, then the window grows so
+      // the pane lands in its own rail. No reflow, no per-frame resize.
       document.body.classList.remove("preview-off");
       renderPreview();
-      animateWindowWidth(true);
+      paneTimer = setTimeout(() => setWindowWidth(true), PANE_SLIDE_MS + 40);
     } else {
-      // Collapsing: the pane's CSS transition slides it out (and collapses
-      // its width) at the same time the window is shrinking, so there is no
-      // snap where the results jump to full width.
+      // Collapse: shrink the window first (results stay 540px), then the
+      // pane slides out, clipped by the window edge.
+      setWindowWidth(false);
       document.body.classList.add("preview-off");
       renderPreview();
-      animateWindowWidth(false);
     }
   });
 }

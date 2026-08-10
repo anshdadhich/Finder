@@ -68,37 +68,43 @@ struct AppState {
     /// so the UI knows to re-fetch without polling the full list down.
     app_rev: Arc<AtomicU64>,
     icon_cache: Arc<Mutex<HashMap<String, String>>>,
-    icon_gate: Arc<IconGate>,
+    /// Worker pool that performs the actual shell icon extraction. The
+    /// command enqueues jobs here and awaits per-path reply channels.
+    icon_tx: Arc<std::sync::mpsc::Sender<IconJob>>,
     freq: Arc<Mutex<std::collections::HashMap<String, u32>>>,
     first_scan: Arc<AtomicBool>,
 }
 
-/// Simple counting semaphore so concurrent shell icon extractors never hammer
-/// the COM/SHGetFileInfo plumbing from many render cycles at once.
-struct IconGate {
-    gate: std::sync::Mutex<u32>,
-    cv: std::sync::Condvar,
+/// One icon-extraction request with its own reply channel, so the async
+/// command can await per-path results without any shared mutable state.
+struct IconJob {
+    path: String,
+    reply: std::sync::mpsc::Sender<Option<String>>,
 }
 
-impl IconGate {
-    fn new(permits: u32) -> Self {
-        Self {
-            gate: std::sync::Mutex::new(permits),
-            cv: std::sync::Condvar::new(),
-        }
+/// Shell icon extraction is STA+COM bound and must never run on the Tauri
+/// main thread (a sync command there freezes the whole webview for every
+/// batch). A small pool of dedicated threads — each with its own COM
+/// apartment — parallelizes the ~5-30ms per-icon cost so a 12-row batch
+/// lands in one round trip without ever blocking the UI.
+fn spawn_icon_workers(n: usize) -> Arc<std::sync::mpsc::Sender<IconJob>> {
+    let (tx, rx) = std::sync::mpsc::channel::<IconJob>();
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..n {
+        let rx = Arc::clone(&rx);
+        std::thread::spawn(move || {
+            unsafe {
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            loop {
+                let job = rx.lock().recv();
+                let Ok(job) = job else { break };
+                let uri = get_icon_data_uri(&job.path);
+                let _ = job.reply.send(uri);
+            }
+        });
     }
-    fn acquire(&self) {
-        let mut g = self.gate.lock().unwrap();
-        while *g == 0 {
-            g = self.cv.wait(g).unwrap();
-        }
-        *g -= 1;
-    }
-    fn release(&self) {
-        let mut g = self.gate.lock().unwrap();
-        *g += 1;
-        self.cv.notify_one();
-    }
+    Arc::new(tx)
 }
 
 #[derive(Clone, Serialize)]
@@ -156,7 +162,7 @@ fn get_all_apps(state: tauri::State<AppState>) -> Vec<UiResult> {
         .collect()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct FileResults {
     items: Vec<UiResult>,
     /// Exact match count for extension-class queries (".py" lists ALL files
@@ -165,33 +171,46 @@ struct FileResults {
 }
 
 #[tauri::command]
-fn search_files(query: String, offset: usize, state: tauri::State<AppState>) -> FileResults {
-    if !state.ready.load(Ordering::Relaxed) || query.trim().is_empty() {
-        return FileResults { items: Vec::new(), total: 0 };
-    }
+async fn search_files(
+    query: String,
+    offset: usize,
+    app: tauri::AppHandle,
+) -> Result<FileResults, String> {
+    // The whole-index scan is rayon-parallel but still occupies the caller
+    // thread while it joins; a sync command would freeze the webview on every
+    // keystroke, so run it on the blocking pool instead. (AppHandle, not
+    // State<'_, _>: tauri 1.8 cannot hold a borrowed state across an await.)
+    let state = app.state::<AppState>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if !state.ready.load(Ordering::Relaxed) || query.trim().is_empty() {
+            return FileResults { items: Vec::new(), total: 0 };
+        }
 
-    // Extension buckets can be stale after live journal mutations; refresh
-    // once under the write lock before serving an extension search.
-    if state.index.read().ext_dirty {
-        state.index.write().rebuild_ext_index();
-    }
+        // Extension buckets can be stale after live journal mutations; refresh
+        // once under the write lock before serving an extension search.
+        if state.index.read().ext_dirty {
+            state.index.write().rebuild_ext_index();
+        }
 
-    let store = state.index.read();
-    let page = search::search_paged(&store, query.trim(), 100, offset, false, &[]);
-    FileResults {
-        total: page.total,
-        items: page
-            .results
-            .into_iter()
-            .map(|r| UiResult {
-                name: r.name,
-                path: r.full_path.to_string_lossy().to_string(),
-                is_dir: r.is_dir,
-                kind: if r.is_dir { "dir".to_string() } else { "file".to_string() },
-                rank: r.rank,
-            })
-            .collect(),
-    }
+        let store = state.index.read();
+        let page = search::search_paged(&store, query.trim(), 100, offset, false, &[]);
+        FileResults {
+            total: page.total,
+            items: page
+                .results
+                .into_iter()
+                .map(|r| UiResult {
+                    name: r.name,
+                    path: r.full_path.to_string_lossy().to_string(),
+                    is_dir: r.is_dir,
+                    kind: if r.is_dir { "dir".to_string() } else { "file".to_string() },
+                    rank: r.rank,
+                })
+                .collect(),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -369,39 +388,68 @@ fn uri_png_bytes(uri: &str) -> Option<Vec<u8>> {
 }
 
 #[tauri::command]
-fn get_icons(paths: Vec<String>, state: tauri::State<AppState>) -> HashMap<String, String> {
-    let mut out = HashMap::with_capacity(paths.len());
-    let mut cache = state.icon_cache.lock();
-    for path in paths {
-        let key = path.to_lowercase();
-        let disk = icon_disk_path(&key);
-        let uri = if let Some(v) = cache.get(&key) {
-            Some(v.clone())
-        } else if let Ok(png) = std::fs::read(&disk) {
-            // Persistent disk cache: extraction hit once, reused forever.
-            let uri = png_to_uri(&png);
-            cache.insert(key, uri.clone());
-            Some(uri)
-        } else {
-            state.icon_gate.acquire();
-            let v = get_icon_data_uri(&path);
-            state.icon_gate.release();
-            if let Some(uri) = v {
-                cache.insert(key, uri.clone());
-                if let Some(png) = uri_png_bytes(&uri) {
-                    let _ = std::fs::create_dir_all(icon_cache_dir());
-                    let _ = std::fs::write(&disk, png);
+async fn get_icons(
+    paths: Vec<String>,
+    app: tauri::AppHandle,
+) -> Result<HashMap<String, String>, String> {
+    let state = app.state::<AppState>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = HashMap::with_capacity(paths.len());
+        let mut pending: Vec<String> = Vec::new();
+
+        // 1) In-memory cache (apps pool + this session's extractions).
+        {
+            let cache = state.icon_cache.lock();
+            for path in &paths {
+                let key = path.to_lowercase();
+                if let Some(v) = cache.get(&key) {
+                    out.insert(path.clone(), v.clone());
+                } else {
+                    pending.push(path.clone());
                 }
-                Some(uri)
-            } else {
-                None
             }
-        };
-        if let Some(uri) = uri {
+        }
+
+        // 2) Persistent disk cache: extraction hit once, reused forever.
+        let mut to_extract: Vec<String> = Vec::new();
+        {
+            let mut cache = state.icon_cache.lock();
+            for path in pending {
+                let key = path.to_lowercase();
+                let disk = icon_disk_path(&key);
+                if let Ok(png) = std::fs::read(&disk) {
+                    let uri = png_to_uri(&png);
+                    cache.insert(key, uri.clone());
+                    out.insert(path, uri);
+                } else {
+                    to_extract.push(path);
+                }
+            }
+        }
+
+        // 3) Real extraction on the STA worker pool, one job per path with an
+        //    independent reply channel. The UI thread never blocks here.
+        for path in to_extract {
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Option<String>>();
+            let job = IconJob { path: path.clone(), reply: reply_tx };
+            if state.icon_tx.send(job).is_err() {
+                break; // pool gone (shutdown) — serve what we have
+            }
+            let Ok(Some(uri)) = reply_rx.recv_timeout(Duration::from_secs(5)) else {
+                continue;
+            };
+            let key = path.to_lowercase();
+            state.icon_cache.lock().insert(key.clone(), uri.clone());
+            if let Some(png) = uri_png_bytes(&uri) {
+                let _ = std::fs::create_dir_all(icon_cache_dir());
+                let _ = std::fs::write(icon_disk_path(&key), png);
+            }
             out.insert(path, uri);
         }
-    }
-    out
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 fn get_icon_data_uri(path: &str) -> Option<String> {
@@ -955,7 +1003,7 @@ fn main() {
         apps: Arc::clone(&apps),
         app_rev: Arc::clone(&app_rev),
         icon_cache: Arc::clone(&icon_cache),
-        icon_gate: Arc::new(IconGate::new(8)),
+        icon_tx: spawn_icon_workers(4),
         freq: Arc::new(Mutex::new(std::collections::HashMap::new())),
         first_scan: Arc::clone(&first_scan),
     };
@@ -988,6 +1036,7 @@ fn main() {
             let window = app.get_window("main").expect("main window");
             *setup_close_window.lock() = Some(window.clone());
             position_spotlight(&window);
+            apply_window_backdrop(&window);
             let _ = window.show();
             let _ = window.set_focus();
 
@@ -1074,7 +1123,8 @@ fn main() {
             copy_path,
             quit_app,
             file_preview,
-            resize_palette
+            resize_palette,
+            backdrop_ok
         ])
         .build(tauri::generate_context!())
         .expect("error while building FastSeek");
@@ -1093,6 +1143,75 @@ fn main() {
         _ => {}
     });
     log_line("run: finished");
+}
+
+/// True once real OS-level frosted glass (Mica/Acrylic) is active. The JS
+/// falls back to CSS backdrop-filter when this is false, so the palette never
+/// renders flat over an un-blurred desktop.
+static BACKDROP_OK: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+fn backdrop_ok() -> bool {
+    BACKDROP_OK.load(Ordering::Relaxed)
+}
+
+/// Real frosted glass at the OS level: Mica (Win11 22H2+, cheap, system-
+/// drawn) or Acrylic (Win10 / older Win11 via SetWindowCompositionAttribute).
+/// CSS backdrop-filter cannot blur the desktop behind a transparent WebView2
+/// window — Chromium only samples the window's own content — so the DWM
+/// backdrop is the only path to genuine glass. Build number and app theme
+/// come from the registry (no extra windows-crate features needed).
+fn apply_window_backdrop(window: &tauri::Window) {
+    let build = windows_build_number();
+    let dark = !apps_use_light_theme();
+    let tint = if dark {
+        (26, 27, 29, 230)
+    } else {
+        (248, 248, 250, 230)
+    };
+
+    let chosen;
+    let mut res = if build >= 22621 {
+        chosen = "mica";
+        window_vibrancy::apply_mica(window, Some(dark))
+    } else {
+        chosen = "acrylic";
+        window_vibrancy::apply_acrylic(window, Some(tint))
+    };
+    if res.is_err() {
+        // Safety net: if the primary backdrop failed (unexpected build), the
+        // other one usually still works — never leave a flat window.
+        res = window_vibrancy::apply_acrylic(window, Some(tint));
+    }
+    BACKDROP_OK.store(res.is_ok(), Ordering::Relaxed);
+    log_line(&format!(
+        "backdrop: {} (build {}, {})",
+        if res.is_ok() { "applied" } else { "failed" },
+        build,
+        chosen
+    ));
+}
+
+/// Windows build number from the registry (e.g. 22631 for Win11 23H2).
+fn windows_build_number() -> u32 {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
+        .and_then(|k| k.get_value::<String, _>("CurrentBuildNumber"))
+        .map(|v| v.trim().parse().unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Whether Windows apps are in light theme (HKCU …\Personalize\AppsUseLightTheme).
+fn apps_use_light_theme() -> bool {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|k| k.get_value::<u32, _>("AppsUseLightTheme"))
+        .map(|v| v != 0)
+        .unwrap_or(true)
 }
 
 fn position_spotlight(window: &tauri::Window) {
@@ -1950,13 +2069,14 @@ fn file_preview(path: String) -> Option<PreviewInfo> {
 }
 
 /// Animates the palette between the wide (preview) and compact (results-only)
-/// widths. JS steps this command frame-by-frame; the clamp keeps a glitchy
-/// caller from blowing the window past its authored sizes. Resizing anchors
-/// the LEFT edge, so every step re-centers on the monitor — this also fixes
-/// the boot case where the hidden-by-default preview shrinks an 820px window.
+/// widths. JS calls this at most once per toggle — never per frame — and the
+/// clamp keeps a glitchy caller from blowing the window past its authored
+/// sizes. Resizing anchors the LEFT edge, so every step re-centers on the
+/// monitor — this also fixes the boot case where the hidden-by-default
+/// preview shrinks a 910px window.
 #[tauri::command]
 fn resize_palette(window: tauri::Window, width: u32) -> Result<(), String> {
-    let width = width.clamp(560, 820);
+    let width = width.clamp(560, 910);
     window
         .set_size(tauri::LogicalSize::new(width as f64, 520.0))
         .map_err(|e| e.to_string())?;
