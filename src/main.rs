@@ -56,9 +56,19 @@ fn main() {
                                     let _ = std::fs::remove_file(&cache_path);
                                     false
                                 } else {
-                                let count = cache.entries.len();
-                                let checkpoints = cache.checkpoints.clone();
-                                *index.write() = IndexStore::from_cache(cache);
+                                match IndexStore::from_cache(cache) {
+                                    None => {
+                                        // Wrong magic/version (format bumped)
+                                        // or structurally corrupt — the old
+                                        // cache is invalid, rebuild it.
+                                        println!("cache format changed, rescanning...");
+                                        let _ = std::fs::remove_file(&cache_path);
+                                        false
+                                    }
+                                    Some(store) => {
+                                let count = store.len();
+                                let checkpoints = store.checkpoints.clone();
+                                *index.write() = store;
                                 println!("{} files", count);
 
                                 // --- Delta catch-up ---
@@ -115,6 +125,8 @@ fn main() {
                                 } else {
                                     println!();
                                     true
+                                }
+                                }
                                 }
                                 }
                             }
@@ -177,7 +189,7 @@ fn main() {
                 let t2 = std::time::Instant::now();
                 {
                     let mut store = index_clone.write();
-                    store.populate_from_scan(scan, &drive.root);
+                    store.populate_from_scan(scan, drive);
                 }
                 let index_time = t2.elapsed();
 
@@ -441,7 +453,7 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                         if !kind_ok { return None; }
 
                         let full_path = fastsearch::index::search::build_path(
-                            entry.file_ref, &store
+                            entry, &store
                         );
 
                         // Check exclusions

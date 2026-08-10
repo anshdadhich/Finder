@@ -169,7 +169,7 @@ fn search_by_ext(
             if is_junk_chain(store, entry) {
                 return None;
             }
-            let full_path = build_path(entry.file_ref, store);
+            let full_path = build_path(entry, store);
             let path_lower = full_path.to_string_lossy().to_lowercase();
             if !excluded_dirs.is_empty()
                 && excluded_dirs.iter().any(|ex| path_lower.starts_with(ex.as_str()))
@@ -266,18 +266,24 @@ pub fn search(
 }
 
 /// Junk-empty without building a full path string: walk the parent chain
-/// through the sorted file_ref lookup and compare each ancestor directory's
-/// lowercased name against the compact junk list. Deterministic, allocation
-/// free, ~1µs per row — so page windows of 100 rows cost microseconds.
+/// through the sorted file_ref lookup (inside the entry's own drive — refs
+/// collide across volumes) and compare each ancestor directory's lowercased
+/// name against the compact junk list. Deterministic, allocation free,
+/// ~1µs per row — so page windows of 100 rows cost microseconds.
 fn is_junk_chain(store: &IndexStore, entry: &crate::index::store::IndexEntry) -> bool {
+    let drive = entry.drive;
     let mut current = entry.parent_ref;
     for _ in 0..32 {
         // Parents pruned at scan time are not in the lookup; recognize them
-        // through the recorded junk ref set.
-        if store.junk_refs.contains(&current) {
+        // through the recorded junk ref set for this drive.
+        if store
+            .junk_refs
+            .get(drive as usize)
+            .map_or(false, |s| s.contains(&current))
+        {
             return true;
         }
-        let Some(idx) = store.lookup_idx(current) else {
+        let Some(idx) = store.lookup_idx(drive, current) else {
             break;
         };
         let e = &store.entries[idx as usize];
@@ -360,7 +366,7 @@ fn generic_paged(
         if is_junk_chain(store, entry) {
             continue;
         }
-        let full_path = build_path(entry.file_ref, store);
+        let full_path = build_path(entry, store);
         let path_lower = full_path.to_string_lossy().to_lowercase();
         if !excluded_dirs.is_empty()
             && excluded_dirs.iter().any(|ex| path_lower.starts_with(ex.as_str()))
@@ -444,7 +450,7 @@ fn fuzzy_fill(
         if is_junk_chain(store, entry) {
             continue;
         }
-        let full_path = build_path(entry.file_ref, store);
+        let full_path = build_path(entry, store);
         let path_lower = full_path.to_string_lossy().to_lowercase();
         if !excluded_dirs.is_empty()
             && excluded_dirs.iter().any(|ex| path_lower.starts_with(ex.as_str()))
@@ -479,27 +485,34 @@ pub fn apps(_store: &IndexStore, limit: usize) -> Vec<SearchResult> {
     }).collect()
 }
 
-/// Iterative path builder — walks parent chain via sorted ref_lookup.
-pub fn build_path(file_ref: u64, store: &IndexStore) -> std::path::PathBuf {
+/// Iterative path builder — walks the parent chain via the entry's own
+/// drive's sorted ref_lookup, rooted at that volume's root.
+pub fn build_path(entry: &crate::index::store::IndexEntry, store: &IndexStore) -> std::path::PathBuf {
+    let drive = entry.drive;
+    let root = store
+        .drive_roots
+        .get(drive as usize)
+        .map(|d| d.root.as_str())
+        .unwrap_or("C:\\");
     let mut components: Vec<&str> = Vec::with_capacity(16);
-    let mut current = file_ref;
+    let mut current = entry.file_ref;
 
     for _ in 0..64 {
-        match store.lookup_idx(current) {
+        match store.lookup_idx(drive, current) {
             Some(idx) => {
-                let entry = &store.entries[idx as usize];
-                components.push(store.name(entry));
-                if entry.parent_ref == current {
+                let e = &store.entries[idx as usize];
+                components.push(store.name(e));
+                if e.parent_ref == current {
                     break;
                 }
-                current = entry.parent_ref;
+                current = e.parent_ref;
             }
             None => break,
         }
     }
 
     components.reverse();
-    let mut path = std::path::PathBuf::from(&store.drive_root);
+    let mut path = std::path::PathBuf::from(root);
     for comp in components {
         path.push(comp);
     }
@@ -518,9 +531,12 @@ mod tests {
             name_arena: Vec::new(),
             name_lower_arena: Vec::new(),
             ref_lookup: Vec::new(),
-            drive_root: "C:\\".to_string(),
+            drive_roots: vec![crate::index::store::DriveRoot {
+                letter: 'C',
+                root: "C:\\".to_string(),
+            }],
             checkpoints: Vec::new(),
-            junk_refs: std::collections::HashSet::new(),
+            junk_refs: vec![std::collections::HashSet::new()],
             ext_index: std::collections::HashMap::new(),
             ext_dirty: true,
         };
@@ -530,7 +546,6 @@ mod tests {
             let nl_off = s.name_lower_arena.len() as u32;
             s.name_arena.extend_from_slice(name.as_bytes());
             s.name_lower_arena.extend_from_slice(lower.as_bytes());
-            let i = s.entries.len();
             s.entries.push(IndexEntry {
                 file_ref: fr,
                 parent_ref: parent,
@@ -539,8 +554,8 @@ mod tests {
                 name_len: name.len() as u16,
                 name_lower_len: lower.len() as u16,
                 flags: if *kind == FileKind::Directory { 1 } else { 0 },
+                drive: 0,
             });
-            s.ref_lookup.push((fr, i as u32));
         }
         // Keep the same sorted-by-lowercase-name invariant the production
         // store maintains (finalize / insert / apply_events).
@@ -549,11 +564,14 @@ mod tests {
             let st = unsafe { &*store_ptr };
             st.name_lower(a).cmp(st.name_lower(b))
         });
-        s.ref_lookup.clear();
-        for (i, e) in s.entries.iter().enumerate() {
-            s.ref_lookup.push((e.file_ref, i as u32));
-        }
-        s.ref_lookup.sort_unstable_by_key(|&(r, _)| r);
+        let mut pairs: Vec<(u64, u32)> = s
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.file_ref, i as u32))
+            .collect();
+        pairs.sort_unstable_by_key(|&(r, _)| r);
+        s.ref_lookup = vec![pairs];
         s
     }
 
@@ -710,9 +728,12 @@ mod tests {
             name_arena: Vec::new(),
             name_lower_arena: Vec::new(),
             ref_lookup: Vec::new(),
-            drive_root: "C:\\".to_string(),
+            drive_roots: vec![crate::index::store::DriveRoot {
+                letter: 'C',
+                root: "C:\\".to_string(),
+            }],
             checkpoints: Vec::new(),
-            junk_refs: std::collections::HashSet::new(),
+            junk_refs: vec![std::collections::HashSet::new()],
             ext_index: std::collections::HashMap::new(),
             ext_dirty: true,
         };
@@ -744,6 +765,7 @@ mod tests {
                 name_len: name.len() as u16,
                 name_lower_len: lower.len() as u16,
                 flags: 0,
+                drive: 0,
             });
         }
         s.finalize();

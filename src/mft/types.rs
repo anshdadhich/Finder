@@ -64,10 +64,14 @@ pub struct NtfsDrive {
 
 #[derive(Debug)]
 pub enum IndexEvent {
-    Created(FileRecord),
-    Deleted(u64),
-    Renamed { old_ref: u64, new_record: FileRecord },
-    Moved { file_ref: u64, new_parent_ref: u64, name: String, kind: FileKind },
+    /// `drive_letter` identifies the volume that produced the event. MFT
+    /// file references are per-volume, so the same file_ref can exist on
+    /// two drives; every event must carry its drive for the index to apply
+    /// it to the right per-drive entry space.
+    Created { drive_letter: char, record: FileRecord },
+    Deleted { drive_letter: char, file_ref: u64 },
+    Renamed { drive_letter: char, old_ref: u64, new_record: FileRecord },
+    Moved { drive_letter: char, file_ref: u64, new_parent_ref: u64, name: String, kind: FileKind },
     /// A USN journal checkpoint emitted by the live watcher *after* all events
     /// that occurred before it on the same channel. Once applied, every prior
     /// event is guaranteed to be reflected in the index, so persisting this

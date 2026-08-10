@@ -1670,7 +1670,14 @@ fn load_cache_and_catch_up(
             }
 
             let checkpoints = cache.checkpoints.clone();
-            *index.write() = IndexStore::from_cache(cache);
+            let Some(store) = IndexStore::from_cache(cache) else {
+                // Old cache format (pre-v2) or structurally corrupt — a
+                // format bump intentionally invalidates previous caches.
+                let _ = std::fs::remove_file(cache_path);
+                *index.write() = IndexStore::new();
+                return false;
+            };
+            *index.write() = store;
 
             if checkpoints.is_empty() {
                 return true;
@@ -1778,7 +1785,7 @@ fn build_full_index(
             total_drives
         );
         let t_index = Instant::now();
-        index.write().populate_from_scan(scan, &drive.root);
+        index.write().populate_from_scan(scan, drive);
         let index_secs = t_index.elapsed().as_secs_f64();
         log_line(&format!(
             "scan drive {}: {} records via {} (read+parse {:.2}s, index {:.2}s; workers {})",

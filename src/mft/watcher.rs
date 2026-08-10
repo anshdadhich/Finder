@@ -470,7 +470,10 @@ impl UsnWatcher {
         let reason = record.Reason;
 
         if reason & USN_REASON_FILE_DELETE != 0 {
-            let _ = self.sender.send(IndexEvent::Deleted(file_ref));
+            let _ = self.sender.send(IndexEvent::Deleted {
+                drive_letter: self.drive.letter,
+                file_ref,
+            });
             return;
         }
 
@@ -479,6 +482,7 @@ impl UsnWatcher {
         // Rename new name = could be a rename OR a move to different folder
         if reason & USN_REASON_RENAME_NEW_NAME != 0 {
             let _ = self.sender.send(IndexEvent::Moved {
+                drive_letter: self.drive.letter,
                 file_ref,
                 new_parent_ref: parent_ref,
                 name: name.clone(),
@@ -494,7 +498,10 @@ impl UsnWatcher {
                 name,
                 kind,
             };
-            let _ = self.sender.send(IndexEvent::Created(new_record));
+            let _ = self.sender.send(IndexEvent::Created {
+                drive_letter: self.drive.letter,
+                record: new_record,
+            });
         }
     }
 }

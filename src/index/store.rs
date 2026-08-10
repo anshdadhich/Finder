@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
-use crate::mft::types::{FileKind, FileRecord, IndexEvent, JournalCheckpoint};
+use crate::mft::types::{FileKind, FileRecord, IndexEvent, JournalCheckpoint, NtfsDrive};
 use crate::mft::reader::{CompactRecord, ScanResult};
 
 /// Directory names (lowercased) that mark a subtree as junk: anything under
@@ -26,24 +26,44 @@ pub const JUNK_DIR_NAMES: &[&str] = &[
 ];
 
 // ── Cache format (disk) ──────────────────────────────────────────────
+/// Cache format version. Bumped on any on-disk layout change; readers
+/// reject caches whose magic/version differ and fall back to a full scan.
+pub const CACHE_MAGIC: [u8; 4] = *b"FSKC";
+pub const CACHE_FORMAT_VERSION: u32 = 2;
+
+/// A volume's root path, as indexed. Entries carry a `drive` index into
+/// this list, so file_refs (per-volume MFT record numbers) never collide
+/// and paths are always built against the right volume root.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CachedEntry {
-    pub file_ref: u64,
-    pub parent_ref: u64,
-    pub name: String,
-    pub kind: FileKind,
+pub struct DriveRoot {
+    pub letter: char,
+    pub root: String,
 }
 
+/// Cache v2: the raw in-memory index, persisted verbatim. No per-entry
+/// String materialization on save and no UTF-16 decode + re-lowercase on
+/// load — the arenas travel as-is and only the derived lookup structures
+/// (ref_lookup, ext_index) are rebuilt after deserialization.
 #[derive(Serialize, Deserialize)]
 pub struct CacheData {
-    pub entries: Vec<CachedEntry>,
-    pub drive_root: String,
+    pub magic: [u8; 4],
+    pub version: u32,
+    /// Raw entries with absolute offsets into `name_arena` /
+    /// `name_lower_arena` — valid as-is because the arenas are stored
+    /// byte-for-byte.
+    pub entries: Vec<IndexEntry>,
+    pub name_arena: Vec<u8>,
+    pub name_lower_arena: Vec<u8>,
+    /// Per-drive roots; `IndexEntry.drive` indexes into this list.
+    pub drive_roots: Vec<DriveRoot>,
     pub checkpoints: Vec<JournalCheckpoint>,
-    pub junk_refs: Vec<u64>,
+    /// file_refs of every record pruned from a junk subtree at scan time,
+    /// grouped per drive (same drive semantics as the entries).
+    pub junk_refs: Vec<Vec<u64>>,
 }
 
 // ── Compact in-memory entry (32 bytes) ───────────────────────────────
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntry {
     pub file_ref: u64,
     pub parent_ref: u64,
@@ -52,6 +72,8 @@ pub struct IndexEntry {
     pub name_len: u16,
     pub name_lower_len: u16,
     pub flags: u8, // bit 0 = is_dir
+    /// Volume this entry belongs to; index into `IndexStore.drive_roots`.
+    pub drive: u8,
 }
 
 impl IndexEntry {
@@ -71,14 +93,18 @@ pub struct IndexStore {
     pub entries: Vec<IndexEntry>,
     pub name_arena: Vec<u8>,
     pub name_lower_arena: Vec<u8>,
-    pub ref_lookup: Vec<(u64, u32)>, // sorted by file_ref for binary search
-    pub drive_root: String,
+    /// Per-drive ref → entry-index tables, each sorted by file_ref for
+    /// binary search. Separate buckets because MFT record numbers are
+    /// per-volume and collide across drives.
+    pub ref_lookup: Vec<Vec<(u64, u32)>>,
+    /// Volume roots, ordered; `IndexEntry.drive` indexes here.
+    pub drive_roots: Vec<DriveRoot>,
     pub checkpoints: Vec<JournalCheckpoint>,
-    /// file_refs of every record pruned from a junk subtree at scan time.
-    /// Live journal events can re-enter those subtrees (new file under
-    /// %TEMP%\x while the app runs); this set lets `is_live_junk` recognize
-    /// them even though their parents were never indexed.
-    pub junk_refs: std::collections::HashSet<u64>,
+    /// Per-drive file_refs of every record pruned from a junk subtree at
+    /// scan time. Live journal events can re-enter those subtrees (new file
+    /// under %TEMP%\x while the app runs); this set lets `is_live_junk`
+    /// recognize them even though their parents were never indexed.
+    pub junk_refs: Vec<std::collections::HashSet<u64>>,
     /// Extension → entry indices (lowercase ext, e.g. "py"). Buckets keep
     /// name-sorted order because `entries` is name-sorted. Built lazily;
     /// any live mutation marks it dirty and it is rebuilt before the next
@@ -94,12 +120,27 @@ impl IndexStore {
             name_arena: Vec::new(),
             name_lower_arena: Vec::new(),
             ref_lookup: Vec::new(),
-            drive_root: String::new(),
+            drive_roots: Vec::new(),
             checkpoints: Vec::new(),
-            junk_refs: std::collections::HashSet::new(),
+            junk_refs: Vec::new(),
             ext_index: std::collections::HashMap::new(),
             ext_dirty: true,
         }
+    }
+
+    /// Index of the drive with `letter`, registering it (root filled in
+    /// later by populate_from_scan when the scan succeeds) on first sight.
+    /// Events can arrive for a volume whose scan failed; the fallback root
+    /// still yields a usable (letter-qualified) path for those entries.
+    fn drive_index(&mut self, letter: char) -> u8 {
+        if let Some(i) = self.drive_roots.iter().position(|d| d.letter == letter) {
+            return i as u8;
+        }
+        self.drive_roots.push(DriveRoot {
+            letter,
+            root: format!("{}:\\", letter),
+        });
+        (self.drive_roots.len() - 1) as u8
     }
 
     /// Rebuild every extension bucket in one pass. O(N); only runs at
@@ -164,22 +205,29 @@ impl IndexStore {
         }
     }
 
-    // ── Ref lookup (binary search) ───────────────────────────────────
+    // ── Ref lookup (per-drive binary search) ─────────────────────────
 
-    pub fn lookup_idx(&self, file_ref: u64) -> Option<u32> {
-        self.ref_lookup
+    pub fn lookup_idx(&self, drive: u8, file_ref: u64) -> Option<u32> {
+        let bucket = self.ref_lookup.get(drive as usize)?;
+        bucket
             .binary_search_by_key(&file_ref, |&(r, _)| r)
             .ok()
-            .map(|pos| self.ref_lookup[pos].1)
+            .map(|pos| bucket[pos].1)
     }
 
     fn rebuild_ref_lookup(&mut self) {
-        self.ref_lookup.clear();
-        self.ref_lookup.reserve(self.entries.len());
+        let mut buckets: Vec<Vec<(u64, u32)>> = Vec::with_capacity(self.drive_roots.len().max(1));
         for (i, e) in self.entries.iter().enumerate() {
-            self.ref_lookup.push((e.file_ref, i as u32));
+            let d = e.drive as usize;
+            while buckets.len() <= d {
+                buckets.push(Vec::new());
+            }
+            buckets[d].push((e.file_ref, i as u32));
         }
-        self.ref_lookup.par_sort_unstable_by_key(|&(r, _)| r);
+        for b in &mut buckets {
+            b.par_sort_unstable_by_key(|&(r, _)| r);
+        }
+        self.ref_lookup = buckets;
     }
 
     // ── Populate from MFT scan ───────────────────────────────────────
@@ -195,7 +243,7 @@ struct BuiltChunk {
     entries: Vec<IndexEntry>,
 }
 
-fn build_chunk(chunk: &[CompactRecord], name_data: &[u16]) -> BuiltChunk {
+fn build_chunk(chunk: &[CompactRecord], name_data: &[u16], drive: u8) -> BuiltChunk {
     let mut names = Vec::with_capacity(chunk.len() * 24);
     let mut lowers = Vec::with_capacity(chunk.len() * 24);
     let mut entries = Vec::with_capacity(chunk.len());
@@ -221,6 +269,7 @@ fn build_chunk(chunk: &[CompactRecord], name_data: &[u16]) -> BuiltChunk {
             name_len: n_len,
             name_lower_len: nl_len,
             flags: if r.is_dir { 1 } else { 0 },
+            drive,
         });
     }
     BuiltChunk {
@@ -233,8 +282,10 @@ fn build_chunk(chunk: &[CompactRecord], name_data: &[u16]) -> BuiltChunk {
 impl IndexStore {
     // ── Populate from MFT scan ───────────────────────────────────────
 
-    pub fn populate_from_scan(&mut self, scan: ScanResult, drive_root: &str) {
-        self.drive_root = drive_root.to_string();
+    pub fn populate_from_scan(&mut self, scan: ScanResult, drive: &NtfsDrive) {
+        // Register the volume and remember its authoritative root.
+        let drive_idx = self.drive_index(drive.letter);
+        self.drive_roots[drive_idx as usize].root = drive.root.clone();
 
         // Pass 1a: map every directory to (lowercased name, parent) so a cheap
         // ancestor walk can prune junk subtrees (node_modules, Windows, AppData,
@@ -284,12 +335,18 @@ impl IndexStore {
         // Remember everything the sweep dropped: live journal events (a file
         // created under a pruned %TEMP% subtree while we run) must still be
         // recognized and filtered, and their parents are gone from the index.
-        self.junk_refs = scan
+        // Kept per drive — file_refs collide across volumes.
+        let pruned: std::collections::HashSet<u64> = scan
             .records
             .par_iter()
             .filter(|r| junk_chain(r.parent_ref, &dirs))
             .map(|r| r.file_ref)
             .collect();
+        if self.junk_refs.len() <= drive_idx as usize {
+            self.junk_refs
+                .resize(drive_idx as usize + 1, std::collections::HashSet::new());
+        }
+        self.junk_refs[drive_idx as usize].extend(pruned);
 
         // Pass 2 (PARALLEL): decode + lowercase UTF-16 names in per-core
         // chunks, each building its own little arena. Merging afterwards is
@@ -299,7 +356,7 @@ impl IndexStore {
         let chunk_size = (clean.len() / (threads * 2)).max(256);
         let chunks: Vec<BuiltChunk> = clean
             .par_chunks(chunk_size)
-            .map(|chunk| build_chunk(chunk, name_data))
+            .map(|chunk| build_chunk(chunk, name_data, drive_idx))
             .collect();
 
         // Merge: shift chunk-local offsets, one big copy per arena.
@@ -337,105 +394,75 @@ impl IndexStore {
 
     // ── Cache serialization ──────────────────────────────────────────
 
+    /// Cache v2 save: the in-memory arenas and entries travel verbatim
+    /// (plain memcpy clones) — no per-file String materialization, so this
+    /// is a large-but-fast blob instead of millions of allocations.
     pub fn to_cache(&self) -> CacheData {
         CacheData {
-            entries: self
-                .entries
-                .par_iter()
-                .map(|e| CachedEntry {
-                    file_ref: e.file_ref,
-                    parent_ref: e.parent_ref,
-                    name: self.name(e).to_string(),
-                    kind: e.kind(),
-                })
-                .collect(),
-            drive_root: self.drive_root.clone(),
+            magic: CACHE_MAGIC,
+            version: CACHE_FORMAT_VERSION,
+            entries: self.entries.clone(),
+            name_arena: self.name_arena.clone(),
+            name_lower_arena: self.name_lower_arena.clone(),
+            drive_roots: self.drive_roots.clone(),
             checkpoints: self.checkpoints.clone(),
-            junk_refs: self.junk_refs.iter().copied().collect(),
+            junk_refs: self
+                .junk_refs
+                .iter()
+                .map(|s| s.iter().copied().collect())
+                .collect(),
         }
     }
 
-    pub fn from_cache(cache: CacheData) -> Self {
-        let count = cache.entries.len();
+    /// Cache v2 load. The arenas are already in final form, so there is no
+    /// UTF-16 decode and no re-lowercasing — only the derived structures
+    /// (ref_lookup, ext_index) get rebuilt. Returns None for anything that
+    /// is not a valid v2 cache (wrong magic/version, out-of-bounds entry,
+    /// empty roots); callers treat that as "corrupt" and rescan.
+    pub fn from_cache(cache: CacheData) -> Option<Self> {
+        if cache.magic != CACHE_MAGIC || cache.version != CACHE_FORMAT_VERSION {
+            return None;
+        }
+        if cache.drive_roots.is_empty() {
+            return None;
+        }
+        // Every entry must point inside its arenas and at a known drive —
+        // guards against truncated/tampered files (and any v1 remnant that
+        // happened to survive the magic check).
+        let valid = cache.entries.par_iter().all(|e| {
+            (e.drive as usize) < cache.drive_roots.len()
+                && (e.name_off as usize + e.name_len as usize) <= cache.name_arena.len()
+                && (e.name_lower_off as usize + e.name_lower_len as usize)
+                    <= cache.name_lower_arena.len()
+        });
+        if !valid {
+            return None;
+        }
+
         let mut store = Self {
-            entries: Vec::with_capacity(count),
-            name_arena: Vec::with_capacity(count * 30),
-            name_lower_arena: Vec::with_capacity(count * 30),
-            ref_lookup: Vec::with_capacity(count),
-            drive_root: cache.drive_root,
+            entries: cache.entries,
+            name_arena: cache.name_arena,
+            name_lower_arena: cache.name_lower_arena,
+            ref_lookup: Vec::new(),
+            drive_roots: cache.drive_roots,
             checkpoints: cache.checkpoints,
-            junk_refs: cache.junk_refs.into_iter().collect(),
+            junk_refs: cache
+                .junk_refs
+                .into_iter()
+                .map(|v| v.into_iter().collect())
+                .collect(),
             ext_index: std::collections::HashMap::new(),
             ext_dirty: true,
         };
-
-        // The cache load is the hot path of every launch — decode the
-        // cached names on all cores, then merge the chunks (memcpy only).
-        let threads = rayon::current_num_threads().max(2);
-        let chunk_size = (count / (threads * 2)).max(128);
-        let chunks: Vec<BuiltChunk> = cache
-            .entries
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let mut names = Vec::with_capacity(chunk.len() * 24);
-                let mut lowers = Vec::with_capacity(chunk.len() * 24);
-                let mut entries = Vec::with_capacity(chunk.len());
-                for c in chunk {
-                    let name_lower = c.name.to_lowercase();
-
-                    let n_off = names.len() as u32;
-                    let n_len = c.name.len() as u16;
-                    names.extend_from_slice(c.name.as_bytes());
-
-                    let nl_off = lowers.len() as u32;
-                    let nl_len = name_lower.len() as u16;
-                    lowers.extend_from_slice(name_lower.as_bytes());
-
-                    let flags = match c.kind {
-                        FileKind::Directory => 1u8,
-                        FileKind::File => 0u8,
-                    };
-                    entries.push(IndexEntry {
-                        file_ref: c.file_ref,
-                        parent_ref: c.parent_ref,
-                        name_off: n_off,
-                        name_lower_off: nl_off,
-                        name_len: n_len,
-                        name_lower_len: nl_len,
-                        flags,
-                    });
-                }
-                BuiltChunk {
-                    names,
-                    lowers,
-                    entries,
-                }
-            })
-            .collect();
-
-        for mut c in chunks {
-            let base = store.name_arena.len() as u32;
-            let base_lower = store.name_lower_arena.len() as u32;
-            for e in &mut c.entries {
-                e.name_off += base;
-                e.name_lower_off += base_lower;
-            }
-            store.name_arena.extend_from_slice(&c.names);
-            store.name_lower_arena.extend_from_slice(&c.lowers);
-            store.entries.extend(c.entries);
-        }
-
         store.rebuild_ref_lookup();
-        store.name_arena.shrink_to_fit();
-        store.name_lower_arena.shrink_to_fit();
         store.rebuild_ext_index();
-        store
+        Some(store)
     }
 
     // ── Live mutations ───────────────────────────────────────────────
 
     /// Append a record to the arenas and build its compact entry.
-    fn arena_entry(&mut self, record: &FileRecord) -> IndexEntry {
+    fn arena_entry(&mut self, record: &FileRecord, drive: u8) -> IndexEntry {
         let name_lower = record.name.to_lowercase();
 
         let n_off = self.name_arena.len() as u32;
@@ -459,19 +486,35 @@ impl IndexStore {
             name_len: n_len,
             name_lower_len: nl_len,
             flags,
+            drive,
         }
+    }
+
+    /// Per-drive junk set, growing the vec on first use for a drive.
+    fn junk_refs_for(&mut self, drive: u8) -> &mut std::collections::HashSet<u64> {
+        let i = drive as usize;
+        if self.junk_refs.len() <= i {
+            self.junk_refs
+                .resize(i + 1, std::collections::HashSet::new());
+        }
+        &mut self.junk_refs[i]
     }
 
     /// True when walking the parent chain from `parent_ref` touches a junk
     /// directory name or a ref that the scan-time sweep pruned. Guards live
-    /// journal inserts so junk never re-enters the index mid-session.
-    pub fn is_live_junk(&self, parent_ref: u64) -> bool {
+    /// journal inserts so junk never re-enters the index mid-session. The
+    /// walk stays inside `drive`'s ref space — never crosses volumes.
+    pub fn is_live_junk(&self, parent_ref: u64, drive: u8) -> bool {
         let mut current = parent_ref;
         for _ in 0..32 {
-            if self.junk_refs.contains(&current) {
+            if self
+                .junk_refs
+                .get(drive as usize)
+                .map_or(false, |s| s.contains(&current))
+            {
                 return true;
             }
-            let Some(idx) = self.lookup_idx(current) else {
+            let Some(idx) = self.lookup_idx(drive, current) else {
                 return false; // parent unknown — not provably junk, keep it
             };
             let e = &self.entries[idx as usize];
@@ -490,15 +533,17 @@ impl IndexStore {
         false
     }
 
-    pub fn insert(&mut self, record: FileRecord) {
+    pub fn insert(&mut self, drive: u8, record: FileRecord) {
         // Idempotent: a record supersedes any existing entry with the same
-        // file_ref (journals can re-deliver a create/rename across restarts).
-        self.entries.retain(|e| e.file_ref != record.file_ref);
+        // file_ref on the same drive (journals can re-deliver a create/rename
+        // across restarts).
+        self.entries
+            .retain(|e| !(e.drive == drive && e.file_ref == record.file_ref));
 
         // Live junk guard: a journal event inside a pruned subtree is
         // dropped here, exactly like the scan-time prefilter never let it in.
-        if self.is_live_junk(record.parent_ref) {
-            self.junk_refs.insert(record.file_ref);
+        if self.is_live_junk(record.parent_ref, drive) {
+            self.junk_refs_for(drive).insert(record.file_ref);
             return;
         }
 
@@ -508,71 +553,81 @@ impl IndexStore {
             let s = unsafe { &*store_ptr };
             s.name_lower(e) < name_lower.as_str()
         });
-        let entry = self.arena_entry(&record);
+        let entry = self.arena_entry(&record, drive);
         self.entries.insert(pos, entry);
         self.rebuild_ref_lookup();
         self.ext_dirty = true;
     }
 
-    pub fn remove(&mut self, file_ref: u64) {
+    pub fn remove(&mut self, drive: u8, file_ref: u64) {
         // Name bytes left as dead space in arena (negligible for rare deletes)
-        self.entries.retain(|e| e.file_ref != file_ref);
+        self.entries
+            .retain(|e| !(e.drive == drive && e.file_ref == file_ref));
+        self.junk_refs_for(drive).remove(&file_ref);
         self.rebuild_ref_lookup();
         self.ext_dirty = true;
     }
 
-    pub fn rename(&mut self, old_ref: u64, new_record: FileRecord) {
-        self.remove(old_ref);
-        self.insert(new_record);
+    pub fn rename(&mut self, drive: u8, old_ref: u64, new_record: FileRecord) {
+        self.remove(drive, old_ref);
+        self.insert(drive, new_record);
     }
 
-    pub fn apply_move(&mut self, file_ref: u64, new_parent_ref: u64, name: String, kind: FileKind) {
-        self.remove(file_ref);
-        self.insert(FileRecord { file_ref, parent_ref: new_parent_ref, name, kind });
+    pub fn apply_move(&mut self, drive: u8, file_ref: u64, new_parent_ref: u64, name: String, kind: FileKind) {
+        self.remove(drive, file_ref);
+        self.insert(drive, FileRecord { file_ref, parent_ref: new_parent_ref, name, kind });
     }
 
     /// Apply a batch of journal events under a single lock acquisition:
     /// all mutations run first, then sorted-name order and ref_lookup are
-    /// restored once (instead of once per event).
+    /// restored once (instead of once per event). Every data event carries
+    /// its drive letter; all removes/inserts stay in that drive's space.
     pub fn apply_events(&mut self, events: Vec<IndexEvent>) {
         if events.is_empty() {
             return;
         }
 
-        let mut pending: Vec<FileRecord> = Vec::with_capacity(events.len());
+        let mut pending: Vec<(u8, FileRecord)> = Vec::with_capacity(events.len());
         let mut removed = false;
 
         for event in events {
             match event {
-                IndexEvent::Created(r) => {
-                    if !self.is_live_junk(r.parent_ref) {
-                        pending.push(r);
+                IndexEvent::Created { drive_letter, record } => {
+                    let d = self.drive_index(drive_letter);
+                    if !self.is_live_junk(record.parent_ref, d) {
+                        pending.push((d, record));
                     } else {
-                        self.junk_refs.insert(r.file_ref);
+                        self.junk_refs_for(d).insert(record.file_ref);
                     }
                 }
-                IndexEvent::Deleted(id) => {
+                IndexEvent::Deleted { drive_letter, file_ref } => {
+                    let d = self.drive_index(drive_letter);
                     let before = self.entries.len();
-                    self.entries.retain(|e| e.file_ref != id);
-                    self.junk_refs.remove(&id);
+                    self.entries
+                        .retain(|e| !(e.drive == d && e.file_ref == file_ref));
+                    self.junk_refs_for(d).remove(&file_ref);
                     removed |= self.entries.len() != before;
                 }
-                IndexEvent::Renamed { old_ref, new_record } => {
-                    self.entries.retain(|e| e.file_ref != old_ref);
-                    self.junk_refs.remove(&old_ref);
-                    if !self.is_live_junk(new_record.parent_ref) {
-                        pending.push(new_record);
+                IndexEvent::Renamed { drive_letter, old_ref, new_record } => {
+                    let d = self.drive_index(drive_letter);
+                    self.entries
+                        .retain(|e| !(e.drive == d && e.file_ref == old_ref));
+                    self.junk_refs_for(d).remove(&old_ref);
+                    if !self.is_live_junk(new_record.parent_ref, d) {
+                        pending.push((d, new_record));
                     } else {
-                        self.junk_refs.insert(new_record.file_ref);
+                        self.junk_refs_for(d).insert(new_record.file_ref);
                     }
                 }
-                IndexEvent::Moved { file_ref, new_parent_ref, name, kind } => {
-                    self.entries.retain(|e| e.file_ref != file_ref);
+                IndexEvent::Moved { drive_letter, file_ref, new_parent_ref, name, kind } => {
+                    let d = self.drive_index(drive_letter);
+                    self.entries
+                        .retain(|e| !(e.drive == d && e.file_ref == file_ref));
                     let rec = FileRecord { file_ref, parent_ref: new_parent_ref, name, kind };
-                    if !self.is_live_junk(rec.parent_ref) {
-                        pending.push(rec);
+                    if !self.is_live_junk(rec.parent_ref, d) {
+                        pending.push((d, rec));
                     } else {
-                        self.junk_refs.insert(rec.file_ref);
+                        self.junk_refs_for(d).insert(rec.file_ref);
                     }
                 }
                 IndexEvent::Checkpoint(_) => {}
@@ -587,15 +642,17 @@ impl IndexStore {
         }
 
         // Idempotency: every record in this batch supersedes any pre-existing
-        // entry with the same file_ref. This makes re-applying journal events
-        // (e.g. after a stale checkpoint) safe instead of duplicating entries.
-        let pending_refs: std::collections::HashSet<u64> =
-            pending.iter().map(|r| r.file_ref).collect();
-        self.entries.retain(|e| !pending_refs.contains(&e.file_ref));
+        // entry with the same (drive, file_ref). This makes re-applying
+        // journal events (e.g. after a stale checkpoint) safe instead of
+        // duplicating entries.
+        let pending_refs: std::collections::HashSet<(u8, u64)> =
+            pending.iter().map(|(d, r)| (*d, r.file_ref)).collect();
+        self.entries
+            .retain(|e| !pending_refs.contains(&(e.drive, e.file_ref)));
 
         self.entries.reserve(pending.len());
-        for record in &pending {
-            let entry = self.arena_entry(record);
+        for (d, record) in &pending {
+            let entry = self.arena_entry(record, *d);
             self.entries.push(entry);
         }
         let store_ptr = self as *const IndexStore;
@@ -615,6 +672,14 @@ impl IndexStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ntfs_drive(letter: char) -> NtfsDrive {
+        NtfsDrive {
+            letter,
+            root: format!("{}:\\", letter),
+            device_path: format!("\\\\.\\{}:", letter),
+        }
+    }
 
     fn scan_result(records: &[(u64, u64, &str, bool)]) -> ScanResult {
         let mut name_data = Vec::new();
@@ -657,7 +722,7 @@ mod tests {
                 (15, 0, "Temp", true),
                 (16, 15, "cache.tmp", false),
             ]),
-            "C:\\",
+            &ntfs_drive('C'),
         );
         store.finalize();
 
@@ -672,14 +737,14 @@ mod tests {
             .iter()
             .find(|e| store.name(e) == "report.txt")
             .unwrap();
-        let pidx = store.lookup_idx(report.parent_ref).unwrap();
+        let pidx = store.lookup_idx(0, report.parent_ref).unwrap();
         assert_eq!(store.name(&store.entries[pidx as usize]), "Alice");
 
         // Pruned subtree members are remembered (live journal re-entries are
         // filtered through junk_refs), but surviving junk ROOT dirs are not.
-        assert!(store.junk_refs.contains(&14)); // lodash.js under node_modules
-        assert!(store.junk_refs.contains(&16)); // cache.tmp under Temp
-        assert!(!store.junk_refs.contains(&13)); // node_modules itself kept
+        assert!(store.junk_refs[0].contains(&14)); // lodash.js under node_modules
+        assert!(store.junk_refs[0].contains(&16)); // cache.tmp under Temp
+        assert!(!store.junk_refs[0].contains(&13)); // node_modules itself kept
     }
 
     #[test]
@@ -691,12 +756,12 @@ mod tests {
                 (2, 1, "beta.md", false),
                 (3, 0, "Dir", true),
             ]),
-            "C:\\",
+            &ntfs_drive('C'),
         );
         store.finalize();
 
         let cache = store.to_cache();
-        let loaded = IndexStore::from_cache(cache);
+        let loaded = IndexStore::from_cache(cache).unwrap();
         assert_eq!(loaded.entries.len(), 3);
         assert_eq!(loaded.junk_refs, store.junk_refs);
         assert_eq!(
@@ -708,7 +773,125 @@ mod tests {
             .iter()
             .find(|e| loaded.name(e) == "beta.md")
             .unwrap();
-        let pidx = loaded.lookup_idx(beta.parent_ref).unwrap();
+        let pidx = loaded.lookup_idx(0, beta.parent_ref).unwrap();
         assert_eq!(loaded.name(&loaded.entries[pidx as usize]), "Alpha.TXT");
+    }
+
+    #[test]
+    fn multi_drive_refs_do_not_collide_and_paths_use_own_root() {
+        let mut store = IndexStore::new();
+        // Both drives use the same file_refs (1 = root dir, 10 = child) —
+        // MFT record numbers are per-volume, so collisions are the norm.
+        store.populate_from_scan(
+            scan_result(&[
+                (1, 0, "Users", true),
+                (10, 1, "a.txt", false),
+            ]),
+            &ntfs_drive('C'),
+        );
+        store.populate_from_scan(
+            scan_result(&[
+                (1, 0, "Games", true),
+                (10, 1, "b.exe", false),
+            ]),
+            &ntfs_drive('D'),
+        );
+        store.finalize();
+
+        assert_eq!(store.drive_roots.len(), 2);
+        assert_eq!(store.drive_roots[0].root, "C:\\");
+        assert_eq!(store.drive_roots[1].root, "D:\\");
+
+        let a = store.entries.iter().find(|e| store.name(e) == "a.txt").unwrap();
+        let b = store.entries.iter().find(|e| store.name(e) == "b.exe").unwrap();
+        assert_eq!(a.drive, 0);
+        assert_eq!(b.drive, 1);
+
+        // Same file_ref on both drives resolves inside its own volume.
+        assert_eq!(store.name(&store.entries[store.lookup_idx(0, 10).unwrap() as usize]), "a.txt");
+        assert_eq!(store.name(&store.entries[store.lookup_idx(1, 10).unwrap() as usize]), "b.exe");
+
+        // Paths are built against each volume's own root.
+        assert_eq!(
+            crate::index::search::build_path(a, &store).to_string_lossy(),
+            r"C:\Users\a.txt"
+        );
+        assert_eq!(
+            crate::index::search::build_path(b, &store).to_string_lossy(),
+            r"D:\Games\b.exe"
+        );
+
+        // Cache round-trips the per-drive layout.
+        let cache = store.to_cache();
+        let loaded = IndexStore::from_cache(cache).unwrap();
+        assert_eq!(loaded.drive_roots.len(), 2);
+        assert_eq!(loaded.junk_refs, store.junk_refs);
+        let loaded_b = loaded.entries.iter().find(|e| loaded.name(e) == "b.exe").unwrap();
+        assert_eq!(
+            crate::index::search::build_path(loaded_b, &loaded).to_string_lossy(),
+            r"D:\Games\b.exe"
+        );
+    }
+
+    #[test]
+    fn live_events_stay_in_their_drive() {
+        let mut store = IndexStore::new();
+        store.populate_from_scan(
+            scan_result(&[
+                (1, 0, "Users", true),
+                (10, 1, "old.txt", false),
+            ]),
+            &ntfs_drive('C'),
+        );
+        store.populate_from_scan(
+            scan_result(&[
+                (1, 0, "Games", true),
+                (10, 1, "keep.exe", false),
+            ]),
+            &ntfs_drive('D'),
+        );
+        store.finalize();
+
+        // Deleting ref 10 on drive C must not touch drive D's ref 10.
+        store.apply_events(vec![IndexEvent::Deleted {
+            drive_letter: 'C',
+            file_ref: 10,
+        }]);
+        assert!(store.entries.iter().any(|e| e.drive == 1 && store.name(e) == "keep.exe"));
+        assert!(!store.entries.iter().any(|e| e.drive == 0 && store.name(e) == "old.txt"));
+
+        // Creating ref 10 on drive D (same ref as deleted C entry) lands on D.
+        store.apply_events(vec![IndexEvent::Created {
+            drive_letter: 'D',
+            record: FileRecord {
+                file_ref: 10,
+                parent_ref: 1,
+                name: "new.txt".to_string(),
+                kind: FileKind::File,
+            },
+        }]);
+        let new_entries: Vec<&IndexEntry> =
+            store.entries.iter().filter(|e| e.file_ref == 10).collect();
+        assert_eq!(new_entries.len(), 1);
+        assert_eq!(new_entries[0].drive, 1);
+        assert_eq!(store.name(new_entries[0]), "new.txt");
+    }
+
+    #[test]
+    fn cache_rejects_foreign_format() {
+        let mut store = IndexStore::new();
+        store.populate_from_scan(
+            scan_result(&[(1, 0, "a.txt", false)]),
+            &ntfs_drive('C'),
+        );
+        store.finalize();
+
+        let mut cache = store.to_cache();
+        cache.version = 1;
+        assert!(IndexStore::from_cache(cache).is_none());
+
+        let mut cache = store.to_cache();
+        cache.magic = *b"OLDC";
+        assert!(IndexStore::from_cache(cache).is_none());
     }
 }
