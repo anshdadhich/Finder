@@ -1036,7 +1036,6 @@ fn main() {
             let window = app.get_window("main").expect("main window");
             *setup_close_window.lock() = Some(window.clone());
             position_spotlight(&window);
-            apply_window_backdrop(&window);
             let _ = window.show();
             let _ = window.set_focus();
 
@@ -1144,73 +1143,15 @@ fn main() {
     log_line("run: finished");
 }
 
-/// True once real OS-level frosted glass (Mica/Acrylic) is active. The JS
-/// falls back to CSS backdrop-filter when this is false, so the palette never
-/// renders flat over an un-blurred desktop.
-static BACKDROP_OK: AtomicBool = AtomicBool::new(false);
-
+// The OS backdrop (Mica/Acrylic) is retired: it paints the ENTIRE window
+// rect as one dark sheet, which turns the transparent margins around the
+// card into a big black rectangle. The window is now a fully transparent
+// sheet — the card's own translucent background + full shadow is the design
+// (the card is width-animated inside the sheet, so a window-filling backdrop
+// is impossible anyway).
 #[tauri::command]
 fn backdrop_ok() -> bool {
-    BACKDROP_OK.load(Ordering::Relaxed)
-}
-
-/// Real frosted glass at the OS level: Mica (Win11 22H2+, cheap, system-
-/// drawn) or Acrylic (Win10 / older Win11 via SetWindowCompositionAttribute).
-/// CSS backdrop-filter cannot blur the desktop behind a transparent WebView2
-/// window — Chromium only samples the window's own content — so the DWM
-/// backdrop is the only path to genuine glass. Build number and app theme
-/// come from the registry (no extra windows-crate features needed).
-fn apply_window_backdrop(window: &tauri::Window) {
-    let build = windows_build_number();
-    let dark = !apps_use_light_theme();
-    let tint = if dark {
-        (26, 27, 29, 230)
-    } else {
-        (248, 248, 250, 230)
-    };
-
-    let chosen;
-    let mut res = if build >= 22621 {
-        chosen = "mica";
-        window_vibrancy::apply_mica(window, Some(dark))
-    } else {
-        chosen = "acrylic";
-        window_vibrancy::apply_acrylic(window, Some(tint))
-    };
-    if res.is_err() {
-        // Safety net: if the primary backdrop failed (unexpected build), the
-        // other one usually still works — never leave a flat window.
-        res = window_vibrancy::apply_acrylic(window, Some(tint));
-    }
-    BACKDROP_OK.store(res.is_ok(), Ordering::Relaxed);
-    log_line(&format!(
-        "backdrop: {} (build {}, {})",
-        if res.is_ok() { "applied" } else { "failed" },
-        build,
-        chosen
-    ));
-}
-
-/// Windows build number from the registry (e.g. 22631 for Win11 23H2).
-fn windows_build_number() -> u32 {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
-    use winreg::RegKey;
-    RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
-        .and_then(|k| k.get_value::<String, _>("CurrentBuildNumber"))
-        .map(|v| v.trim().parse().unwrap_or(0))
-        .unwrap_or(0)
-}
-
-/// Whether Windows apps are in light theme (HKCU …\Personalize\AppsUseLightTheme).
-fn apps_use_light_theme() -> bool {
-    use winreg::enums::HKEY_CURRENT_USER;
-    use winreg::RegKey;
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-        .and_then(|k| k.get_value::<u32, _>("AppsUseLightTheme"))
-        .map(|v| v != 0)
-        .unwrap_or(true)
+    true
 }
 
 fn position_spotlight(window: &tauri::Window) {

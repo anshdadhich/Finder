@@ -47,7 +47,6 @@ crossbeam-channel = "0.5"
 fuzzy-matcher = "0.3"
 once_cell = "1.19"
 parking_lot = "0.12"
-window-vibrancy = "0.4"
 bincode = "1.3"
 serde = { version = "1", features = ["derive"] }
 lz4_flex = "0.11"
