@@ -267,10 +267,12 @@ input#search::placeholder {
 }
 
 #results {
-  width: 56%;
+  flex: 1 1 auto;
+  min-width: 0;
   padding: 8px;
   overflow-y: auto;
   border-right: 1px solid var(--border-subtle);
+  transition: border-right-color 0.24s ease;
 }
 
 #results::-webkit-scrollbar {
@@ -413,20 +415,32 @@ input#search::placeholder {
 
 /* ── Preview pane ──────────────────────────────────────────────────────── */
 .preview-pane {
-  width: 44%;
+  flex: 0 0 350px;
+  width: 350px;
+  min-width: 0;
   padding: 22px 18px;
   display: flex;
   flex-direction: column;
   background: var(--bg-preview);
+  overflow-x: hidden;
   overflow-y: auto;
+  /* The pane slides out/in as a real rail: transform does the visual slide
+     while flex-basis/width surrender the layout space so #results grows
+     smoothly with it (no end-snap). */
+  transform: translateX(0);
+  transition: flex-basis 0.24s ease, width 0.24s ease, transform 0.24s ease, opacity 0.2s ease;
 }
 
 body.preview-off .preview-pane {
-  display: none;
+  flex-basis: 0;
+  width: 0;
+  transform: translateX(100%);
+  opacity: 0;
 }
 
 body.preview-off #results {
-  width: 100%;
+  flex: 1 1 auto;
+  width: auto;
   border-right: 0;
 }
 

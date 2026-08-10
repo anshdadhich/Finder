@@ -991,10 +991,11 @@ fn main() {
             let _ = window.show();
             let _ = window.set_focus();
 
-            register_shortcut(app, "Super+Space", window.clone());
+            // Primary summon hotkey. NB: Win+Space is RESERVED by Windows 11
+            // (language switcher) and RegisterHotKey refuses it, so Super+Space
+            // is deliberately not used here. Ctrl+Space is primary; Ctrl+Alt+
+            // Space is the collision-free (IME-safe) backup, registered last.
             register_shortcut(app, "Ctrl+Space", window.clone());
-            // Fallback that never collides with Win+Space (language switch)
-            // or Ctrl+Space (IME); registered last so the common ones win.
             register_shortcut(app, "Ctrl+Alt+Space", window.clone());
 
             start_backend(
@@ -1116,14 +1117,56 @@ fn show_spotlight(window: &tauri::Window) {
 
 fn register_shortcut(app: &tauri::App, shortcut: &str, window: tauri::Window) {
     let label = shortcut.to_string();
-    if let Err(e) = app.global_shortcut_manager().register(shortcut, move || {
-        if window.is_visible().unwrap_or(false) {
-            let _ = window.hide();
-        } else {
-            show_spotlight(&window);
+    let handler = {
+        let window = window.clone();
+        move || {
+            if window.is_visible().unwrap_or(false) {
+                let _ = window.hide();
+            } else {
+                show_spotlight(&window);
+            }
         }
-    }) {
-        eprintln!("Could not register {}: {}", label, e);
+    };
+    match app.global_shortcut_manager().register(&label, handler) {
+        Ok(()) => log_line(&format!("hotkey registered: {}", label)),
+        Err(e) => {
+            // The GUI has no console, so a silent eprintln would be invisible.
+            // Log it, then retry on the main thread a few times — transient
+            // conflicts (IME, another app briefly holding the combo) clear
+            // within a couple of seconds.
+            log_line(&format!("hotkey {} register failed: {}; retrying", label, e));
+            let handle = app.handle().clone();
+            let label2 = label;
+            std::thread::spawn(move || {
+                for attempt in 1..=3u32 {
+                    std::thread::sleep(Duration::from_secs(2));
+                    let handle_inner = handle.clone();
+                    let label3 = label2.clone();
+                    let _ = handle_inner.run_on_main_thread({
+                        let handle_inner = handle_inner.clone();
+                        move || {
+                            let Some(window) = handle_inner.get_window("main") else {
+                                return;
+                            };
+                            let handler = {
+                                let window = window.clone();
+                                move || {
+                                    if window.is_visible().unwrap_or(false) {
+                                        let _ = window.hide();
+                                    } else {
+                                        show_spotlight(&window);
+                                    }
+                                }
+                            };
+                            match handle_inner.global_shortcut_manager().register(&label3, handler) {
+                                Ok(()) => log_line(&format!("hotkey {} registered (retry {})", label3, attempt)),
+                                Err(e) => log_line(&format!("hotkey {} retry {} failed: {}", label3, attempt, e)),
+                            }
+                        }
+                    });
+                }
+            });
+        }
     }
 }
 
@@ -1804,23 +1847,35 @@ fn now_millis() -> u64 {
 }
 
 /// Returns the existing FastSeek window when an instance is already running.
+/// Double-guarded: a `Global\`-namespace mutex plus a live-window check, so two
+/// instances can never both claim ownership (which would make them fight over
+/// the same global hotkeys).
 fn ensure_single_instance() -> Option<HWND> {
-    let mut name: Vec<u16> = "FastSeek_SingleInstance"
+    let existing = find_fastseek_window();
+    let mut name: Vec<u16> = "Global\\FastSeek_SingleInstance"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
     let name_ptr = PCWSTR(name.as_mut_ptr());
+    // requireAdministrator grants SeCreateGlobalPrivilege, so the Global\
+    // namespace is safe here and holds even across sessions.
     let Ok(mutex) = (unsafe { CreateMutexW(None, true.into(), name_ptr) }) else {
         return None; // could not even create the mutex; proceed anyway
     };
     let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-    std::mem::forget(mutex); // keep the name owned until process exit
-    if !already_running {
-        return None;
+    std::mem::forget(mutex); // leak the handle so the mutex lives for the process
+    if already_running {
+        return existing;
     }
+    // Mutex says we're first — but if a FastSeek window already exists (mutex
+    // namespace quirk), defer to it instead of starting a second index.
+    existing
+}
+
+fn find_fastseek_window() -> Option<HWND> {
     let mut title: Vec<u16> = "FastSeek".encode_utf16().chain(std::iter::once(0)).collect();
     let title_ptr = PCWSTR(title.as_mut_ptr());
-    unsafe { FindWindowW(PCWSTR::null(), title_ptr).ok() }
+    unsafe { FindWindowW(PCWSTR::null(), title_ptr).ok().filter(|h| !h.0.is_null()) }
 }
 
 #[tauri::command]

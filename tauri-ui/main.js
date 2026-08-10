@@ -595,8 +595,10 @@ function applyPreviewVisibility() {
 }
 
 // The window width follows the pane: wide (820) with preview, compact (560)
-// without. JS steps the size frame-by-frame via IPC so the growth reads as
-// one motion; onDone fires after the final frame.
+// without. Do it as ONE native resize+reposition — animating the OS window
+// frame-by-frame via IPC re-rasterizes the transparent blur window ~14x and
+// makes every component jitter. The pane's own CSS transition (flex-basis +
+// transform) supplies the smooth slide now.
 let widthAnim = null;
 function setWindowWidth(wide) {
   if (!invoke) return;
@@ -605,27 +607,8 @@ function setWindowWidth(wide) {
 function animateWindowWidth(wide, onDone) {
   if (widthAnim) cancelAnimationFrame(widthAnim);
   widthAnim = null;
-  if (!invoke) {
-    if (onDone) onDone();
-    return;
-  }
-  const from = wide ? 560 : 820;
-  const to = wide ? 820 : 560;
-  const t0 = performance.now();
-  const DUR = 230;
-  const step = () => {
-    const p = Math.min(1, (performance.now() - t0) / DUR);
-    const e = 1 - Math.pow(1 - p, 3);
-    const w = Math.round(from + (to - from) * e);
-    invoke("resize_palette", { width: w }).catch(() => {});
-    if (p < 1) {
-      widthAnim = requestAnimationFrame(step);
-    } else {
-      widthAnim = null;
-      if (onDone) onDone();
-    }
-  };
-  step();
+  setWindowWidth(wide);
+  if (onDone) onDone();
 }
 
 applyPreviewVisibility();
@@ -638,17 +621,17 @@ if (previewToggle) {
     localStorage.setItem("fs-preview-hidden", hiding ? "1" : "0");
     previewToggle.setAttribute("aria-pressed", String(!hiding));
     if (!hiding) {
-      // Expanding: the pane appears right away and grows with the window.
+      // Expanding: pane slides in while the window grows to make room.
       document.body.classList.remove("preview-off");
       renderPreview();
       animateWindowWidth(true);
     } else {
-      // Collapsing: keep the pane laid out so the shrinking window clips it
-      // away naturally; only then switch to full-width results.
-      animateWindowWidth(false, () => {
-        document.body.classList.add("preview-off");
-        renderPreview();
-      });
+      // Collapsing: the pane's CSS transition slides it out (and collapses
+      // its width) at the same time the window is shrinking, so there is no
+      // snap where the results jump to full width.
+      document.body.classList.add("preview-off");
+      renderPreview();
+      animateWindowWidth(false);
     }
   });
 }
