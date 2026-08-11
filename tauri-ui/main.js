@@ -170,7 +170,7 @@ function paintFromPools(query) {
   const canPaint = (appPoolLoaded && appPool.length > 0) || fileCache.size > 0;
   if (!canPaint) return false;
   // Math queries paint instantly — no backend round-trip needed.
-  const math = tryMath(q);
+  const math = mathEnabled ? tryMath(q) : null;
   if (math) {
     items = [math];
     selected = 0;
@@ -490,7 +490,7 @@ function renderNow() {
   // Math rows are synthesized per render from the current query: "2*8"
   // becomes "2*8 = 16" as the top result. Strip stale math rows first.
   items = items.filter((it) => it.kind !== "math");
-  const math = tryMath(query);
+  const math = mathEnabled ? tryMath(query) : null;
   if (math) items.unshift(math);
   statusEl.style.display = "none";
   const groups = groupItems(items);
@@ -715,6 +715,20 @@ if (setPreviewSwitch) {
   });
 }
 
+// Instant math: typing "2*8" evaluates locally. Off = plain file search.
+const setMathSwitch = document.getElementById("setMath");
+let mathEnabled = localStorage.getItem("fs-math") !== "0";
+if (setMathSwitch) {
+  setMathSwitch.setAttribute("aria-checked", String(mathEnabled));
+  setMathSwitch.addEventListener("click", () => {
+    mathEnabled = !mathEnabled;
+    localStorage.setItem("fs-math", mathEnabled ? "1" : "0");
+    setMathSwitch.setAttribute("aria-checked", String(mathEnabled));
+    paintFromPools(input.value);
+    scheduleSearch();
+  });
+}
+
 // Window transparency: the bg colors are composed here (they depend on the
 // active theme) and set inline on <body>, which outranks the :root defaults.
 // Setting only --window-alpha does NOT work: custom properties resolve their
@@ -830,6 +844,16 @@ function fmtRelative(secs) {
   return `${Math.floor(age / 86400)} days ago`;
 }
 
+// Detail rows whose value is "—" (nothing to show) collapse instead of
+// rendering a dash. Called after every metadata fill.
+function refreshMetaVisibility() {
+  for (const row of document.querySelectorAll(".meta-row")) {
+    const value = row.querySelector(".meta-value");
+    const text = value ? value.textContent.trim() : "";
+    row.classList.toggle("pv-empty", text === "" || text === "—");
+  }
+}
+
 async function previewMeta(path) {
   clearTimeout(previewTimer);
   previewTimer = setTimeout(async () => {
@@ -842,6 +866,7 @@ async function previewMeta(path) {
       pvSize.textContent = "—";
       pvModified.textContent = "—";
     }
+    refreshMetaVisibility();
   }, 60);
 }
 
@@ -905,6 +930,7 @@ function renderPreview() {
     pvSize.textContent = "—";
     pvModified.textContent = "—";
   }
+  refreshMetaVisibility();
 }
 
 // Apps: the preview resolves the shortcut to its real executable (size,
@@ -942,6 +968,7 @@ async function previewMetaApp(item) {
       pvPublisher.textContent = "—";
       pvVersion.textContent = "—";
     }
+    refreshMetaVisibility();
   }, 60);
 }
 
@@ -1069,6 +1096,22 @@ async function refreshStatus() {
 }
 
 let lastNavKeyAt = 0; // hover never yanks the selection right after a keystroke
+
+// Clicking anywhere outside the card (the transparent window margins) acts
+// like Esc: reset the query and hide. Clicks on the desktop itself already
+// dismiss via the window's focus-loss handler.
+document.addEventListener("mousedown", (event) => {
+  if (event.button !== 0) return;
+  if (event.target.closest(".launcher-window") || event.target.closest(".fr-card")) return;
+  if (input.value.trim()) {
+    input.value = "";
+    selected = 0;
+    fileTotal = 0;
+    lastNavKeyAt = Date.now();
+    paintFromPools("");
+  }
+  if (invoke) invoke("hide_window");
+});
 
 window.addEventListener("keydown", async (event) => {
   if (event.key === "Escape") {
