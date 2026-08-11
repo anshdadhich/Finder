@@ -32,7 +32,6 @@ const statusText = document.querySelector("#statusText");
 const progressFill = document.querySelector("#progressFill");
 const resultsEl = document.querySelector("#results");
 const emptyEl = document.querySelector("#empty");
-const hintsEl = document.querySelector("#hints");
 const scanStateEl = document.querySelector("#scanState");
 const scanTitle = document.querySelector("#scanTitle");
 const scanSub = document.querySelector("#scanSub");
@@ -466,6 +465,26 @@ function render() {
   });
 }
 
+/* The card's height follows its content but `height: auto` can't be
+   transitioned, so we measure and set it explicitly — debounced by ~90ms so
+   fast typing settles before the card glides (same easing as the width).
+   Auto→px never animates, so the first measure on load is instant. */
+const cardWinEl = document.querySelector(".launcher-window");
+let cardHeightTimer = null;
+let cardHeightShown = null;
+function syncCardHeight() {
+  clearTimeout(cardHeightTimer);
+  cardHeightTimer = setTimeout(() => {
+    // Probe in "auto" (a px value can't measure content), then always
+    // restore — the deduped value must be re-set, otherwise the inline
+    // style is left at "auto" and the card stops tracking its content.
+    cardWinEl.style.height = "auto";
+    const h = Math.max(210, Math.min(cardWinEl.scrollHeight, 520));
+    cardHeightShown = h;
+    cardWinEl.style.height = h + "px";
+  }, 90);
+}
+
 function renderNow() {
   const query = input.value;
   // Math rows are synthesized per render from the current query: "2*8"
@@ -623,7 +642,7 @@ function renderNow() {
 
   resultsEl.replaceChildren(fragment);
   emptyEl.classList.toggle("visible", flatIndex === 0 && input.value.trim().length > 0);
-  hintsEl.classList.toggle("visible", flatIndex > 0);
+  syncCardHeight();
   for (let i = 0; i < rowEls.length; i++) {
     const el = rowEls[i];
     if (el && !el._observed && !el.classList.contains("more") && !el.classList.contains("math")) {
@@ -682,6 +701,7 @@ if (settingsBtn) {
     document.body.classList.toggle("settings-open", open);
     settingsBtn.setAttribute("aria-pressed", String(open));
     if (!open) renderPreview();
+    syncCardHeight();
   });
 }
 
@@ -699,14 +719,16 @@ if (setPreviewSwitch) {
 // active theme) and set inline on <body>, which outranks the :root defaults.
 // Setting only --window-alpha does NOT work: custom properties resolve their
 // var() references at the declaration site (:root), not per element.
-let alphaValue = 85;
+// The slider value is TRANSPARENCY: 0% = solid panel, 100% = nearly
+// invisible. (Older builds stored opacity; values >50 are migrated below.)
+let alphaValue = 15;
 function applyAlpha(v) {
   alphaValue = v;
-  const a = v / 100;
+  const a = Math.max(0.12, 1 - v / 100);
   const dark = document.documentElement.getAttribute("data-theme") !== "light";
   const base = dark ? [28, 28, 30] : [250, 250, 252];
   const preview = dark ? [22, 23, 26] : [243, 243, 246];
-  const pa = Math.max(0.3, a - 0.05);
+  const pa = Math.max(0.12, a - 0.05);
   document.body.style.setProperty("--bg-window", `rgba(${base[0]}, ${base[1]}, ${base[2]}, ${a})`);
   document.body.style.setProperty("--bg-preview", `rgba(${preview[0]}, ${preview[1]}, ${preview[2]}, ${pa})`);
   document.body.style.setProperty("--window-alpha", String(a));
@@ -714,8 +736,10 @@ function applyAlpha(v) {
   if (setAlphaVal) setAlphaVal.textContent = v + "%";
   localStorage.setItem("fs-alpha", String(v));
 }
-const savedAlpha = parseInt(localStorage.getItem("fs-alpha"), 10);
-applyAlpha(Number.isFinite(savedAlpha) && savedAlpha >= 50 && savedAlpha <= 100 ? savedAlpha : 85);
+const rawAlpha = parseInt(localStorage.getItem("fs-alpha"), 10);
+let initialAlpha = Number.isFinite(rawAlpha) ? rawAlpha : 15;
+if (initialAlpha > 50) initialAlpha = 100 - initialAlpha; // legacy opacity value
+applyAlpha(Math.max(0, Math.min(100, initialAlpha)));
 if (setAlpha) {
   setAlpha.addEventListener("input", () => applyAlpha(Number(setAlpha.value)));
 }
@@ -825,6 +849,7 @@ function renderPreview() {
   // Called on every selection change (and on search re-render). All DOM
   // work is confined to the pane; the stat itself is debounced + skipped
   // entirely while the pane is hidden.
+  syncCardHeight();
   const row = rowEls[selected];
   const item = row && row._item;
   const pane = previewPaneEl;
@@ -1189,7 +1214,17 @@ resultsEl.addEventListener("mousemove", (event) => {
   }
 });
 
+// Traditional behavior: a single click selects the row (highlight moves,
+// preview follows); a double click opens it. Keyboard (Enter etc.) and the
+// preview action buttons still open on their own.
 resultsEl.addEventListener("click", (event) => {
+  const row = event.target.closest(".result");
+  if (!row) return;
+  selected = Number(row.dataset.index);
+  updateSelection();
+});
+
+resultsEl.addEventListener("dblclick", (event) => {
   const row = event.target.closest(".result");
   if (!row) return;
   selected = Number(row.dataset.index);

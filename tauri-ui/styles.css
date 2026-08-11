@@ -116,7 +116,7 @@ body {
   position: relative;
   overflow: hidden;
   animation: popIn 0.16s cubic-bezier(0.16, 1, 0.3, 1);
-  transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1);
+  transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), height 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 body.preview-off .launcher-window {
@@ -331,6 +331,18 @@ input#search::placeholder {
   border-radius: 10px;
 }
 #results::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* The preview pane scrolls like the results list: same slim, subtle thumb. */
+.preview-pane::-webkit-scrollbar {
+  width: 5px;
+}
+.preview-pane::-webkit-scrollbar-thumb {
+  background: var(--bg-hover);
+  border-radius: 10px;
+}
+.preview-pane::-webkit-scrollbar-track {
   background: transparent;
 }
 
@@ -907,30 +919,7 @@ input#setAlpha {
   display: flex;
 }
 
-/* ── Footer / shortcut bar ─────────────────────────────────────────────── */
-.footer-bar {
-  flex: 0 0 auto;
-  height: 34px;
-  background: var(--footer-bg);
-  border-top: 1px solid var(--border-subtle);
-  display: none;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 16px;
-  font-size: 11px;
-  color: var(--text-secondary);
-  overflow: hidden;
-}
-
-.footer-bar.visible {
-  display: flex;
-}
-
-.shortcuts-group {
-  display: flex;
-  gap: 14px;
-}
-
+/* ── Shortcut pills (preview pane) ─────────────────────────────────────── */
 .shortcut-item {
   display: flex;
   align-items: center;
@@ -948,9 +937,7 @@ input#setAlpha {
 }
 
 .brand {
-  font-size: 10.5px;
-  color: var(--text-tertiary);
-  font-weight: 500;
+  display: none;
 }
 
 /* ── Scan (first run / rebuild) screen ─────────────────────────────────── */
