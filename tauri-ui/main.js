@@ -500,30 +500,40 @@ function renderNow() {
   const rendered = new Set();
 
   for (const group of groups) {
-    const header = document.createElement("div");
-    header.className = "group-label";
-    header.textContent = group.label;
-    fragment.appendChild(header);
+    if (group.label !== "Calculation") {
+      const header = document.createElement("div");
+      header.className = "group-label";
+      header.textContent = group.label;
+      fragment.appendChild(header);
+    }
 
     for (const item of group.rows) {
-      // Math queries render as a calculator-style display (query on top, big
-      // result below) instead of a list row — like a calculator's screen.
+      // Math queries render as a hero card (like a calculator display): the
+      // expression as tokens (numbers in chips, operators in red), a
+      // "Calculator Result" badge, and the answer big and bold below.
       if (item.kind === "math") {
         let el = rowPool.get(item.path);
         if (!el) {
           el = document.createElement("div");
-          el.className = "result math";
-          const disp = document.createElement("div");
-          disp.className = "math-display";
-          const expr = document.createElement("div");
-          expr.className = "math-expr";
-          const value = document.createElement("div");
-          value.className = "math-value";
-          disp.appendChild(expr);
-          disp.appendChild(value);
-          el.appendChild(disp);
-          el._exprEl = expr;
-          el._valueEl = value;
+          el.className = "result calc-hero-row";
+          const hero = document.createElement("div");
+          hero.className = "calc-hero";
+          const head = document.createElement("div");
+          head.className = "calc-head";
+          const tokens = document.createElement("div");
+          tokens.className = "calc-tokens";
+          const badge = document.createElement("span");
+          badge.className = "calc-badge";
+          badge.textContent = "Calculator Result";
+          const result = document.createElement("div");
+          result.className = "calc-result";
+          head.appendChild(tokens);
+          head.appendChild(badge);
+          hero.appendChild(head);
+          hero.appendChild(result);
+          el.appendChild(hero);
+          el._tokensEl = tokens;
+          el._resultEl = result;
           rowPool.set(item.path, el);
         }
         rendered.add(item.path);
@@ -531,11 +541,12 @@ function renderNow() {
         el.dataset.path = item.path;
         el._item = item;
         if (el._expr !== item.expr) {
-          el._exprEl.textContent = item.expr;
+          el._tokensEl.innerHTML = mathTokens(item.expr);
           el._expr = item.expr;
         }
         if (el._value !== item.value) {
-          el._valueEl.textContent = `= ${item.value}`;
+          const n = Number(item.value);
+          el._resultEl.textContent = Number.isFinite(n) ? n.toLocaleString() : item.value;
           el._value = item.value;
         }
         fragment.appendChild(el);
@@ -735,7 +746,7 @@ if (setMathSwitch) {
 // var() references at the declaration site (:root), not per element.
 // The slider value is TRANSPARENCY: 0% = solid panel, 100% = nearly
 // invisible. (Older builds stored opacity; values >50 are migrated below.)
-let alphaValue = 15;
+let alphaValue = 35;
 function applyAlpha(v) {
   alphaValue = v;
   const a = Math.max(0.12, 1 - v / 100);
@@ -751,7 +762,7 @@ function applyAlpha(v) {
   localStorage.setItem("fs-alpha", String(v));
 }
 const rawAlpha = parseInt(localStorage.getItem("fs-alpha"), 10);
-let initialAlpha = Number.isFinite(rawAlpha) ? rawAlpha : 15;
+let initialAlpha = Number.isFinite(rawAlpha) ? rawAlpha : 35;
 if (initialAlpha > 50) initialAlpha = 100 - initialAlpha; // legacy opacity value
 applyAlpha(Math.max(0, Math.min(100, initialAlpha)));
 if (setAlpha) {
@@ -797,6 +808,23 @@ function tryMath(query) {
       ? String(value)
       : String(Math.round(value * 1e9) / 1e9).replace(/\.?0+$/, "");
   return { kind: "math", name: `${s} = ${text}`, path: `math:${s}`, expr: s, value: text === "-0" ? "0" : text };
+}
+
+// Turn an expression like "100*25" into display tokens: numbers as chips,
+// operators as red symbols (× ÷), exactly like a calculator's readout.
+function mathTokens(expr) {
+  const parts = expr.split(/([+\-*/%^])/g).filter((t) => t.trim() !== "");
+  let html = "";
+  for (const part of parts) {
+    const t = part.trim();
+    if (/^[+\-*/%^]$/.test(t)) {
+      const sym = t === "*" ? "×" : t === "/" ? "÷" : t;
+      html += `<span class="tag-op">${sym}</span>`;
+    } else {
+      html += `<span class="tag-num">${t}</span>`;
+    }
+  }
+  return html;
 }
 
 async function copyText(text) {
@@ -894,14 +922,23 @@ function renderPreview() {
   const type = document.getElementById("pvType");
   const path = document.getElementById("pvPath");
   const iconEl = document.getElementById("pvIcon");
-  const snippet = document.getElementById("pvSnippet");
 
   title.textContent = item.name || item.path;
   type.textContent =
     item.kind === "app" ? "Application" : item.kind === "more" ? "More results" : item.is_dir ? "Folder" : "File";
   pane.classList.toggle("pv-app", item.kind === "app");
+  pane.classList.toggle("pv-plain", !!item.is_dir);
   path.textContent = item.path || "";
   path.title = item.path || "";
+
+  // Action buttons per item type: apps get admin + location (+ uninstall
+  // only when the registry knows an uninstaller), files/folders get a single
+  // "Open file location" (the path box is gone — the button replaces it).
+  const isFile = item.kind === "file" || item.kind === "dir";
+  if (adminBtn) adminBtn.style.display = item.kind === "app" ? "" : "none";
+  if (openLocBtn) openLocBtn.style.display = item.kind === "app" || isFile ? "" : "none";
+  if (uninstallBtn) uninstallBtn.style.display = "none";
+  currentSelection = { item, info: null };
 
   if (row.classList.contains("has-icon") && row._img && row._img.src) {
     iconEl.textContent = "";
@@ -919,7 +956,6 @@ function renderPreview() {
   }
 
   const hasStat = item.kind === "file" || item.kind === "dir" || item.kind === "app";
-  snippet.textContent = item.kind === "file" || item.kind === "dir" ? item.path || "" : "";
   if (item.kind === "app") {
     previewMetaApp(item);
   } else if (hasStat && item.path) {
@@ -933,10 +969,9 @@ function renderPreview() {
   refreshMetaVisibility();
 }
 
-// Apps: the preview resolves the shortcut to its real executable (size,
-// modified, location come from the exe, not the .lnk) and pulls publisher /
-// version / uninstall from the registry. Buttons act on the resolved target.
-let currentApp = null;
+// The previewed item: { item, info } — info (exe target / publisher /
+// uninstall entry) is filled in by app_info for apps, null otherwise.
+let currentSelection = null;
 
 async function previewMetaApp(item) {
   clearTimeout(previewTimer);
@@ -949,7 +984,7 @@ async function previewMetaApp(item) {
     pvModified.textContent = "…";
     try {
       const info = await invoke("app_info", { name: item.name, path: item.path });
-      currentApp = { item, info };
+      currentSelection = { item, info };
       const pvPath = document.getElementById("pvPath");
       const target = info.target || "";
       if (target && target !== item.path) {
@@ -962,6 +997,9 @@ async function previewMetaApp(item) {
       pvVersion.textContent = info.version || "—";
       if (openLocBtn) openLocBtn.disabled = !target || info.is_uwp;
       if (adminBtn) adminBtn.disabled = info.is_uwp;
+      // Uninstall exists only for installed/downloaded apps (registry entry);
+      // system apps like Command Prompt have none — no button at all.
+      if (uninstallBtn) uninstallBtn.style.display = info.uninstall_string ? "" : "none";
     } catch {
       pvSize.textContent = "—";
       pvModified.textContent = "—";
@@ -972,9 +1010,9 @@ async function previewMetaApp(item) {
   }, 60);
 }
 
-// App preview actions: run elevated, reveal the exe in Explorer, uninstall.
+// Preview actions: run elevated, reveal in Explorer, uninstall.
 async function runAppAction(cmd, payload) {
-  const cur = currentApp;
+  const cur = currentSelection;
   if (!cur) return;
   try {
     await invoke(cmd, payload);
@@ -989,21 +1027,22 @@ const openLocBtn = document.getElementById("pvOpenLoc");
 const uninstallBtn = document.getElementById("pvUninstall");
 if (adminBtn) {
   adminBtn.addEventListener("click", () => {
-    const cur = currentApp;
+    const cur = currentSelection;
     if (cur) runAppAction("launch_admin", { path: cur.item.path });
   });
 }
 if (openLocBtn) {
   openLocBtn.addEventListener("click", () => {
-    const cur = currentApp;
+    const cur = currentSelection;
     if (!cur) return;
-    const target = cur.info && cur.info.target ? cur.info.target : cur.item.path;
+    const target =
+      cur.info && cur.info.target && !cur.info.is_uwp ? cur.info.target : cur.item.path;
     runAppAction("open_parent", { path: target });
   });
 }
 if (uninstallBtn) {
   uninstallBtn.addEventListener("click", () => {
-    const cur = currentApp;
+    const cur = currentSelection;
     if (cur) runAppAction("uninstall_app", { name: cur.item.name, path: cur.item.path });
   });
 }
