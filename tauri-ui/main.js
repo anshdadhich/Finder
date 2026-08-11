@@ -1,8 +1,11 @@
 const invoke = window.__TAURI__?.tauri?.invoke || window.__TAURI__?.invoke;
 
-// Follow the OS theme live (head inline script handles first paint).
+// Theme: follows the OS by default ("system"); a manual dark/light choice
+// made in Settings (fs-theme) overrides it.
 const themeQuery = window.matchMedia("(prefers-color-scheme: light)");
+let userTheme = localStorage.getItem("fs-theme") || "system";
 function applySystemTheme() {
+  if (userTheme !== "system") return;
   document.documentElement.setAttribute(
     "data-theme",
     themeQuery.matches ? "light" : "dark"
@@ -167,6 +170,14 @@ function paintFromPools(query) {
   const q = query.trim();
   const canPaint = (appPoolLoaded && appPool.length > 0) || fileCache.size > 0;
   if (!canPaint) return false;
+  // Math queries paint instantly — no backend round-trip needed.
+  const math = tryMath(q);
+  if (math) {
+    items = [math];
+    selected = 0;
+    render();
+    return true;
+  }
   const parts = [];
   if (appPoolLoaded && appPool.length) {
     for (const app of clientApps(q)) {
@@ -293,15 +304,18 @@ function scheduleSearch() {
 }
 
 function groupItems() {
+  const math = [];
   const apps = [];
   const dirs = [];
   const files = [];
   for (const item of items) {
-    if (item.kind === "app") apps.push(item);
+    if (item.kind === "math") math.push(item);
+    else if (item.kind === "app") apps.push(item);
     else if (item.kind === "dir") dirs.push(item);
     else if (item.kind !== "more") files.push(item);
   }
   const groups = [];
+  if (math.length) groups.push({ label: "Calculation", rows: math });
   if (apps.length) groups.push({ label: "Applications", rows: apps });
   if (dirs.length) groups.push({ label: "Folders", rows: dirs });
   if (files.length) {
@@ -454,6 +468,11 @@ function render() {
 
 function renderNow() {
   const query = input.value;
+  // Math rows are synthesized per render from the current query: "2*8"
+  // becomes "2*8 = 16" as the top result. Strip stale math rows first.
+  items = items.filter((it) => it.kind !== "math");
+  const math = tryMath(query);
+  if (math) items.unshift(math);
   statusEl.style.display = "none";
   const groups = groupItems(items);
   const fragment = document.createDocumentFragment();
@@ -511,19 +530,21 @@ function renderNow() {
         }
         el._name = item.name;
         el._q = query;
-        const initial = (item.name || item.path || "?")[0].toUpperCase();
+        const initial = item.kind === "math" ? "=" : (item.name || item.path || "?")[0].toUpperCase();
         el._chip.textContent = initial;
-        let h = 7;
-        const seed = item.name || item.path || "";
-        for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+        let h = item.kind === "math" ? 210 : 7;
+        if (item.kind !== "math") {
+          const seed = item.name || item.path || "";
+          for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+        }
         el._chip.style.setProperty("--chip-hue", String(h % 360));
       }
-      const pathText = item.kind === "app" ? "" : item.kind === "more" ? item.remainingLabel : item.path;
+      const pathText = item.kind === "app" || item.kind === "math" ? "" : item.kind === "more" ? item.remainingLabel : item.path;
       if (el._path !== pathText) {
         el._pathEl.textContent = pathText;
         el._path = pathText;
       }
-      const tagText = item.kind === "app" ? "App" : item.kind === "more" ? "More" : item.is_dir ? "Folder" : "File";
+      const tagText = item.kind === "app" ? "App" : item.kind === "more" ? "More" : item.kind === "math" ? "Math" : item.is_dir ? "Folder" : "File";
       if (el._tagText !== tagText) {
         el._tag.textContent = tagText;
         el._tagText = tagText;
@@ -592,11 +613,15 @@ function updateSelection() {
   renderPreview();
 }
 
-/* ── Preview pane ───────────────────────────────────────────────────────── */
-const previewToggle = document.getElementById("previewToggle");
+/* ── Settings (the header gear opens these in place of the preview) ───── */
 const previewPaneEl = document.getElementById("previewPane");
 const pvSize = document.getElementById("pvSize");
 const pvModified = document.getElementById("pvModified");
+const settingsBtn = document.getElementById("settingsBtn");
+const setPreviewSwitch = document.getElementById("setPreview");
+const setAlpha = document.getElementById("setAlpha");
+const setAlphaVal = document.getElementById("setAlphaVal");
+const setThemeBtns = document.querySelectorAll("#setTheme button");
 let previewHidden = localStorage.getItem("fs-preview-hidden") === "1";
 let previewTimer = null;
 
@@ -606,19 +631,111 @@ let previewTimer = null;
 // flexes to fill, so there is nothing to glitch and closing animates too.
 function applyPreviewVisibility() {
   document.body.classList.toggle("preview-off", previewHidden);
-  if (previewToggle) previewToggle.setAttribute("aria-pressed", String(!previewHidden));
+  if (setPreviewSwitch) setPreviewSwitch.setAttribute("aria-checked", String(!previewHidden));
 }
 
 applyPreviewVisibility();
 
-if (previewToggle) {
-  previewToggle.addEventListener("click", () => {
+if (settingsBtn) {
+  settingsBtn.addEventListener("click", () => {
+    const open = !document.body.classList.contains("settings-open");
+    document.body.classList.toggle("settings-open", open);
+    settingsBtn.setAttribute("aria-pressed", String(open));
+    if (!open) renderPreview();
+  });
+}
+
+if (setPreviewSwitch) {
+  setPreviewSwitch.addEventListener("click", () => {
     previewHidden = !previewHidden;
     localStorage.setItem("fs-preview-hidden", previewHidden ? "1" : "0");
     document.body.classList.toggle("preview-off", previewHidden);
-    if (previewToggle) previewToggle.setAttribute("aria-pressed", String(!previewHidden));
+    setPreviewSwitch.setAttribute("aria-checked", String(!previewHidden));
     renderPreview();
   });
+}
+
+// Window transparency: --window-alpha drives the panel backgrounds.
+function applyAlpha(v) {
+  document.body.style.setProperty("--window-alpha", String(v / 100));
+  if (setAlpha) setAlpha.value = String(v);
+  if (setAlphaVal) setAlphaVal.textContent = v + "%";
+  localStorage.setItem("fs-alpha", String(v));
+}
+const savedAlpha = parseInt(localStorage.getItem("fs-alpha"), 10);
+applyAlpha(Number.isFinite(savedAlpha) && savedAlpha >= 50 && savedAlpha <= 100 ? savedAlpha : 85);
+if (setAlpha) {
+  setAlpha.addEventListener("input", () => applyAlpha(Number(setAlpha.value)));
+}
+
+// Theme: dark / light / system (system follows the OS live).
+function applyThemeChoice() {
+  const t =
+    userTheme === "system"
+      ? themeQuery.matches ? "light" : "dark"
+      : userTheme;
+  document.documentElement.setAttribute("data-theme", t);
+  for (const btn of setThemeBtns) btn.classList.toggle("active", btn.dataset.themeChoice === userTheme);
+}
+for (const btn of setThemeBtns) {
+  btn.addEventListener("click", () => {
+    userTheme = btn.dataset.themeChoice;
+    localStorage.setItem("fs-theme", userTheme);
+    applyThemeChoice();
+  });
+}
+applyThemeChoice();
+
+/* ── Math (Spotlight-style calculator) ─────────────────────────────────── */
+// Pure arithmetic queries (digits + operators, no letters) evaluate locally:
+// typing "2*8" shows "2*8 = 16" as the top result. ^ is exponentiation.
+const MATH_RE = /^[0-9+\-*/().%\s^]+$/;
+function tryMath(query) {
+  const s = query.trim();
+  if (!s || s.length > 80 || !MATH_RE.test(s)) return null;
+  if (!/\d/.test(s) || !/[+\-*/%^]/.test(s)) return null;
+  let value;
+  try {
+    value = Function(`"use strict"; return (${s.replace(/\^/g, "**")});`)();
+  } catch {
+    return null;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const text =
+    Number.isInteger(value)
+      ? String(value)
+      : String(Math.round(value * 1e9) / 1e9).replace(/\.?0+$/, "");
+  return { kind: "math", name: `${s} = ${text}`, path: `math:${s}`, value: text === "-0" ? "0" : text };
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.cssText = "position:fixed;opacity:0";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch {}
+    ta.remove();
+    return ok;
+  }
+}
+
+function acceptMathResult(item) {
+  // Enter/click on a math row replaces the query with the result
+  // (Spotlight convention) and re-searches from there.
+  input.value = item.value;
+  selected = 0;
+  fileTotal = 0;
+  lastNavKeyAt = Date.now();
+  paintFromPools(item.value);
+  scheduleSearch();
 }
 
 function fmtSize(bytes) {
@@ -659,7 +776,12 @@ function renderPreview() {
   const item = row && row._item;
   const pane = previewPaneEl;
   if (!pane) return;
-  if (previewHidden || !item) {
+  if (
+    previewHidden ||
+    document.body.classList.contains("settings-open") ||
+    !item ||
+    item.kind === "math"
+  ) {
     pane.classList.add("empty-preview");
     return;
   }
@@ -720,6 +842,10 @@ async function openSelected(mode) {
         showActionError(query, error);
       }
     }
+    return;
+  }
+  if (item.kind === "math") {
+    if (item.value != null) acceptMathResult(item);
     return;
   }
   if (item.kind === "more") {
@@ -815,6 +941,18 @@ window.addEventListener("keydown", async (event) => {
   ) {
     // Ctrl+C without a text selection in the box copies the highlighted row.
     const item = rowEls[selected] && rowEls[selected]._item;
+    if (item && item.kind === "math" && item.value != null) {
+      event.preventDefault();
+      if (await copyText(item.value)) {
+        statusEl.style.display = "";
+        progressFill.style.display = "none";
+        statusText.textContent = "Result copied to clipboard";
+        setTimeout(() => {
+          statusEl.style.display = "none";
+        }, 1500);
+      }
+      return;
+    }
     if (item && invoke) {
       event.preventDefault();
       try {
@@ -887,6 +1025,11 @@ window.addEventListener("keydown", async (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
     const query = input.value.trim();
+    const mathItem = rowEls[selected] && rowEls[selected]._item;
+    if (mathItem && mathItem.kind === "math" && mathItem.value != null) {
+      acceptMathResult(mathItem);
+      return;
+    }
     if (event.altKey) {
       await openSelected("props");
       return;
