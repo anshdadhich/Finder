@@ -1122,6 +1122,8 @@ fn main() {
             copy_path,
             quit_app,
             file_preview,
+            app_info,
+            uninstall_app,
             backdrop_ok
         ])
         .build(tauri::generate_context!())
@@ -2000,17 +2002,171 @@ struct PreviewInfo {
 #[tauri::command]
 fn file_preview(path: String) -> Option<PreviewInfo> {
     let md = std::fs::metadata(&path).ok()?;
-    let modified_secs = md
-        .modified()
+    Some(PreviewInfo {
+        size: md.len(),
+        modified_secs: modified_secs_of(&md),
+        is_dir: md.is_dir(),
+    })
+}
+
+fn modified_secs_of(md: &std::fs::Metadata) -> u64 {
+    md.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    Some(PreviewInfo {
-        size: md.len(),
+        .unwrap_or(0)
+}
+
+#[derive(Serialize, Default)]
+struct AppInfo {
+    /// Resolved executable for .lnk apps (None for UWP / unresolvable links).
+    target: Option<String>,
+    size: u64,
+    modified_secs: u64,
+    is_uwp: bool,
+    publisher: Option<String>,
+    version: Option<String>,
+    uninstall_string: Option<String>,
+}
+
+/// App-targeted metadata for the preview pane: resolve the .lnk to its real
+/// executable so Size/Modified/Where show the app itself (not the shortcut),
+/// and pull publisher/version/uninstall from the registry.
+#[tauri::command]
+fn app_info(name: String, path: String) -> AppInfo {
+    let is_uwp = path.starts_with("aumid:");
+    let mut target = None;
+    if !is_uwp {
+        target = Some(if path.to_lowercase().ends_with(".lnk") {
+            resolve_lnk_target(&path).unwrap_or_else(|| path.clone())
+        } else {
+            path.clone()
+        });
+    }
+    let (size, modified_secs) = target
+        .as_deref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|md| (md.len(), modified_secs_of(&md)))
+        .unwrap_or((0, 0));
+    let reg = find_uninstall_entry(&name);
+    AppInfo {
+        target,
+        size,
         modified_secs,
-        is_dir: md.is_dir(),
-    })
+        is_uwp,
+        publisher: reg.as_ref().and_then(|r| r.publisher.clone()),
+        version: reg.as_ref().and_then(|r| r.version.clone()),
+        uninstall_string: reg
+            .and_then(|r| r.uninstall_string.or(r.quiet_uninstall_string)),
+    }
+}
+
+/// Run the app's uninstaller (registry UninstallString), falling back to the
+/// Apps & features settings page when no registry entry exists. UWP apps have
+/// no uninstaller string — open their settings page instead.
+#[tauri::command]
+fn uninstall_app(name: String, path: String) -> Result<(), String> {
+    let mut target = None;
+    if !path.starts_with("aumid:") && path.to_lowercase().ends_with(".lnk") {
+        target = resolve_lnk_target(&path);
+    }
+    let _ = target; // (kept for potential future UWP package mapping)
+    if let Some(entry) = find_uninstall_entry(&name) {
+        if let Some(cmd) = entry.uninstall_string.or(entry.quiet_uninstall_string) {
+            std::process::Command::new("cmd")
+                .args(["/C", &cmd])
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+    // No registry entry (or UWP): the Apps & features page is the safe path.
+    let _ = std::process::Command::new("explorer")
+        .arg("ms-settings:appsfeatures")
+        .spawn();
+    Ok(())
+}
+
+struct UninstallEntry {
+    publisher: Option<String>,
+    version: Option<String>,
+    uninstall_string: Option<String>,
+    quiet_uninstall_string: Option<String>,
+}
+
+/// Match an app name against the standard Uninstall registry keys
+/// (HKCU + HKLM + WOW6432Node) and return the entry that names it.
+fn find_uninstall_entry(app_name: &str) -> Option<UninstallEntry> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+    let want = app_name.trim().trim_end_matches(".lnk").trim();
+    if want.is_empty() {
+        return None;
+    }
+    const SUB: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+    let bases = [
+        (HKEY_CURRENT_USER, SUB.to_string()),
+        (HKEY_LOCAL_MACHINE, SUB.to_string()),
+        (HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall".to_string()),
+    ];
+    for (hive, base) in bases {
+        let Ok(root) = RegKey::predef(hive).open_subkey_with_flags(&base, KEY_READ) else {
+            continue;
+        };
+        for sub in root.enum_keys().flatten() {
+            let Ok(key) = root.open_subkey_with_flags(&sub, KEY_READ) else {
+                continue;
+            };
+            let Ok(display) = key.get_value::<String, _>("DisplayName") else {
+                continue;
+            };
+            if !display.trim().eq_ignore_ascii_case(want) {
+                continue;
+            }
+            let uninstall = key.get_value::<String, _>("UninstallString").ok();
+            let quiet = key.get_value::<String, _>("QuietUninstallString").ok();
+            if uninstall.is_none() && quiet.is_none() {
+                continue;
+            }
+            return Some(UninstallEntry {
+                publisher: key.get_value::<String, _>("Publisher").ok(),
+                version: key.get_value::<String, _>("DisplayVersion").ok(),
+                uninstall_string: uninstall,
+                quiet_uninstall_string: quiet,
+            });
+        }
+    }
+    None
+}
+
+/// Resolve a .lnk shortcut to its target path via IShellLinkW.
+fn resolve_lnk_target(path: &str) -> Option<String> {
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, IPersistFile, STGM};
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }.ok()?;
+    let persist = link.cast::<IPersistFile>().ok()?;
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        persist.Load(PCWSTR(wide.as_ptr()), STGM(0) /* STGM_READ */).ok()?;
+    }
+    let mut buf = [0u16; 1024];
+    let mut find = WIN32_FIND_DATAW::default();
+    let mut resolved = String::new();
+    unsafe {
+        if link.GetPath(&mut buf, &mut find, 0).is_ok() {
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            if end > 0 {
+                resolved = String::from_utf16_lossy(&buf[..end]);
+            }
+        }
+    }
+    (!resolved.is_empty()).then_some(resolved)
 }
 
 #[tauri::command]

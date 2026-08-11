@@ -487,6 +487,44 @@ function renderNow() {
     fragment.appendChild(header);
 
     for (const item of group.rows) {
+      // Math queries render as a calculator-style display (query on top, big
+      // result below) instead of a list row — like a calculator's screen.
+      if (item.kind === "math") {
+        let el = rowPool.get(item.path);
+        if (!el) {
+          el = document.createElement("div");
+          el.className = "result math";
+          const disp = document.createElement("div");
+          disp.className = "math-display";
+          const expr = document.createElement("div");
+          expr.className = "math-expr";
+          const value = document.createElement("div");
+          value.className = "math-value";
+          disp.appendChild(expr);
+          disp.appendChild(value);
+          el.appendChild(disp);
+          el._exprEl = expr;
+          el._valueEl = value;
+          rowPool.set(item.path, el);
+        }
+        rendered.add(item.path);
+        el.dataset.index = flatIndex;
+        el.dataset.path = item.path;
+        el._item = item;
+        if (el._expr !== item.expr) {
+          el._exprEl.textContent = item.expr;
+          el._expr = item.expr;
+        }
+        if (el._value !== item.value) {
+          el._valueEl.textContent = `= ${item.value}`;
+          el._value = item.value;
+        }
+        fragment.appendChild(el);
+        rowEls[flatIndex] = el;
+        flatIndex += 1;
+        continue;
+      }
+
       let el = rowPool.get(item.path);
       if (!el) {
         el = document.createElement("div");
@@ -588,7 +626,7 @@ function renderNow() {
   hintsEl.classList.toggle("visible", flatIndex > 0);
   for (let i = 0; i < rowEls.length; i++) {
     const el = rowEls[i];
-    if (el && !el._observed && !el.classList.contains("more")) {
+    if (el && !el._observed && !el.classList.contains("more") && !el.classList.contains("math")) {
       el._observed = true;
       iconObserver.observe(el);
     }
@@ -617,6 +655,8 @@ function updateSelection() {
 const previewPaneEl = document.getElementById("previewPane");
 const pvSize = document.getElementById("pvSize");
 const pvModified = document.getElementById("pvModified");
+const pvPublisher = document.getElementById("pvPublisher");
+const pvVersion = document.getElementById("pvVersion");
 const settingsBtn = document.getElementById("settingsBtn");
 const setPreviewSwitch = document.getElementById("setPreview");
 const setAlpha = document.getElementById("setAlpha");
@@ -655,9 +695,21 @@ if (setPreviewSwitch) {
   });
 }
 
-// Window transparency: --window-alpha drives the panel backgrounds.
+// Window transparency: the bg colors are composed here (they depend on the
+// active theme) and set inline on <body>, which outranks the :root defaults.
+// Setting only --window-alpha does NOT work: custom properties resolve their
+// var() references at the declaration site (:root), not per element.
+let alphaValue = 85;
 function applyAlpha(v) {
-  document.body.style.setProperty("--window-alpha", String(v / 100));
+  alphaValue = v;
+  const a = v / 100;
+  const dark = document.documentElement.getAttribute("data-theme") !== "light";
+  const base = dark ? [28, 28, 30] : [250, 250, 252];
+  const preview = dark ? [22, 23, 26] : [243, 243, 246];
+  const pa = Math.max(0.3, a - 0.05);
+  document.body.style.setProperty("--bg-window", `rgba(${base[0]}, ${base[1]}, ${base[2]}, ${a})`);
+  document.body.style.setProperty("--bg-preview", `rgba(${preview[0]}, ${preview[1]}, ${preview[2]}, ${pa})`);
+  document.body.style.setProperty("--window-alpha", String(a));
   if (setAlpha) setAlpha.value = String(v);
   if (setAlphaVal) setAlphaVal.textContent = v + "%";
   localStorage.setItem("fs-alpha", String(v));
@@ -676,6 +728,7 @@ function applyThemeChoice() {
       : userTheme;
   document.documentElement.setAttribute("data-theme", t);
   for (const btn of setThemeBtns) btn.classList.toggle("active", btn.dataset.themeChoice === userTheme);
+  applyAlpha(alphaValue);
 }
 for (const btn of setThemeBtns) {
   btn.addEventListener("click", () => {
@@ -705,7 +758,7 @@ function tryMath(query) {
     Number.isInteger(value)
       ? String(value)
       : String(Math.round(value * 1e9) / 1e9).replace(/\.?0+$/, "");
-  return { kind: "math", name: `${s} = ${text}`, path: `math:${s}`, value: text === "-0" ? "0" : text };
+  return { kind: "math", name: `${s} = ${text}`, path: `math:${s}`, expr: s, value: text === "-0" ? "0" : text };
 }
 
 async function copyText(text) {
@@ -817,12 +870,90 @@ function renderPreview() {
 
   const hasStat = item.kind === "file" || item.kind === "dir" || item.kind === "app";
   snippet.textContent = item.kind === "file" || item.kind === "dir" ? item.path || "" : "";
-  if (hasStat && item.path) {
+  if (item.kind === "app") {
+    previewMetaApp(item);
+  } else if (hasStat && item.path) {
     previewMeta(item.path);
+    pvPublisher.textContent = "—";
+    pvVersion.textContent = "—";
   } else {
     pvSize.textContent = "—";
     pvModified.textContent = "—";
   }
+}
+
+// Apps: the preview resolves the shortcut to its real executable (size,
+// modified, location come from the exe, not the .lnk) and pulls publisher /
+// version / uninstall from the registry. Buttons act on the resolved target.
+let currentApp = null;
+
+async function previewMetaApp(item) {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(async () => {
+    if (previewHidden || !item || !invoke) return;
+    // The selection may have moved on while app_info was in flight.
+    const rowNow = rowEls[selected];
+    if (!rowNow || rowNow._item !== item) return;
+    pvSize.textContent = "…";
+    pvModified.textContent = "…";
+    try {
+      const info = await invoke("app_info", { name: item.name, path: item.path });
+      currentApp = { item, info };
+      const pvPath = document.getElementById("pvPath");
+      const target = info.target || "";
+      if (target && target !== item.path) {
+        pvPath.textContent = target;
+        pvPath.title = target;
+      }
+      pvSize.textContent = info.size ? fmtSize(info.size) : "—";
+      pvModified.textContent = info.modified_secs ? fmtRelative(info.modified_secs) : "—";
+      pvPublisher.textContent = info.publisher || "—";
+      pvVersion.textContent = info.version || "—";
+      if (openLocBtn) openLocBtn.disabled = !target || info.is_uwp;
+      if (adminBtn) adminBtn.disabled = info.is_uwp;
+    } catch {
+      pvSize.textContent = "—";
+      pvModified.textContent = "—";
+      pvPublisher.textContent = "—";
+      pvVersion.textContent = "—";
+    }
+  }, 60);
+}
+
+// App preview actions: run elevated, reveal the exe in Explorer, uninstall.
+async function runAppAction(cmd, payload) {
+  const cur = currentApp;
+  if (!cur) return;
+  try {
+    await invoke(cmd, payload);
+    await invoke("hide_window");
+  } catch (error) {
+    showActionError(cur.item.name, error);
+  }
+}
+
+const adminBtn = document.getElementById("pvAdmin");
+const openLocBtn = document.getElementById("pvOpenLoc");
+const uninstallBtn = document.getElementById("pvUninstall");
+if (adminBtn) {
+  adminBtn.addEventListener("click", () => {
+    const cur = currentApp;
+    if (cur) runAppAction("launch_admin", { path: cur.item.path });
+  });
+}
+if (openLocBtn) {
+  openLocBtn.addEventListener("click", () => {
+    const cur = currentApp;
+    if (!cur) return;
+    const target = cur.info && cur.info.target ? cur.info.target : cur.item.path;
+    runAppAction("open_parent", { path: target });
+  });
+}
+if (uninstallBtn) {
+  uninstallBtn.addEventListener("click", () => {
+    const cur = currentApp;
+    if (cur) runAppAction("uninstall_app", { name: cur.item.name, path: cur.item.path });
+  });
 }
 
 // The displayed row order (grouped: Applications → Folders → Files) is NOT

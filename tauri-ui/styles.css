@@ -136,12 +136,12 @@ body.css-blur .launcher-window {
   -webkit-backdrop-filter: blur(40px) saturate(180%);
 }
 body.css-blur {
-  --bg-window: rgba(26, 27, 29, 0.96);
-  --bg-preview: rgba(23, 24, 26, 0.95);
+  --bg-window: rgba(26, 27, 29, var(--window-alpha));
+  --bg-preview: rgba(23, 24, 26, calc(var(--window-alpha) - 0.05));
 }
 body.css-blur[data-theme="light"] {
-  --bg-window: rgba(248, 248, 250, 0.96);
-  --bg-preview: rgba(241, 241, 244, 0.95);
+  --bg-window: rgba(248, 248, 250, var(--window-alpha));
+  --bg-preview: rgba(241, 241, 244, calc(var(--window-alpha) - 0.05));
 }
 
 @keyframes popIn {
@@ -461,6 +461,65 @@ input#search::placeholder {
   font-weight: 600;
 }
 
+/* Math queries: a calculator-style display instead of a list row — the
+   expression on a small muted line, the result big and bold below, like a
+   calculator's screen. */
+.result.math {
+  padding: 12px;
+  margin-bottom: 2px;
+}
+
+.math-display {
+  flex: 1;
+  min-height: 74px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 6px;
+  padding: 12px 18px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  font-family: var(--font-mono);
+}
+
+.math-expr {
+  font-size: 14px;
+  letter-spacing: 1px;
+  color: var(--text-secondary);
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.math-value {
+  font-size: 34px;
+  font-weight: 650;
+  letter-spacing: 1px;
+  line-height: 1;
+  color: var(--accent-blue);
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.result.math.selected .math-display {
+  background: var(--bg-selected);
+  border-color: rgba(0, 122, 255, 0.4);
+  box-shadow: inset 0 0 0 1px rgba(0, 122, 255, 0.4);
+}
+
+.result.math.selected .math-expr {
+  color: var(--path-on-selected);
+}
+
+.result.math.selected .math-value {
+  color: #ffffff;
+}
+
 /* ── Preview pane ──────────────────────────────────────────────────────── */
 /* Flex sibling of #results: animates width + padding + opacity (Raycast
    style). No transform, no overlay, no native window resize — the results
@@ -773,12 +832,57 @@ input#setAlpha {
   font-weight: 500;
 }
 
-.preview-pane.pv-app .meta-where {
+.preview-pane.pv-app .preview-snippet {
   display: none;
 }
 
-.preview-pane.pv-app .preview-snippet {
+/* Publisher/Version rows exist only for apps. */
+.preview-pane:not(.pv-app) .meta-app {
   display: none;
+}
+
+/* App action buttons: stacked compact rows inside the preview pane. */
+.preview-actions {
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 16px;
+}
+
+.preview-pane.pv-app .preview-actions {
+  display: flex;
+}
+
+.pv-btn {
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 8px 12px;
+  border-radius: var(--radius-item);
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.08s ease, border-color 0.08s ease;
+}
+
+.pv-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--border-window);
+}
+
+.pv-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.pv-btn-danger {
+  color: #ff5f57;
+}
+
+.pv-btn-danger:hover:not(:disabled) {
+  border-color: rgba(255, 95, 87, 0.5);
+  background: rgba(255, 95, 87, 0.1);
 }
 
 /* ── Empty state ───────────────────────────────────────────────────────── */
