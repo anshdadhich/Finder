@@ -24,10 +24,11 @@ use tauri::{
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, SIZE};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BI_RGB, DIB_RGB_COLORS,
-    HGDIOBJ, HBITMAP,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    GetObjectW, ReleaseDC, SelectObject, BITMAP, BITMAPINFO, BI_RGB, DIB_RGB_COLORS,
+    HGDIOBJ, HBITMAP, RGBQUAD, SRCCOPY,
 };
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows::Win32::System::Com::{
@@ -43,7 +44,8 @@ use windows::Win32::UI::Shell::{
     SIID_APPLICATION, SHSTOCKICONINFO, SHIL_JUMBO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, FindWindowW, GetIconInfo, HICON, ICONINFO, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    DestroyIcon, FindWindowW, GetIconInfo, GetWindowRect, HICON, ICONINFO, SetForegroundWindow,
+    ShowWindow, SW_RESTORE,
 };
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
@@ -839,6 +841,132 @@ fn hide_window(window: tauri::Window) {
     let _ = window.hide();
 }
 
+#[derive(Clone, serde::Serialize)]
+struct BackdropGrab {
+    uri: String,
+    w_css: f64,
+    h_css: f64,
+}
+
+/// The most recent desktop grab taken while the window was still hidden.
+/// A transparent WebView2 cannot sample the desktop with CSS backdrop-filter
+/// (it only sees its own page pixels), so the frontend layers this JPEG
+/// behind the card and blurs it with a plain CSS filter — that is what makes
+/// the blur slider visibly real. The capture MUST happen before show(), or
+/// the grab would contain the app's own panel.
+static BACKDROP: Mutex<Option<BackdropGrab>> = Mutex::new(None);
+
+/// Capture the desktop behind the window and cache it. Returns the grab so
+/// the caller can push it to the webview BEFORE the window becomes visible —
+/// the JPEG decode then overlaps the still-hidden period and the user never
+/// sees the previous (stale) backdrop flash in.
+fn capture_backdrop(window: &tauri::Window) -> Option<BackdropGrab> {
+    let grab = (|| -> Result<BackdropGrab, String> {
+        // tauri's HWND comes from its own pinned `windows` crate version;
+        // unwrap the raw pointer and rebuild it as our crate's handle type.
+        let hwnd_tauri = window.hwnd().map_err(|e| e.to_string())?;
+        let hwnd = HWND(hwnd_tauri.0 as *mut std::os::raw::c_void);
+        let mut rect = RECT::default();
+        unsafe {
+            GetWindowRect(hwnd, &mut rect).map_err(|e| e.to_string())?;
+        }
+        let w = (rect.right - rect.left).max(1);
+        let h = (rect.bottom - rect.top).max(1);
+        let scale = window.scale_factor().unwrap_or(1.0).max(1.0);
+
+        let hdc_screen = unsafe { GetDC(None) };
+        let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
+        if hdc_mem.0.is_null() {
+            let _ = unsafe { ReleaseDC(None, hdc_screen) };
+            return Err("CreateCompatibleDC failed".into());
+        }
+        let bmp = unsafe { CreateCompatibleBitmap(hdc_screen, w, h) };
+        if bmp.0.is_null() {
+            let _ = unsafe { DeleteDC(hdc_mem) };
+            let _ = unsafe { ReleaseDC(None, hdc_screen) };
+            return Err("CreateCompatibleBitmap failed".into());
+        }
+        let old_bmp = unsafe { SelectObject(hdc_mem, HGDIOBJ(bmp.0)) };
+        let blt = unsafe { BitBlt(hdc_mem, 0, 0, w, h, Some(hdc_screen), rect.left, rect.top, SRCCOPY) };
+        if blt.is_err() {
+            unsafe {
+                let _ = SelectObject(hdc_mem, old_bmp);
+                let _ = DeleteObject(HGDIOBJ(bmp.0));
+                let _ = DeleteDC(hdc_mem);
+                let _ = ReleaseDC(None, hdc_screen);
+            }
+            return Err("BitBlt failed".into());
+        }
+
+        // Pull the pixels out as 32bpp BGRA with top-down rows (negative height).
+        let mut bmi = BITMAPINFO {
+            bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            bmiColors: [RGBQUAD::default()],
+        };
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let dib = unsafe {
+            GetDIBits(
+                hdc_mem,
+                bmp,
+                0,
+                h as u32,
+                Some(pixels.as_mut_ptr() as *mut std::os::raw::c_void),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            )
+        };
+        unsafe {
+            let _ = SelectObject(hdc_mem, old_bmp);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(hdc_mem);
+            let _ = ReleaseDC(None, hdc_screen);
+        }
+        // GetDIBits returns the number of scanlines retrieved (0 = failure).
+        if dib < 1 {
+            return Err(format!("GetDIBits failed: {}", dib));
+        }
+
+        // BGRA → RGBA for the image crate.
+        for px in pixels.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        let img = image::RgbaImage::from_raw(w as u32, h as u32, pixels)
+            .ok_or_else(|| "image buffer invalid".to_string())?;
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Jpeg)
+            .map_err(|e| e.to_string())?;
+        Ok(BackdropGrab {
+            uri: format!("data:image/jpeg;base64,{}", B64.encode(out.into_inner())),
+            w_css: w as f64 / scale,
+            h_css: h as f64 / scale,
+        })
+    })();
+
+    match grab {
+        Ok(g) => {
+            *BACKDROP.lock() = Some(g.clone());
+            Some(g)
+        }
+        Err(e) => {
+            log_line(&format!("backdrop capture failed: {}", e));
+            None
+        }
+    }
+}
+
+#[tauri::command]
+fn grab_backdrop() -> Option<BackdropGrab> {
+    BACKDROP.lock().clone()
+}
+
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
     std::process::Command::new("explorer")
@@ -850,9 +978,13 @@ fn open_path(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn open_parent(path: String) -> Result<(), String> {
-    let parent = Path::new(&path)
-        .parent()
-        .ok_or_else(|| "Path has no parent".to_string())?;
+    let p = Path::new(&path);
+    // A bare filename (or a root like "C:\") has an empty/None parent —
+    // explorer can't open "", so fall back to the path itself.
+    let parent = match p.parent() {
+        Some(par) if !par.as_os_str().is_empty() => par.to_path_buf(),
+        _ => p.to_path_buf(),
+    };
     std::process::Command::new("explorer")
         .arg(parent)
         .spawn()
@@ -985,6 +1117,7 @@ fn main() {
     let status = Arc::new(RwLock::new(String::from("Starting...")));
     let first_scan = Arc::new(AtomicBool::new(false));
     let apps = Arc::new(RwLock::new(discover_apps()));
+    log_app_pool(&apps.read());
     let app_rev = Arc::new(AtomicU64::new(0));
     let icon_cache = Arc::new(Mutex::new(HashMap::new()));
     {
@@ -1036,6 +1169,11 @@ fn main() {
             let window = app.get_window("main").expect("main window");
             *setup_close_window.lock() = Some(window.clone());
             position_spotlight(&window);
+            if let Some(grab) = capture_backdrop(&window) {
+                // Harmless if the page hasn't registered listeners yet (the
+                // initial load's refreshBackdrop() covers that first show).
+                let _ = window.emit("backdrop", grab);
+            }
             let _ = window.show();
             let _ = window.set_focus();
 
@@ -1115,6 +1253,7 @@ fn main() {
             launch_admin,
             open_properties,
             hide_window,
+            grab_backdrop,
             open_path,
             open_parent,
             open_web_search,
@@ -1177,6 +1316,9 @@ fn position_spotlight(window: &tauri::Window) {
 
 fn show_spotlight(window: &tauri::Window) {
     position_spotlight(window);
+    if let Some(grab) = capture_backdrop(window) {
+        let _ = window.emit("backdrop", grab);
+    }
     let _ = window.show();
     let _ = window.set_focus();
 }
@@ -1242,6 +1384,9 @@ fn discover_apps() -> Vec<AppEntry> {
 
     // Store / UWP apps from the Shell AppsFolder (comes with real icons).
     for app in apps_from_shell() {
+        if is_shell_junk(&app.name, &app.path) {
+            continue;
+        }
         let key = norm_app_name(&app.name);
         if seen.insert(key) {
             apps.push(app);
@@ -1280,6 +1425,9 @@ fn discover_apps() -> Vec<AppEntry> {
             continue;
         }
         if let Some(path) = registry_app_path(&app) {
+            if is_installer_junk(&path) {
+                continue;
+            }
             if seen.insert(key) {
                 apps.push(AppEntry {
                     name: app.name,
@@ -1345,8 +1493,255 @@ fn discover_apps() -> Vec<AppEntry> {
         }
     }
 
+    // Name-dedupe above is per-source; a final pass collapses entries that
+    // point at the SAME executable but have different display names (e.g.
+    // Start Menu "Word.lnk" + registry "WINWORD", or "Antigravity IDE" vs
+    // "Antigravity IDE (User)"). The better-looking name wins.
+    dedupe_by_target(&mut apps);
+
     apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     apps
+}
+
+/// Canonical target key for an app entry: resolve .lnk shortcuts to their
+/// executable; keep .exe paths as-is; UWP (aumid:) / settings (ms-) / shell
+/// folder links can't be resolved — they are never collapsed.
+fn app_target_exe(app: &AppEntry) -> Option<String> {
+    let p = app.path.trim();
+    let lower = p.to_lowercase();
+    // Curated system-tool entries carry a real exe path behind the aumid:
+    // prefix ("aumid:C:\...\python.exe") — use the path itself as the key.
+    let path: &str = if let Some(rest) = lower.strip_prefix("aumid:") {
+        if rest.ends_with(".exe") {
+            rest
+        } else {
+            return None;
+        }
+    } else {
+        p
+    };
+    let pl = path.to_lowercase();
+    if pl.ends_with(".lnk") {
+        resolve_lnk_target(path)
+    } else if pl.ends_with(".exe") {
+        Some(path.to_string())
+    } else {
+        None
+    }
+}
+
+/// Normalize a resolved target for dedupe keys: canonicalize (long names,
+/// ~1 short names, dot-dot segments, case) with a raw-path fallback when the
+/// file no longer exists. Registry paths and shortcut targets for the same
+/// exe then collapse even if one of them was written with short names.
+fn canonical_target(p: &str) -> String {
+    let lower = p.to_lowercase();
+    std::fs::canonicalize(p)
+        .map(|c| c.to_string_lossy().to_lowercase())
+        .unwrap_or(lower)
+}
+
+/// Which display name is worth keeping when two entries share a target:
+/// prefer mixed-case over ALL-CAPS ("Word" > "WINWORD"), names without a
+/// "(User)" profile suffix, shorter names, human-readable titles (spaces)
+/// over exe-stem names, and Start Menu shortcuts over registry-sourced
+/// paths.
+fn app_name_score(app: &AppEntry) -> i32 {
+    let name = &app.name;
+    let mut score = 0;
+    let upper = name.chars().filter(|c| c.is_ascii_uppercase()).count();
+    let lower = name.chars().filter(|c| c.is_ascii_lowercase()).count();
+    if upper > 0 && lower > 0 {
+        score += 4; // mixed case: human-friendly title
+    } else if upper > 0 && lower == 0 {
+        score -= 4; // ALL-CAPS: exe-name style shortcut
+    }
+    let nlower = name.to_lowercase();
+    if nlower.contains("(user)") || nlower.contains("- user") || nlower.ends_with(" user") {
+        score -= 6;
+    }
+    score -= (name.chars().count() as i32) / 8;
+    if app.path.to_lowercase().ends_with(".lnk") {
+        score += 2; // Start Menu copy has the real identity
+    }
+    // A name that is literally the exe stem ("winword") is an internal name
+    // — the human-readable twin ("Microsoft Word") should win the collapse.
+    if let Some(stem) = app_target_exe(app).and_then(|t| {
+        Path::new(&t)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+    }) {
+        let compact: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+        if compact == stem {
+            score -= 8;
+        } else if name.contains(' ') {
+            score += 3; // human-readable title, not a raw file name
+        }
+    }
+    score
+}
+
+/// Collapse entries that resolve to the same executable. Two layers:
+/// 1. full canonical target path — Start Menu .lnk targets vs registry .exe
+///    paths vs aumid:-entries that carry a real path behind the prefix;
+/// 2. executable FILE NAME, bridged ONLY through Store-style aumids that
+///    embed an exe name ("Microsoft.Office.WINWORD.EXE.15" → "winword.exe").
+///    That collapses the classic Word/WINWORD twin while never merging two
+///    real exe paths that merely share a file name (Chrome Stable vs Beta).
+fn dedupe_by_target(apps: &mut Vec<AppEntry>) {
+    let mut seen_path: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // name key → (index, entry key came from an aumid exe token)
+    let mut seen_name: std::collections::HashMap<String, (usize, bool)> =
+        std::collections::HashMap::new();
+    let mut keep = vec![true; apps.len()];
+    for i in 0..apps.len() {
+        let p = apps[i].path.trim();
+        let pl = p.to_lowercase();
+        let (path_key, name_key, name_is_aumid): (Option<String>, Option<String>, bool) =
+            if pl.ends_with(".lnk") {
+                match resolve_lnk_target(p) {
+                    Some(t) => (Some(canonical_target(&t)), file_name_key(&t), false),
+                    None => (None, None, false),
+                }
+            } else if pl.ends_with(".exe") {
+                (Some(canonical_target(p)), file_name_key(p), false)
+            } else if let Some(rest) = pl.strip_prefix("aumid:") {
+                if rest.ends_with(".exe") {
+                    (Some(canonical_target(rest)), file_name_key(rest), false)
+                } else {
+                    (None, aumid_exe_token(rest), true)
+                }
+            } else {
+                (None, None, false)
+            };
+
+        let mut collided: Option<usize> = None;
+        if let Some(k) = &path_key {
+            if let Some(&j) = seen_path.get(k) {
+                collided = Some(j);
+            }
+        }
+        if collided.is_none() {
+            if let Some(k) = &name_key {
+                if let Some(&(j, aumid)) = seen_name.get(k) {
+                    if aumid || name_is_aumid {
+                        collided = Some(j);
+                    }
+                }
+            }
+        }
+        match collided {
+            None => {
+                if let Some(k) = &path_key {
+                    seen_path.insert(k.clone(), i);
+                }
+                if let Some(k) = &name_key {
+                    seen_name.insert(k.clone(), (i, name_is_aumid));
+                }
+            }
+            Some(j) => {
+                let winner =
+                    if app_name_score(&apps[i]) > app_name_score(&apps[j]) { i } else { j };
+                keep[if winner == i { j } else { i }] = false;
+                if let Some(k) = &path_key {
+                    seen_path.insert(k.clone(), winner);
+                }
+                if let Some(k) = &name_key {
+                    seen_name.insert(k.clone(), (winner, name_is_aumid));
+                }
+            }
+        }
+    }
+    let mut idx = 0usize;
+    apps.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
+}
+
+/// Lowercased exe file name of a path ("C:\...\winword.exe" → "winword.exe").
+fn file_name_key(p: &str) -> Option<String> {
+    Path::new(p)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+}
+
+/// Store-style aumids embed the exe name ("Microsoft.Office.WINWORD.EXE.15",
+/// "Microsoft.Office.POWERPNT.EXE.15") — extract it so the classic desktop
+/// twin (registry WINWORD.EXE) can collapse onto the aumid entry.
+fn aumid_exe_token(aumid: &str) -> Option<String> {
+    let low = aumid.to_lowercase();
+    let mut start = 0usize;
+    while let Some(pos) = low[start..].find(".exe") {
+        let abs = start + pos;
+        let after = low[abs + 4..].chars().next();
+        if after.is_none() || after == Some('.') {
+            let stem_start = low[..abs].rfind('.').map(|d| d + 1).unwrap_or(0);
+            let stem = &low[stem_start..abs];
+            if !stem.is_empty()
+                && stem
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                return Some(format!("{}.exe", stem));
+            }
+        }
+        start = abs + 4;
+    }
+    None
+}
+
+/// Installer/shell noise Windows lists as apps but a launcher should not:
+/// URL shortcuts (nodejs.org docs/website, Windows Kits .url samples) and
+/// installer entry points ("Install Additional Tools for Node.js",
+/// "Uninstall Node.js", "* command prompt" shells).
+fn is_shell_junk(name: &str, path: &str) -> bool {
+    let pl = path.to_lowercase();
+    if let Some(rest) = pl.strip_prefix("aumid:") {
+        if rest.starts_with("http") || rest.ends_with(".url") {
+            return true;
+        }
+    }
+    let lower = name.to_lowercase();
+    lower.starts_with("uninstall ")
+        || lower.starts_with("install ")
+        || lower.ends_with(" command prompt")
+}
+
+/// Shortcut-target noise: a .lnk resolving to a shell interpreter or an
+/// uninstaller stub is not a launchable app.
+fn is_shortcut_target_junk(target: &str) -> bool {
+    let Some(stem) = Path::new(target)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+    else {
+        return true;
+    };
+    matches!(stem.as_str(), "cmd" | "powershell" | "pwsh" | "wscript" | "cscript")
+        || stem.contains("unins")
+        || stem.contains("uninst")
+        || stem.contains("uninstall")
+}
+
+/// One-time debug dump of the discovered pool — name | path | resolved target
+/// | dedupe score — so duplicate pairs can be diagnosed straight from log.txt
+/// instead of guessing. Removed once the remaining dupes are resolved.
+fn log_app_pool(apps: &[AppEntry]) {
+    log_line(&format!("app pool: {} entries", apps.len()));
+    for a in apps {
+        log_line(&format!(
+            "app-pool | {} | {} | target={} | score={}",
+            a.name,
+            a.path,
+            app_target_exe(a).unwrap_or_default(),
+            app_name_score(a)
+        ));
+    }
 }
 /// (strip a trailing ",icon-index" and expand env vars; only .exe/.lnk count —
 /// for .ico/.dll icons we hunt for an .exe in the same folder instead), else
@@ -1481,6 +1876,15 @@ fn collect_shortcuts(dir: &str, out: &mut Vec<AppEntry>, seen: &mut std::collect
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                 let name = stem.trim().to_string();
                 if !name.is_empty() {
+                    if is_shell_junk(&name, "") {
+                        continue;
+                    }
+                    let path_str = path.to_string_lossy().to_string();
+                    if let Some(target) = resolve_lnk_target(&path_str) {
+                        if is_shortcut_target_junk(&target) {
+                            continue;
+                        }
+                    }
                     let key = norm_app_name(&name);
                     // Never replace a packaged AUMID entry with a shortcut —
                     // the AUMID copy has the real app identity/icon.
@@ -1488,7 +1892,7 @@ fn collect_shortcuts(dir: &str, out: &mut Vec<AppEntry>, seen: &mut std::collect
                         if seen.insert(key) {
                             out.push(AppEntry {
                                 name,
-                                path: path.to_string_lossy().to_string(),
+                                path: path_str,
                                 icon: None,
                             });
                         }
@@ -1501,15 +1905,78 @@ fn collect_shortcuts(dir: &str, out: &mut Vec<AppEntry>, seen: &mut std::collect
 
 /// Normalized key for dedupe: lowercase alphanumerics only, so "SnippingTool"
 /// and "Snipping Tool" collapse to the same app (packaged twin wins, since
-/// shell:AppsFolder runs first).
+/// shell:AppsFolder runs first). Version/arch/channel noise is folded so
+/// twins share a key ("Antigravity" vs "Antigravity 2.1.4", "Opera Browser"
+/// vs "Opera Stable 133.0.5932.85", "Python 3.13 (64-bit)" vs
+/// "Python 3.13.7 (64-bit)") — while real distinguishers (x86 vs x64
+/// PowerShell, "Outlook (classic)", versioned SDKs) are kept.
 fn norm_app_name(name: &str) -> String {
+    let mut n = name.trim().to_string();
+    let lower = n.to_lowercase();
+    if lower.ends_with(" - shortcut") {
+        n.truncate(n.len() - " - shortcut".len());
+    }
+    for suffix in ["(user)", "(machine)", " - user", " - machine"] {
+        if n.to_lowercase().ends_with(suffix) {
+            n.truncate(n.len() - suffix.len());
+            break;
+        }
+    }
+    let toks: Vec<&str> = n.split_whitespace().collect();
+    let mut end = toks.len();
+    loop {
+        if end == 0 {
+            break;
+        }
+        let tl = toks[end - 1].to_lowercase();
+        if tl == "-" || tl == "stable" || tl == "browser" {
+            end -= 1;
+        } else if is_version_token(toks[end - 1]) {
+            end -= 1;
+        } else if is_arch_token(&tl) && end >= 2 && is_version_token(toks[end - 2]) {
+            end -= 2;
+        } else {
+            break;
+        }
+    }
     let mut out = String::new();
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
+    for tok in toks.iter().take(end) {
+        for ch in tok.chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch.to_ascii_lowercase());
+            }
         }
     }
     out
+}
+
+/// "3.13.7", "11.0.61030" — a dotted numeric version. "2012" (a year) and
+/// plain numbers like "11" are NOT versions: they distinguish real products.
+fn is_version_token(tok: &str) -> bool {
+    tok.split('.').count() >= 2 && tok.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+fn is_arch_token(tok: &str) -> bool {
+    matches!(tok, "(x86)" | "(x64)" | "(arm64)" | "(32-bit)" | "(64-bit)")
+}
+
+/// Registry entries that resolve to installer machinery (ProgramData\Package
+/// Cache bootstrappers, uninstaller stubs) are not launchable apps — keep the
+/// pool clean of them.
+fn is_installer_junk(path: &str) -> bool {
+    let low = path.to_lowercase();
+    if low.contains("\\package cache\\") || low.ends_with("\\package cache") {
+        return true;
+    }
+    if let Some(stem) = Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+    {
+        if stem.contains("unins") || stem.contains("uninst") || stem.contains("uninstall") {
+            return true;
+        }
+    }
+    false
 }
 
 fn find_exe(dir: &Path, app_name: &str) -> Option<std::path::PathBuf> {

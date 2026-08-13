@@ -18,6 +18,11 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
+    <!-- Real frosted glass: a JPEG of the desktop (captured while the window
+         was hidden) sits here behind the card and gets CSS-filter blurred,
+         because backdrop-filter cannot see the desktop through a transparent
+         WebView2 window. The blur slider drives --blur-px. -->
+    <div id="glassLayer" class="glass-layer"></div>
     <!-- ── State: ready (search palette) ─────────────────────────────── -->
     <main class="launcher-window" id="card">
       <div class="search-header">
@@ -95,8 +100,13 @@
             </div>
             <div class="setting-row">
               <span class="setting-label">Transparency</span>
-              <input id="setAlpha" type="range" min="0" max="100" step="1" value="15" aria-label="Window transparency" />
-              <span id="setAlphaVal" class="setting-value">15%</span>
+              <input id="setAlpha" type="range" min="0" max="100" step="1" value="35" aria-label="Window transparency" />
+              <span id="setAlphaVal" class="setting-value">35%</span>
+            </div>
+            <div class="setting-row">
+              <span class="setting-label">Blur</span>
+              <input id="setBlur" type="range" min="0" max="100" step="1" value="50" aria-label="Frosted blur strength" />
+              <span id="setBlurVal" class="setting-value">50%</span>
             </div>
             <div class="setting-row">
               <span class="setting-label">Theme</span>

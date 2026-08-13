@@ -31,6 +31,8 @@
 
   --border-window: rgba(255, 255, 255, 0.14);
   --border-subtle: rgba(255, 255, 255, 0.08);
+  /* css.glass recipe for the window itself (dark): deep border, soft shadow */
+  --glass-border: rgba(0, 0, 0, 0.37);
 
   --text-primary: #ffffff;
   --text-secondary: rgba(235, 235, 245, 0.65);
@@ -38,7 +40,7 @@
   --text-on-selected: #ffffff;
   --path-on-selected: rgba(255, 255, 255, 0.55);
 
-  --shadow-mac: 0 24px 60px rgba(0, 0, 0, 0.6), 0 0 0 0.5px var(--border-window);
+  --shadow-mac: 0 0 0 1px var(--glass-border), 0 2px 8px rgba(0, 0, 0, 0.22), 0 0 22px rgba(0, 0, 0, 0.14);
   --snippet-bg: rgba(0, 0, 0, 0.3);
 }
 
@@ -57,6 +59,8 @@
 
   --border-window: rgba(0, 0, 0, 0.12);
   --border-subtle: rgba(0, 0, 0, 0.08);
+  /* css.glass recipe for the window itself (light): light border */
+  --glass-border: rgba(255, 255, 255, 0.4);
 
   --text-primary: #1c1c1e;
   --text-secondary: rgba(60, 60, 67, 0.75);
@@ -64,7 +68,7 @@
   --text-on-selected: #1c1c1e;
   --path-on-selected: rgba(60, 60, 67, 0.6);
 
-  --shadow-mac: 0 20px 50px rgba(0, 0, 0, 0.18), 0 0 0 0.5px var(--border-window);
+  --shadow-mac: 0 0 0 1px var(--glass-border), 0 2px 8px rgba(0, 0, 0, 0.12), 0 0 22px rgba(0, 0, 0, 0.08);
   --snippet-bg: rgba(0, 0, 0, 0.05);
 }
 
@@ -82,6 +86,21 @@ body {
   height: 100%;
   overflow: hidden;
   background: transparent;
+}
+
+/* The real frosted glass. Sized+positioned (from JS) to exactly the card
+   rect with a small bleed that exists only so the CSS blur has pixels to
+   sample beyond the edge; clip-path trims that bleed back out of view, so
+   the blurred desktop is confined to the search tool and nothing else. */
+.glass-layer {
+  position: fixed;
+  z-index: -1;
+  pointer-events: none;
+  background-repeat: no-repeat;
+  overflow: hidden;
+  clip-path: inset(24px round var(--radius-window));
+  filter: blur(var(--blur-px, 20px)) saturate(1.8);
+  transition: filter 0.12s linear;
 }
 
 body {
@@ -109,18 +128,18 @@ body {
   min-height: 210px;
   max-height: 520px;
   background: var(--bg-window);
+  border: 1px solid var(--glass-border);
   border-radius: var(--radius-window);
   box-shadow: var(--shadow-mac);
   /* Always-on frosted glass: the native window is transparent, so this
-     blurs whatever is behind it — the transparency slider dials how much
-     of that blur shows through. 20px + saturation = the reference look. */
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
+     blurs whatever is behind it — the blur slider sets --blur-px, the
+     transparency slider dials how much of that blur shows through. */
+  backdrop-filter: blur(var(--blur-px, 20px)) saturate(180%);
+  -webkit-backdrop-filter: blur(var(--blur-px, 20px)) saturate(180%);
   display: flex;
   flex-direction: column;
   position: relative;
   overflow: hidden;
-  animation: popIn 0.16s cubic-bezier(0.16, 1, 0.3, 1);
   will-change: height;
   transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), height 0.25s cubic-bezier(0.16, 1, 0.3, 1);
 }
@@ -138,19 +157,8 @@ body.settings-open .launcher-window {
 
 /* CSS-only fallback when OS-level glass (Mica/Acrylic) is unavailable. */
 body.css-blur .launcher-window {
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
-}
-
-@keyframes popIn {
-  from {
-    opacity: 0;
-    transform: scale(0.96) translateY(-8px);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1) translateY(0);
-  }
+  backdrop-filter: blur(var(--blur-px, 20px)) saturate(180%);
+  -webkit-backdrop-filter: blur(var(--blur-px, 20px)) saturate(180%);
 }
 
 .update-banner {
@@ -740,28 +748,29 @@ input#setAlpha {
 }
 
 .preview-large-icon {
-  width: 64px;
-  height: 64px;
+  width: 88px;
+  height: 88px;
   margin-bottom: 10px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 16px;
-  background: hsl(var(--chip-hue, 210) 28% 30%);
-  border: 1px solid var(--border-subtle);
+  /* No plate behind ANY preview icon — apps, folders and files all render
+     the plain large icon; nothing gets a colored/hued background chip. */
+  background: none;
+  border: none;
 }
 
 .preview-large-icon .pv-img {
   width: 100%;
   height: 100%;
   object-fit: contain;
-  border-radius: 14px;
+  border-radius: 0;
 }
 
 .preview-large-icon .pv-initial {
-  font-size: 26px;
-  font-weight: 600;
-  color: rgba(255, 255, 255, 0.88);
+  font-size: 44px;
+  font-weight: 500;
+  color: var(--text-primary);
 }
 
 .preview-title {
@@ -815,44 +824,6 @@ input#setAlpha {
    file without a modified date) disappear instead of showing a dash. */
 .meta-row.pv-empty {
   display: none;
-}
-
-/* Apps: plain big icon (no plate behind it), no Where row. */
-.preview-pane.pv-app .preview-large-icon {
-  width: 88px;
-  height: 88px;
-  background: none;
-  border: none;
-}
-
-.preview-pane.pv-app .preview-large-icon .pv-img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  border-radius: 0;
-}
-
-.preview-pane.pv-app .preview-large-icon .pv-initial {
-  font-size: 44px;
-  font-weight: 500;
-}
-
-/* Folders: same treatment — no brown-ish chip plate behind the icon. */
-.preview-pane.pv-plain .preview-large-icon {
-  background: none;
-  border: none;
-}
-
-.preview-pane.pv-plain .preview-large-icon .pv-img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
-  border-radius: 0;
-}
-
-.preview-pane.pv-plain .preview-large-icon .pv-initial {
-  font-size: 44px;
-  font-weight: 500;
 }
 
 /* Publisher/Version rows exist only for apps. */

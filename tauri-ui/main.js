@@ -287,6 +287,28 @@ async function loadMoreFiles() {
   }
 }
 
+// Long paths get middle-truncated ("C:\Users\me\…\reports\q3.xlsx"); the
+// full path stays available in the row's title tooltip.
+function truncatePath(p) {
+  if (!p) return "";
+  if (p.length <= 48) return p;
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  if (parts.length < 3) {
+    // "aumid:..."-style ids and separator-less paths can't be
+    // middle-truncated on a folder boundary — clip the middle instead.
+    return p.slice(0, 22) + "…" + p.slice(-22);
+  }
+  let head = "";
+  if (parts[0] && parts[0].length === 2 && parts[0][1] === ":") {
+    head = parts[0] + "\\" + parts[1] + "\\";
+  } else {
+    head = parts[0] + "\\";
+  }
+  const tail = parts.slice(-2).join("\\");
+  const out = head + "…\\" + tail;
+  return out.length < p.length ? out : p;
+}
+
 function scheduleSearch() {
   clearTimeout(debounceTimer);
   const now = Date.now();
@@ -436,6 +458,10 @@ function setState(state) {
     cardEl.style.display = "";
     scanStartAt = 0;
     input.focus();
+    // The palette just appeared (possibly after a long scan): re-measure the
+    // height now that the card is visible, or the list opens at the stale
+    // scan-page height (~3 rows) until the next interaction re-syncs it.
+    syncCardHeight();
   }
 }
 
@@ -475,6 +501,11 @@ let cardHeightShown = null;
 function syncCardHeight() {
   clearTimeout(cardHeightTimer);
   cardHeightTimer = setTimeout(() => {
+    // While the scan page is up the card measures ~210px (its content); pin
+    // that and the ready flip would open at "3 rows" until something else
+    // re-syncs. Skip the pin entirely here — setState("ready") re-syncs it
+    // once the palette is actually visible.
+    if (scanStateEl.classList.contains("visible")) return;
     // Probe in "auto" (a px value can't measure content), then always
     // restore — the deduped value must be re-set, otherwise the inline
     // style is left at "auto" and the card stops tracking its content.
@@ -607,9 +638,14 @@ function renderNow() {
         }
         el._chip.style.setProperty("--chip-hue", String(h % 360));
       }
-      const pathText = item.kind === "app" || item.kind === "math" ? "" : item.kind === "more" ? item.remainingLabel : item.path;
+      // No paths in result rows — apps, files and folders show name only
+      // (the full path lives in the preview pane). Only the synthesized
+      // "more" row keeps its count label.
+      const pathText = item.kind === "more" ? item.remainingLabel : "";
       if (el._path !== pathText) {
         el._pathEl.textContent = pathText;
+        el._pathEl.style.display = pathText ? "" : "none";
+        el._pathEl.title = "";
         el._path = pathText;
       }
       const tagText = item.kind === "app" ? "App" : item.kind === "more" ? "More" : item.kind === "math" ? "Math" : item.is_dir ? "Folder" : "File";
@@ -745,7 +781,8 @@ if (setMathSwitch) {
 // Setting only --window-alpha does NOT work: custom properties resolve their
 // var() references at the declaration site (:root), not per element.
 // The slider value is TRANSPARENCY: 0% = solid panel, 100% = nearly
-// invisible. (Older builds stored opacity; values >50 are migrated below.)
+// invisible. Stored under fs-alpha2 (a versioned key — the pre-2 build
+// stored opacity and inverted >50 on every load, which felt reversed).
 let alphaValue = 35;
 function applyAlpha(v) {
   alphaValue = v;
@@ -759,15 +796,111 @@ function applyAlpha(v) {
   document.body.style.setProperty("--window-alpha", String(a));
   if (setAlpha) setAlpha.value = String(v);
   if (setAlphaVal) setAlphaVal.textContent = v + "%";
-  localStorage.setItem("fs-alpha", String(v));
+  localStorage.setItem("fs-alpha2", String(v));
 }
-const rawAlpha = parseInt(localStorage.getItem("fs-alpha"), 10);
+const rawAlpha = parseInt(localStorage.getItem("fs-alpha2"), 10);
 let initialAlpha = Number.isFinite(rawAlpha) ? rawAlpha : 35;
-if (initialAlpha > 50) initialAlpha = 100 - initialAlpha; // legacy opacity value
 applyAlpha(Math.max(0, Math.min(100, initialAlpha)));
 if (setAlpha) {
   setAlpha.addEventListener("input", () => applyAlpha(Number(setAlpha.value)));
 }
+
+// Frosted blur strength: 0% = no blur, 100% = heavy glass. Maps to a px
+// radius via --blur-px (the backdrop-filter rule consumes the variable).
+const setBlur = document.getElementById("setBlur");
+const setBlurVal = document.getElementById("setBlurVal");
+let blurValue = 50;
+function applyBlur(v) {
+  blurValue = v;
+  const px = Math.round((v / 100) * 40); // 0 → 0px, 100 → 40px
+  document.body.style.setProperty("--blur-px", px + "px");
+  if (setBlur) setBlur.value = String(v);
+  if (setBlurVal) setBlurVal.textContent = v + "%";
+  localStorage.setItem("fs-blur", String(v));
+}
+const rawBlur = parseInt(localStorage.getItem("fs-blur"), 10);
+applyBlur(Number.isFinite(rawBlur) ? Math.max(0, Math.min(100, rawBlur)) : 50);
+if (setBlur) {
+  setBlur.addEventListener("input", () => applyBlur(Number(setBlur.value)));
+}
+
+// Real frosted glass: the backend captures the desktop behind the window
+// (while it was hidden) and we layer it behind the card, CSS-filter-blurred.
+// The backdrop-filter rules can't see the desktop through a transparent
+// WebView2 window — this layer is what actually makes blur visible.
+const glassLayerEl = document.getElementById("glassLayer");
+let glassBackdrop = null; // { uri, w, h } from grab_backdrop
+let glassRect = null;
+let glassRafId = null;
+
+// The glass layer tracks the card (or the scan card while the palette is
+// hidden) so the blur stays INSIDE the search tool: same rect, same radius,
+// only a 24px invisible bleed for blur sampling, trimmed by clip-path.
+function syncGlassRect() {
+  if (!glassLayerEl) return;
+  let target = cardWinEl;
+  if (!target || getComputedStyle(target).display === "none") {
+    target = document.querySelector("#scanState .fr-card") || null;
+  }
+  if (!target) return;
+  const l = target.offsetLeft;
+  const t = target.offsetTop;
+  const w = target.offsetWidth;
+  const h = target.offsetHeight;
+  if (
+    glassRect &&
+    glassRect.l === l && glassRect.t === t &&
+    glassRect.w === w && glassRect.h === h
+  ) {
+    return;
+  }
+  glassRect = { l, t, w, h };
+  const bleed = 24;
+  glassLayerEl.style.left = l - bleed + "px";
+  glassLayerEl.style.top = t - bleed + "px";
+  glassLayerEl.style.width = w + bleed * 2 + "px";
+  glassLayerEl.style.height = h + bleed * 2 + "px";
+  if (glassBackdrop) {
+    glassLayerEl.style.backgroundPosition = `-${l - bleed}px -${t - bleed}px`;
+    glassLayerEl.style.backgroundSize = `${glassBackdrop.w}px ${glassBackdrop.h}px`;
+  }
+}
+
+function startGlassLoop() {
+  if (glassRafId) return;
+  const step = () => {
+    syncGlassRect();
+    glassRafId = requestAnimationFrame(step);
+  };
+  glassRafId = requestAnimationFrame(step);
+}
+
+function stopGlassLoop() {
+  if (glassRafId) cancelAnimationFrame(glassRafId);
+  glassRafId = null;
+}
+
+function applyBackdrop(g) {
+  if (!g || !g.uri || !glassLayerEl) return;
+  glassBackdrop = { uri: g.uri, w: g.w_css, h: g.h_css };
+  glassLayerEl.style.backgroundImage = `url("${g.uri}")`;
+  glassRect = null;
+  syncGlassRect();
+}
+
+function clearBackdrop() {
+  glassBackdrop = null;
+  if (glassLayerEl) glassLayerEl.style.backgroundImage = "";
+}
+
+function refreshBackdrop() {
+  if (!invoke || !glassLayerEl) return;
+  invoke("grab_backdrop").then(applyBackdrop).catch(() => {});
+}
+refreshBackdrop();
+// Rust pushes each fresh capture before the window shows, so the JPEG
+// decode overlaps the hidden period — no stale background ever flashes in.
+window.__TAURI__?.event?.listen("backdrop", (e) => applyBackdrop(e.payload));
 
 // Theme: dark / light / system (system follows the OS live).
 function applyThemeChoice() {
@@ -928,13 +1061,19 @@ function renderPreview() {
     item.kind === "app" ? "Application" : item.kind === "more" ? "More results" : item.is_dir ? "Folder" : "File";
   pane.classList.toggle("pv-app", item.kind === "app");
   pane.classList.toggle("pv-plain", !!item.is_dir);
-  path.textContent = item.path || "";
+  path.textContent = truncatePath(item.path || "");
   path.title = item.path || "";
 
   // Action buttons per item type: apps get admin + location (+ uninstall
   // only when the registry knows an uninstaller), files/folders get a single
   // "Open file location" (the path box is gone — the button replaces it).
   const isFile = item.kind === "file" || item.kind === "dir";
+  // Non-app selections MUST re-enable the buttons: previewMetaApp (apps
+  // only) can leave them disabled (UWP / missing target) and nothing else
+  // ever resets them, which made "Open file location" dead for every file
+  // selected after a UWP app.
+  if (openLocBtn) openLocBtn.disabled = false;
+  if (adminBtn) adminBtn.disabled = false;
   if (adminBtn) adminBtn.style.display = item.kind === "app" ? "" : "none";
   if (openLocBtn) openLocBtn.style.display = item.kind === "app" || isFile ? "" : "none";
   if (uninstallBtn) uninstallBtn.style.display = "none";
@@ -988,7 +1127,7 @@ async function previewMetaApp(item) {
       const pvPath = document.getElementById("pvPath");
       const target = info.target || "";
       if (target && target !== item.path) {
-        pvPath.textContent = target;
+        pvPath.textContent = truncatePath(target);
         pvPath.title = target;
       }
       pvSize.textContent = info.size ? fmtSize(info.size) : "—";
@@ -1005,6 +1144,8 @@ async function previewMetaApp(item) {
       pvModified.textContent = "—";
       pvPublisher.textContent = "—";
       pvVersion.textContent = "—";
+      if (openLocBtn) openLocBtn.disabled = false;
+      if (adminBtn) adminBtn.disabled = false;
     }
     refreshMetaVisibility();
   }, 60);
@@ -1104,6 +1245,10 @@ input.addEventListener("input", () => {
   scheduleSearch(); // authoritative backfill
 });
 
+// Warm cache loads (1–3 s) are too short for a page swap; the scan view
+// only appears once this grace expires and the index is still not ready.
+let scanGraceUntil = 0;
+
 async function refreshStatus() {
   if (!invoke) return;
   try {
@@ -1115,9 +1260,21 @@ async function refreshStatus() {
       loadApps(true);
     }
     // Scanning (first install or cache rebuild): ONLY the scanning page.
+    // A warm cache load is usually 1–3 s — too short for a page swap; give
+    // it a grace window and only show the scanner when it is clearly a real
+    // first scan or rebuild.
     if (!status || !status.ready) {
-      setState("scan");
       const first = !!(status && status.first_scan);
+      if (!first && scanGraceUntil === 0) {
+        scanGraceUntil = Date.now() + 4000;
+        setState("ready");
+        return;
+      }
+      if (!first && Date.now() < scanGraceUntil) {
+        setState("ready");
+        return;
+      }
+      setState("scan");
       scanTitle.textContent = first ? "Welcome to FastSeek" : "Indexing files";
       scanSub.textContent = first
         ? "This is your first launch — FastSeek is scanning and indexing your drives. It only happens once."
@@ -1149,6 +1306,15 @@ document.addEventListener("mousedown", (event) => {
     lastNavKeyAt = Date.now();
     paintFromPools("");
   }
+  if (invoke) invoke("hide_window");
+});
+
+// Webview-level safety net: some outside clicks never surface as a page
+// mousedown (nor as a Rust Focused(false) — e.g. clicking another
+// always-on-top window), but they always blur the webview.
+window.addEventListener("blur", () => {
+  stopGlassLoop();
+  clearBackdrop();
   if (invoke) invoke("hide_window");
 });
 
@@ -1337,6 +1503,8 @@ window.addEventListener("focus", () => {
     input.select();
   }
   refreshStatus();
+  refreshBackdrop();
+  startGlassLoop();
 });
 
 input.addEventListener("focus", () => {
