@@ -623,7 +623,7 @@ body.settings-open #results {
   flex-direction: column;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 2px 28px 40px;
+  padding: 12px 28px 32px;
 }
 body.settings-open .settings-pane {
   display: flex;
@@ -651,17 +651,16 @@ body.settings-open .preview-pane {
   min-height: 100%;
 }
 
-.settings-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text-primary);
-  padding: 12px 0 2px;
-}
-
 .settings-group {
   display: flex;
   flex-direction: column;
   margin-top: 16px;
+}
+
+/* A guaranteed sliver of breathing room after the last row, even when the
+   panel scrolls — the container padding can be swallowed by the scroll. */
+.settings-group:last-child {
+  margin-bottom: 14px;
 }
 
 .settings-group-title {
@@ -777,8 +776,12 @@ body.math-open .settings-pane {
   display: none;
 }
 
-/* Compact mode with an empty query: only the search bar remains. The
-   settings pane stays reachable while the settings gear is open. */
+/* Compact mode with an empty query: only the search bar remains, and it
+   narrows to a proportionate bar — a 560/760px wide strip with just an
+   icon + input would look stretched. */
+body.compact-empty:not(.settings-open) .launcher-window {
+  width: 400px;
+}
 body.compact-empty #results,
 body.compact-empty .preview-pane {
   display: none;
@@ -921,9 +924,9 @@ body.math-open #results {
 .meta-row {
   display: flex;
   justify-content: space-between;
-  align-items: baseline;
+  align-items: center;
   gap: 14px;
-  min-height: 34px;
+  min-height: 30px;
   font-size: 11.5px;
   /* Flat rows with hairline separators — same language as Settings. */
   border-bottom: 1px solid var(--border-subtle);
