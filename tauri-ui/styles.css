@@ -42,11 +42,6 @@
 
   --shadow-mac: 0 0 0 1px var(--glass-border), 0 2px 8px rgba(0, 0, 0, 0.22), 0 0 22px rgba(0, 0, 0, 0.14);
   --snippet-bg: rgba(0, 0, 0, 0.3);
-
-  /* Gooey slider colors (dark): faint light track, light inner border. */
-  --slider-track: rgba(255, 255, 255, 0.14);
-  --gooey-stroke: rgba(255, 255, 255, 0.3);
-  --gooey-shadow: rgba(0, 0, 0, 0.55);
 }
 
 /* ── Light (follows the OS theme) ──────────────────────────────────────── */
@@ -75,12 +70,6 @@
 
   --shadow-mac: 0 0 0 1px var(--glass-border), 0 2px 8px rgba(0, 0, 0, 0.12), 0 0 22px rgba(0, 0, 0, 0.08);
   --snippet-bg: rgba(0, 0, 0, 0.05);
-
-  /* Gooey slider colors (light, the reference design): #dddddd track,
-     soft dark border and shadow. */
-  --slider-track: #dddddd;
-  --gooey-stroke: rgba(0, 0, 0, 0.22);
-  --gooey-shadow: rgba(0, 0, 0, 0.1);
 }
 
 * {
@@ -142,11 +131,10 @@ body {
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-window);
   box-shadow: var(--shadow-mac);
-  /* Always-on frosted glass: the native window is transparent, so this
-     blurs whatever is behind it — the blur slider sets --blur-px, the
-     transparency slider dials how much of that blur shows through. */
-  backdrop-filter: blur(var(--blur-px, 20px)) saturate(180%);
-  -webkit-backdrop-filter: blur(var(--blur-px, 20px)) saturate(180%);
+  /* The frosted blur lives on the glass layer ONLY (a blurred JPEG of the
+     desktop sits behind the card). A backdrop-filter here would blur that
+     already-blurred image a SECOND time — a redundant full-window blur pass
+     that roughly doubled the GPU/WebView2 memory footprint. */
   display: flex;
   flex-direction: column;
   position: relative;
@@ -164,12 +152,6 @@ body.preview-off .launcher-window {
    the preview itself is off). */
 body.settings-open .launcher-window {
   width: 760px;
-}
-
-/* CSS-only fallback when OS-level glass (Mica/Acrylic) is unavailable. */
-body.css-blur .launcher-window {
-  backdrop-filter: blur(var(--blur-px, 20px)) saturate(180%);
-  -webkit-backdrop-filter: blur(var(--blur-px, 20px)) saturate(180%);
 }
 
 .update-banner {
@@ -703,60 +685,12 @@ body.math-open #results {
   border-right-color: transparent;
 }
 
-/* ── Liquid (gooey) sliders ────────────────────────────────────────────── */
-/* The reference design's viscous ease-in slider: a physics-driven SVG blob
-   (surface-tension filter + trailing tail) that eases into drags and
-   springs back on release. Colors are theme variables — dark mode gets a
-   faint light track and brighter border, light mode the reference #dddddd. */
-.liquid-slider {
-  position: relative;
+input#setAlpha,
+input#setBlur {
   flex: 1;
   min-width: 0;
-  height: 48px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: grab;
-  touch-action: none;
-  outline: none;
-}
-
-.liquid-slider:active {
-  cursor: grabbing;
-}
-
-.liquid-slider:focus-visible .track {
-  box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.4);
-}
-
-.liquid-slider .track {
-  position: absolute;
-  width: calc(100% - 48px);
-  height: 12px;
-  background: var(--slider-track);
-  border-radius: 6px;
-}
-
-.liquid-slider .svg-canvas {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-  overflow: visible;
-}
-
-.liquid-slider .liquid-thumb {
-  fill: #ffffff;
-}
-
-.liquid-slider .liquid-border {
-  fill: none;
-  stroke: var(--gooey-stroke);
-  stroke-width: 2.8px;
-  filter: blur(0.4px);
-  pointer-events: none;
+  accent-color: var(--accent-blue);
+  cursor: pointer;
 }
 
 .segmented {
@@ -995,11 +929,6 @@ body.math-open #results {
   background: var(--bg-window);
   border: 1px solid var(--border-window);
   box-shadow: var(--shadow-mac);
-}
-
-body.css-blur .fr-card {
-  backdrop-filter: blur(40px) saturate(180%);
-  -webkit-backdrop-filter: blur(40px) saturate(180%);
 }
 
 .fr-logo {

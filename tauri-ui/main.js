@@ -791,7 +791,6 @@ const rawAlpha = parseInt(localStorage.getItem("fs-alpha2"), 10);
 const alphaTouched = Number.isFinite(rawAlpha);
 const alphaThemeDefault = () =>
   document.documentElement.getAttribute("data-theme") === "light" ? 14 : 7;
-let alphaSlider = null;
 let alphaValue = 35;
 function applyAlpha(v, persist = true) {
   alphaValue = v;
@@ -803,7 +802,7 @@ function applyAlpha(v, persist = true) {
   document.body.style.setProperty("--bg-window", `rgba(${base[0]}, ${base[1]}, ${base[2]}, ${a})`);
   document.body.style.setProperty("--bg-preview", `rgba(${preview[0]}, ${preview[1]}, ${preview[2]}, ${pa})`);
   document.body.style.setProperty("--window-alpha", String(a));
-  if (alphaSlider) alphaSlider.set(v);
+  if (setAlpha) setAlpha.value = String(v);
   if (setAlphaVal) setAlphaVal.textContent = v + "%";
   if (persist) localStorage.setItem("fs-alpha2", String(v));
 }
@@ -813,7 +812,8 @@ applyAlpha(
 );
 
 // Frosted blur strength: 0% = no blur, 100% = heavy glass. Maps to a px
-// radius via --blur-px (the backdrop-filter rule consumes the variable).
+// radius via --blur-px (the glass layer's filter consumes the variable —
+// the card itself has no backdrop-filter; blur is a single pass).
 // Same theme-scoped defaulting as transparency: 56% light / 45% dark until
 // the user moves the slider (fs-blur set).
 const setBlur = document.getElementById("setBlur");
@@ -822,13 +822,12 @@ const rawBlur = parseInt(localStorage.getItem("fs-blur"), 10);
 const blurTouched = Number.isFinite(rawBlur);
 const blurThemeDefault = () =>
   document.documentElement.getAttribute("data-theme") === "light" ? 56 : 45;
-let blurSlider = null;
 let blurValue = 50;
 function applyBlur(v, persist = true) {
   blurValue = v;
   const px = Math.round((v / 100) * 40); // 0 → 0px, 100 → 40px
   document.body.style.setProperty("--blur-px", px + "px");
-  if (blurSlider) blurSlider.set(v);
+  if (setBlur) setBlur.value = String(v);
   if (setBlurVal) setBlurVal.textContent = v + "%";
   if (persist) localStorage.setItem("fs-blur", String(v));
 }
@@ -837,223 +836,12 @@ applyBlur(
   blurTouched
 );
 
-/* ── Liquid (gooey) sliders ────────────────────────────────────────────── */
-// The reference implementation, kept as-is: an SVG blob under a
-// surface-tension filter with a trailing tail; drags ease in (followFactor
-// ramps 0.04 → 0.42) and releases spring back with the drag momentum as
-// impulse, plus a second spring for the shape lag. Geometry is measured
-// from the real layout each frame it changes (the settings pane animates
-// width 0 ↔ 310px, so a static measurement would be wrong).
-function createLiquidSlider(container, opts) {
-  const R = 12; // base circle radius
-  const K = R * 0.55228475;
-  const { filterId, onInput } = opts;
-
-  container.classList.add("slider-wrapper");
-  const track = document.createElement("div");
-  track.className = "track";
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("class", "svg-canvas");
-  svg.style.filter = `url("#${filterId}") drop-shadow(0 4px 8px var(--gooey-shadow))`;
-  const liquidPath = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  liquidPath.setAttribute("class", "liquid-thumb");
-  const liquidBorder = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  liquidBorder.setAttribute("class", "liquid-border");
-  svg.appendChild(liquidPath);
-  svg.appendChild(liquidBorder);
-  container.appendChild(track);
-  container.appendChild(svg);
-
-  let trackBounds = { minX: 0, maxX: 100 };
-  let isDragging = false;
-  let targetX = 0;
-  let currentX = 0;
-  let posVel = 0;
-  let prevX = 0;
-  let dragVelocity = 0;
-  let followFactor = 0.04;
-  let vel = 0;
-  let springVel = 0;
-  let springPos = 0;
-  let cy = 24;
-  let currentValue = opts.value != null ? opts.value : 0;
-  let measuredW = -1;
-
-  const clampValue = (v) => Math.max(0, Math.min(100, Math.round(v)));
-  const toX = (v) => trackBounds.minX + ((trackBounds.maxX - trackBounds.minX) * v) / 100;
-  const toValue = (x) => {
-    const span = trackBounds.maxX - trackBounds.minX;
-    return clampValue(((x - trackBounds.minX) / Math.max(1, span)) * 100);
-  };
-
-  function updateBounds(force) {
-    const wrap = container.getBoundingClientRect();
-    const w = Math.round(wrap.width);
-    if (!force && measuredW === w) return;
-    measuredW = w;
-    const tRect = track.getBoundingClientRect();
-    cy = Math.max(R + 2, wrap.height / 2);
-    trackBounds = {
-      minX: tRect.left - wrap.left + R,
-      maxX: tRect.left - wrap.left + tRect.width - R,
-    };
-    if (!isDragging) {
-      targetX = toX(currentValue);
-      currentX = targetX;
-      prevX = targetX;
-    }
-  }
-
-  // Dynamic Bezier path: rounded leading edge + trailing tail (identical to
-  // the reference buildGooeyPath, with the cy measured from the wrapper).
-  function buildGooeyPath(cx, cyy, deformation) {
-    const factor = Math.max(-1.5, Math.min(1.5, deformation / 12));
-    const absF = Math.abs(factor);
-    const stretchTail = R * (1 + 1.2 * absF);
-    const squeezeHead = R * (1 - 0.04 * absF);
-    const squishY = R * (1 - 0.22 * absF);
-    let top, right, bottom, left;
-    let cTopR, cRightT, cRightB, cBottomR;
-    let cBottomL, cLeftB, cLeftT, cTopL;
-    if (factor >= 0) {
-      top = { x: cx, y: cyy - squishY };
-      right = { x: cx + squeezeHead, y: cyy };
-      bottom = { x: cx, y: cyy + squishY };
-      left = { x: cx - stretchTail, y: cyy };
-      const kTail = K * (1 - 0.65 * absF);
-      const kHead = K * (1 + 0.05 * absF);
-      cTopR = { x: top.x + kHead, y: top.y };
-      cRightT = { x: right.x, y: right.y - kHead };
-      cRightB = { x: right.x, y: right.y + kHead };
-      cBottomR = { x: bottom.x + kHead, y: bottom.y };
-      cBottomL = { x: bottom.x - kHead, y: bottom.y };
-      cLeftB = { x: left.x, y: left.y + kTail };
-      cLeftT = { x: left.x, y: left.y - kTail };
-      cTopL = { x: top.x - kHead, y: top.y };
-    } else {
-      top = { x: cx, y: cyy - squishY };
-      right = { x: cx + stretchTail, y: cyy };
-      bottom = { x: cx, y: cyy + squishY };
-      left = { x: cx - squeezeHead, y: cyy };
-      const kTail = K * (1 - 0.65 * absF);
-      const kHead = K * (1 + 0.05 * absF);
-      cTopR = { x: top.x + kTail, y: top.y };
-      cRightT = { x: right.x, y: right.y - kTail };
-      cRightB = { x: right.x, y: right.y + kTail };
-      cBottomR = { x: bottom.x + kHead, y: bottom.y };
-      cBottomL = { x: bottom.x - kHead, y: bottom.y };
-      cLeftB = { x: left.x, y: left.y + kHead };
-      cLeftT = { x: left.x, y: left.y - kHead };
-      cTopL = { x: top.x - kHead, y: top.y };
-    }
-    return `M ${top.x} ${top.y}
-            C ${cTopR.x} ${cTopR.y}, ${cRightT.x} ${cRightT.y}, ${right.x} ${right.y}
-            C ${cRightB.x} ${cRightB.y}, ${cBottomR.x} ${cBottomR.y}, ${bottom.x} ${bottom.y}
-            C ${cBottomL.x} ${cBottomL.y}, ${cLeftB.x} ${cLeftB.y}, ${left.x} ${left.y}
-            C ${cLeftT.x} ${cLeftT.y}, ${cTopL.x} ${cTopL.y}, ${top.x} ${top.y} Z`;
-  }
-
-  // Position physics: ease-in follow while dragging, spring on release.
-  function loop() {
-    updateBounds(false);
-    if (isDragging) {
-      followFactor += (0.42 - followFactor) * 0.08;
-      currentX += (targetX - currentX) * followFactor;
-      dragVelocity = currentX - prevX;
-    } else {
-      const posStiffness = 0.08;
-      const posDamping = 0.82;
-      const posForce = (targetX - currentX) * posStiffness;
-      posVel = (posVel + posForce) * posDamping;
-      currentX += posVel;
-    }
-    currentX = Math.max(trackBounds.minX, Math.min(trackBounds.maxX, currentX));
-
-    // Shape physics: the tail lags the head through its own spring.
-    vel = currentX - prevX;
-    prevX = currentX;
-    const shapeStiffness = 0.06;
-    const shapeDamping = 0.82;
-    const springForce = (vel - springPos) * shapeStiffness;
-    springVel = (springVel + springForce) * shapeDamping;
-    springPos += springVel;
-
-    const pathData = buildGooeyPath(currentX, cy, springPos);
-    liquidPath.setAttribute("d", pathData);
-    liquidBorder.setAttribute("d", pathData);
-
-    const nv = toValue(currentX);
-    if (nv !== currentValue) {
-      currentValue = nv;
-      container.setAttribute("aria-valuenow", String(nv));
-      onInput(nv);
-    }
-    requestAnimationFrame(loop);
-  }
-
-  function handlePointerMove(e) {
-    if (!isDragging) return;
-    const rect = container.getBoundingClientRect();
-    targetX = Math.max(trackBounds.minX, Math.min(trackBounds.maxX, e.clientX - rect.left));
-  }
-
-  container.addEventListener("pointerdown", (e) => {
-    isDragging = true;
-    followFactor = 0.04; // reset for initial ease-in surface tension
-    container.setPointerCapture(e.pointerId);
-    handlePointerMove(e);
-  });
-  container.addEventListener("pointermove", handlePointerMove);
-
-  const stopDrag = () => {
-    if (isDragging) {
-      isDragging = false;
-      posVel = dragVelocity * 1.35; // release momentum → overshoot + bounce
-    }
-  };
-  container.addEventListener("pointerup", stopDrag);
-  container.addEventListener("pointercancel", stopDrag);
-
-  // Keyboard: arrow keys move the blob (Shift = coarse), role=slider.
-  container.addEventListener("keydown", (e) => {
-    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    e.preventDefault();
-    const step = e.shiftKey ? 10 : 1;
-    setValue(currentValue + (e.key === "ArrowRight" ? step : -step));
-  });
-
-  function setValue(v) {
-    const nv = clampValue(v);
-    if (nv === currentValue) return;
-    currentValue = nv;
-    container.setAttribute("aria-valuenow", String(nv));
-    onInput(nv);
-    if (!isDragging) {
-      targetX = toX(nv);
-      currentX = targetX;
-      prevX = targetX;
-      posVel = 0;
-    }
-  }
-
-  window.addEventListener("resize", () => updateBounds(true));
-
-  container.setAttribute("aria-valuenow", String(currentValue));
-  updateBounds(true);
-  requestAnimationFrame(loop);
-  return { set: setValue, get: () => currentValue };
+if (setAlpha) {
+  setAlpha.addEventListener("input", () => applyAlpha(Number(setAlpha.value)));
 }
-
-alphaSlider = createLiquidSlider(document.getElementById("setAlpha"), {
-  filterId: "gooey-filter-alpha",
-  value: alphaValue,
-  onInput: (v) => applyAlpha(v),
-});
-blurSlider = createLiquidSlider(setBlur, {
-  filterId: "gooey-filter-blur",
-  value: blurValue,
-  onInput: (v) => applyBlur(v),
-});
+if (setBlur) {
+  setBlur.addEventListener("input", () => applyBlur(Number(setBlur.value)));
+}
 
 // Real frosted glass: the backend captures the desktop behind the window
 // (while it was hidden) and we layer it behind the card, CSS-filter-blurred.

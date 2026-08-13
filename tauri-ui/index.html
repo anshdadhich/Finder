@@ -100,12 +100,12 @@
             </div>
             <div class="setting-row">
               <span class="setting-label">Transparency</span>
-              <div id="setAlpha" class="liquid-slider" role="slider" tabindex="0" aria-label="Window transparency" aria-valuemin="0" aria-valuemax="100" aria-valuenow="35"></div>
+              <input id="setAlpha" type="range" min="0" max="100" step="1" value="35" aria-label="Window transparency" />
               <span id="setAlphaVal" class="setting-value">35%</span>
             </div>
             <div class="setting-row">
               <span class="setting-label">Blur</span>
-              <div id="setBlur" class="liquid-slider" role="slider" tabindex="0" aria-label="Frosted blur strength" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div>
+              <input id="setBlur" type="range" min="0" max="100" step="1" value="50" aria-label="Frosted blur strength" />
               <span id="setBlurVal" class="setting-value">50%</span>
             </div>
             <div class="setting-row">
@@ -138,23 +138,6 @@
         </div>
       </div>
     </div>
-
-    <!-- SVG surface-tension filters for the gooey (liquid) sliders — one per
-         instance; the JS sets url(#id) drop-shadow(...) on each canvas. -->
-    <svg width="0" height="0" style="position: absolute" aria-hidden="true">
-      <defs>
-        <filter id="gooey-filter-alpha">
-          <feGaussianBlur in="SourceGraphic" stdDeviation="1.8" result="blur" />
-          <feColorMatrix in="blur" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 18 -8" result="goo" />
-          <feComposite in="SourceGraphic" in2="goo" operator="atop" />
-        </filter>
-        <filter id="gooey-filter-blur">
-          <feGaussianBlur in="SourceGraphic" stdDeviation="1.8" result="blur" />
-          <feColorMatrix in="blur" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 18 -8" result="goo" />
-          <feComposite in="SourceGraphic" in2="goo" operator="atop" />
-        </filter>
-      </defs>
-    </svg>
 
     <script src="./main.js"></script>
   </body>
