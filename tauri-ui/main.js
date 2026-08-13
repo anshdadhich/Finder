@@ -715,7 +715,7 @@ function renderNow() {
   updateSelection();
 }
 
-function updateSelection() {
+function updateSelection(scroll = true) {
   // The list may shrink between renders; never let the highlight (or Enter)
   // point at an index that no longer exists.
   if (selected < 0) selected = 0;
@@ -726,7 +726,10 @@ function updateSelection() {
     el.classList.toggle("selected", i === selected);
   }
   const active = rowEls[selected];
-  if (active && active.scrollIntoView) {
+  // Mouse hover/click must NOT scroll: hovering a bottom row would nudge the
+  // list (scrollIntoView "nearest") and push the top group label out of
+  // view. Only keyboard navigation scrolls the selection into view.
+  if (active && active.scrollIntoView && scroll) {
     active.scrollIntoView({ block: "nearest" });
   }
   renderPreview();
@@ -1328,6 +1331,19 @@ async function refreshStatus() {
 
 let lastNavKeyAt = 0; // hover never yanks the selection right after a keystroke
 
+// The UI is a product surface, not a debug surface: no right-click context
+// menu (WebView2's includes "Inspect"), no devtools shortcuts. Devtools are
+// compiled out of release builds anyway; this kills the menu itself.
+document.addEventListener("contextmenu", (event) => event.preventDefault());
+window.addEventListener("keydown", (event) => {
+  if (
+    event.key === "F12" ||
+    (event.ctrlKey && event.shiftKey && /^[iIcCjJ]$/.test(event.key))
+  ) {
+    event.preventDefault();
+  }
+});
+
 // Clicking anywhere outside the card (the transparent window margins) acts
 // like Esc: reset the query and hide. Clicks on the desktop itself already
 // dismiss via the window's focus-loss handler.
@@ -1493,7 +1509,7 @@ resultsEl.addEventListener("mousemove", (event) => {
   const idx = Number(row.dataset.index);
   if (idx !== selected && Number.isInteger(idx)) {
     selected = idx;
-    updateSelection();
+    updateSelection(false);
   }
 });
 
@@ -1504,7 +1520,7 @@ resultsEl.addEventListener("click", (event) => {
   const row = event.target.closest(".result");
   if (!row) return;
   selected = Number(row.dataset.index);
-  updateSelection();
+  updateSelection(false);
 });
 
 resultsEl.addEventListener("dblclick", (event) => {

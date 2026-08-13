@@ -484,6 +484,10 @@ input#search::placeholder {
    tokens (numbers in chips, operators in red) + a "Calculator Result"
    badge, with the answer big and bold below — like the reference design. */
 .result.calc-hero-row {
+  /* .result rows are display:flex, which would make the hero a flex item
+     and shrink it to its content width. As a block, the hero stretches
+     the full width like every other search result. */
+  display: block;
   padding: 0;
   margin-bottom: 2px;
 }
