@@ -90,35 +90,48 @@
         <aside id="settingsPane" class="settings-pane">
           <div class="settings-inner">
             <div class="settings-title">Settings</div>
-            <div class="setting-row">
-              <span class="setting-label">Preview pane</span>
-              <button id="setPreview" class="switch" role="switch" aria-checked="true" aria-label="Toggle preview pane"></button>
-            </div>
-            <div class="setting-row">
-              <span class="setting-label">Instant math</span>
-              <button id="setMath" class="switch" role="switch" aria-checked="true" aria-label="Toggle instant math"></button>
-            </div>
-            <div class="setting-row">
-              <span class="setting-label">Transparency</span>
-              <input id="setAlpha" type="range" min="0" max="100" step="1" value="35" aria-label="Window transparency" />
-              <span id="setAlphaVal" class="setting-value">35%</span>
-            </div>
-            <div class="setting-row">
-              <span class="setting-label">Blur</span>
-              <input id="setBlur" type="range" min="0" max="100" step="1" value="50" aria-label="Frosted blur strength" />
-              <span id="setBlurVal" class="setting-value">50%</span>
-            </div>
-            <div class="setting-row">
-              <span class="setting-label">Theme</span>
-              <div class="segmented" id="setTheme">
-                <button data-theme-choice="dark">Dark</button>
-                <button data-theme-choice="light">Light</button>
-                <button data-theme-choice="system">System</button>
+            <div class="settings-group">
+              <div class="settings-group-title">Appearance</div>
+              <div class="setting-row">
+                <span class="setting-label">Theme</span>
+                <div class="segmented" id="setTheme">
+                  <button data-theme-choice="dark">Dark</button>
+                  <button data-theme-choice="light">Light</button>
+                  <button data-theme-choice="system">System</button>
+                </div>
+              </div>
+              <div class="setting-row">
+                <span class="setting-label">Match Windows accent</span>
+                <button id="setAccent" class="switch" role="switch" aria-checked="false" aria-label="Match Windows accent color"></button>
               </div>
             </div>
-            <div class="setting-row">
-              <span class="setting-label">Match Windows accent</span>
-              <button id="setAccent" class="switch" role="switch" aria-checked="false" aria-label="Match Windows accent color"></button>
+            <div class="settings-group">
+              <div class="settings-group-title">Window</div>
+              <div class="setting-row">
+                <span class="setting-label">Transparency</span>
+                <input id="setAlpha" type="range" min="0" max="100" step="1" value="35" aria-label="Window transparency" />
+                <span id="setAlphaVal" class="setting-value">35%</span>
+              </div>
+              <div class="setting-row">
+                <span class="setting-label">Blur</span>
+                <input id="setBlur" type="range" min="0" max="100" step="1" value="50" aria-label="Frosted blur strength" />
+                <span id="setBlurVal" class="setting-value">50%</span>
+              </div>
+            </div>
+            <div class="settings-group">
+              <div class="settings-group-title">Behavior</div>
+              <div class="setting-row">
+                <span class="setting-label">Preview pane</span>
+                <button id="setPreview" class="switch" role="switch" aria-checked="true" aria-label="Toggle preview pane"></button>
+              </div>
+              <div class="setting-row">
+                <span class="setting-label">Instant math</span>
+                <button id="setMath" class="switch" role="switch" aria-checked="true" aria-label="Toggle instant math"></button>
+              </div>
+              <div class="setting-row">
+                <span class="setting-label">Start with Windows</span>
+                <button id="setAutostart" class="switch" role="switch" aria-checked="false" aria-label="Start with Windows"></button>
+              </div>
             </div>
           </div>
         </aside>

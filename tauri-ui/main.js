@@ -800,6 +800,7 @@ const setAlpha = document.getElementById("setAlpha");
 const setAlphaVal = document.getElementById("setAlphaVal");
 const setThemeBtns = document.querySelectorAll("#setTheme button");
 const setAccentSwitch = document.getElementById("setAccent");
+const setAutostartSwitch = document.getElementById("setAutostart");
 let previewHidden = localStorage.getItem("fs-preview-hidden") === "1";
 let previewTimer = null;
 
@@ -995,14 +996,11 @@ refreshBackdrop();
 // decode overlaps the hidden period — no stale background ever flashes in.
 window.__TAURI__?.event?.listen("backdrop", (e) => applyBackdrop(e.payload));
 
-// Reset while HIDDEN so a re-show never flashes the previous query: the
-// moment the window hides (hotkey/Esc), the query is cleared, the selection
-// reset and the default list re-rendered. By the time the window is visible
-// again the DOM is already fresh — no repaint races the first frame. The
-// visibilityState check keeps this from firing when the user merely clicks
-// another app while the launcher stays visible on top.
-window.addEventListener("blur", () => {
-  if (document.visibilityState !== "hidden") return;
+// Rust emits this BEFORE hiding (webview still visible → JS runs at full
+// speed), so the query/selection reset is done before the window ever
+// repaints hidden. The next show is a fresh launcher with zero visible
+// flash. Covers every hide path: hotkey, Esc, losing focus, close.
+window.__TAURI__?.event?.listen("spotlight-hide", () => {
   input.value = "";
   selected = 0;
   searchSeq += 1; // cancel any in-flight search page
@@ -1065,6 +1063,22 @@ if (setAccentSwitch) {
   });
 }
 applyAccent();
+
+/* ── Start with Windows (shell:startup shortcut, no admin needed) ─────── */
+if (setAutostartSwitch) {
+  invoke("autostart_enabled")
+    .then((on) => setAutostartSwitch.setAttribute("aria-checked", String(!!on)))
+    .catch(() => {});
+  setAutostartSwitch.addEventListener("click", () => {
+    const want = setAutostartSwitch.getAttribute("aria-checked") !== "true";
+    invoke("set_autostart", { enabled: want })
+      .then(() => setAutostartSwitch.setAttribute("aria-checked", String(want)))
+      .catch((error) => {
+        setAutostartSwitch.setAttribute("aria-checked", String(!want));
+        showActionError("Start with Windows", error);
+      });
+  });
+}
 
 /* ── Math (Spotlight-style calculator) ─────────────────────────────────── */
 // Pure arithmetic queries (digits + operators, no letters) evaluate locally:

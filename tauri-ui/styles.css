@@ -618,7 +618,7 @@ body:not(.settings-open) .settings-pane {
 .settings-inner {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 16px;
   min-height: 100%;
 }
 
@@ -626,6 +626,25 @@ body:not(.settings-open) .settings-pane {
   font-size: 14.5px;
   font-weight: 600;
   color: var(--text-primary);
+}
+
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--bg-card);
+}
+
+.settings-group-title {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  margin-bottom: 2px;
 }
 
 .setting-row {

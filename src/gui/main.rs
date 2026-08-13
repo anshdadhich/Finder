@@ -427,17 +427,36 @@ Start-Process -FilePath $exe.FullName -Verb RunAs"#
 
 use std::os::windows::process::CommandExt;
 
-/// Windows accent color (HKCU ...\DWM\AccentColor, 0xAABBGGRR) as "#rrggbb".
-/// Used by the Settings "match accent color" option.
+/// Windows accent color as "#rrggbb", in priority order:
+/// 1. Live WinRT UISettings accent (correct even when the accent is set to
+///    "automatically pick from my background" — the DWM AccentColor value
+///    goes stale in that mode).
+/// 2. HKCU ...\DWM\AccentColor (0xAABBGGRR).
 #[tauri::command]
 fn get_accent_color() -> Result<Option<String>, String> {
+    use std::os::windows::process::CommandExt;
+    let script = r#"[void][Windows.UI.ViewManagement.UISettings,Windows.UI,ContentType=WindowsRuntime]
+$u = New-Object Windows.UI.ViewManagement.UISettings
+$c = $u.GetColorValue([Windows.UI.ViewManagement.UIColorType]::Accent)
+'{0:X2}{1:X2}{2:X2}' -f $c.R,$c.G,$c.B"#;
+    let out = std::process::Command::new("powershell")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW — no console flash
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        let hex = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !hex.is_empty() && hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(Some(format!("#{}", hex.to_lowercase())));
+        }
+    }
+    // Fallback: DWM AccentColor (stale in "auto" mode, but better than none).
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
     use winreg::RegKey;
     let key = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags(r"Software\Microsoft\Windows\DWM", KEY_READ)
         .map_err(|e| e.to_string())?;
     let color: u32 = key.get_value("AccentColor").unwrap_or(0);
-    // DWM stores 0xAABBGGRR; callers only need the RGB.
     let (a, r, g, b) = (
         (color >> 24) & 0xFF,
         color & 0xFF,
@@ -448,6 +467,51 @@ fn get_accent_color() -> Result<Option<String>, String> {
         Ok(None)
     } else {
         Ok(Some(format!("#{:02x}{:02x}{:02x}", r, g, b)))
+    }
+}
+
+/// Shell:startup shortcut path — the autostart switch creates/removes it.
+fn autostart_lnk() -> std::path::PathBuf {
+    std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.join(r"Microsoft\Windows\Start Menu\Programs\Startup\FastSeek.lnk"))
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn autostart_enabled() -> bool {
+    autostart_lnk().exists()
+}
+
+/// Turn "start with Windows" on/off (a shortcut in the user's Startup
+/// folder — no admin, no UAC at login, runs unelevated with the session).
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let lnk = autostart_lnk();
+    if !enabled {
+        let _ = std::fs::remove_file(&lnk);
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let target = exe.to_string_lossy().to_string();
+    let dir = exe
+        .parent()
+        .map(|d| d.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let lnk_str = lnk.to_string_lossy().to_string();
+    let script = format!(
+        r#"$w = New-Object -ComObject WScript.Shell; $s = $w.CreateShortcut('{lnk_str}'); $s.TargetPath = '{target}'; $s.WorkingDirectory = '{dir}'; $s.Save()"#
+    );
+    let out = std::process::Command::new("powershell")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW — no console flash
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 }
 
@@ -921,9 +985,19 @@ fn apps_from_shell() -> Vec<AppEntry> {
     out
 }
 
+/// Hide the launcher and tell the page it happened, so the page can reset
+/// (clear the query, drop the selection) while the window is STILL visible.
+/// The next show then paints a fresh DOM — no lingering text, no scroll
+/// reset visible on screen. Must run before hide(): a hidden WebView2
+/// throttles JS, so an event sent after hiding races the next show.
+fn hide_spotlight(window: &tauri::Window) {
+    let _ = window.emit("spotlight-hide", ());
+    let _ = window.hide();
+}
+
 #[tauri::command]
 fn hide_window(window: tauri::Window) {
-    let _ = window.hide();
+    hide_spotlight(&window);
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -1298,14 +1372,14 @@ fn main() {
                         log_line("window: CloseRequested → save+hide");
                         save_cache(&close_index, &index_cache_path());
                         if let Some(window) = event_close_window.lock().as_ref() {
-                            let _ = window.hide();
+                            hide_spotlight(window);
                         }
                         api.prevent_close();
                     }
                     tauri::WindowEvent::Focused(false) => {
                         if let Some(window) = event_close_window.lock().as_ref() {
                             if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
+                                hide_spotlight(window);
                             }
                         }
                     }
@@ -1359,7 +1433,9 @@ fn main() {
             app_info,
             uninstall_app,
             backdrop_ok,
-            get_accent_color
+            get_accent_color,
+            autostart_enabled,
+            set_autostart
         ])
         .build(tauri::generate_context!())
         .expect("error while building FastSeek");
@@ -1425,7 +1501,7 @@ fn register_shortcut(app: &tauri::App, shortcut: &str, window: tauri::Window) {
         let window = window.clone();
         move || {
             if window.is_visible().unwrap_or(false) {
-                let _ = window.hide();
+                hide_spotlight(&window);
             } else {
                 show_spotlight(&window);
             }
@@ -1456,7 +1532,7 @@ fn register_shortcut(app: &tauri::App, shortcut: &str, window: tauri::Window) {
                                 let window = window.clone();
                                 move || {
                                     if window.is_visible().unwrap_or(false) {
-                                        let _ = window.hide();
+                                        hide_spotlight(&window);
                                     } else {
                                         show_spotlight(&window);
                                     }
