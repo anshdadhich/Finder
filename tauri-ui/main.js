@@ -799,6 +799,7 @@ const setPreviewSwitch = document.getElementById("setPreview");
 const setAlpha = document.getElementById("setAlpha");
 const setAlphaVal = document.getElementById("setAlphaVal");
 const setThemeBtns = document.querySelectorAll("#setTheme button");
+const setAccentSwitch = document.getElementById("setAccent");
 let previewHidden = localStorage.getItem("fs-preview-hidden") === "1";
 let previewTimer = null;
 
@@ -994,6 +995,18 @@ refreshBackdrop();
 // decode overlaps the hidden period — no stale background ever flashes in.
 window.__TAURI__?.event?.listen("backdrop", (e) => applyBackdrop(e.payload));
 
+// Every hotkey/tray re-show opens a FRESH launcher: the previous query,
+// selection and scroll position are dropped, the default list renders from
+// the top. (The very first show at startup never emits this event — the
+// initial load flow already starts clean.)
+window.__TAURI__?.event?.listen("spotlight-open", () => {
+  input.value = "";
+  selected = 0;
+  searchSeq += 1; // cancel any in-flight search page
+  fileTotal = 0;
+  runSearchSafe();
+});
+
 // Theme: dark / light / system (system follows the OS live).
 function applyThemeChoice() {
   const t =
@@ -1016,6 +1029,39 @@ for (const btn of setThemeBtns) {
   });
 }
 applyThemeChoice();
+
+/* ── Accent: optionally adopt the Windows accent color ─────────────────── */
+const ACCENT_DEFAULTS = { hex: "#007aff", rgb: "0, 122, 255" };
+let accentMatch = localStorage.getItem("fs-accent") === "1";
+
+function applyAccent() {
+  const root = document.documentElement;
+  if (setAccentSwitch) setAccentSwitch.setAttribute("aria-checked", String(accentMatch));
+  if (!accentMatch) {
+    root.style.setProperty("--accent-blue", ACCENT_DEFAULTS.hex);
+    root.style.setProperty("--accent-blue-rgb", ACCENT_DEFAULTS.rgb);
+    return;
+  }
+  invoke("get_accent_color")
+    .then((hex) => {
+      if (!hex) return; // registry said no accent — keep the default
+      const r = parseInt(hex.slice(1, 3), 16);
+      const g = parseInt(hex.slice(3, 5), 16);
+      const b = parseInt(hex.slice(5, 7), 16);
+      if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return;
+      root.style.setProperty("--accent-blue", hex);
+      root.style.setProperty("--accent-blue-rgb", `${r}, ${g}, ${b}`);
+    })
+    .catch(() => {});
+}
+if (setAccentSwitch) {
+  setAccentSwitch.addEventListener("click", () => {
+    accentMatch = !accentMatch;
+    localStorage.setItem("fs-accent", accentMatch ? "1" : "0");
+    applyAccent();
+  });
+}
+applyAccent();
 
 /* ── Math (Spotlight-style calculator) ─────────────────────────────────── */
 // Pure arithmetic queries (digits + operators, no letters) evaluate locally:

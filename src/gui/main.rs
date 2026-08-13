@@ -427,6 +427,30 @@ Start-Process -FilePath $exe.FullName -Verb RunAs"#
 
 use std::os::windows::process::CommandExt;
 
+/// Windows accent color (HKCU ...\DWM\AccentColor, 0xAABBGGRR) as "#rrggbb".
+/// Used by the Settings "match accent color" option.
+#[tauri::command]
+fn get_accent_color() -> Result<Option<String>, String> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(r"Software\Microsoft\Windows\DWM", KEY_READ)
+        .map_err(|e| e.to_string())?;
+    let color: u32 = key.get_value("AccentColor").unwrap_or(0);
+    // DWM stores 0xAABBGGRR; callers only need the RGB.
+    let (a, r, g, b) = (
+        (color >> 24) & 0xFF,
+        color & 0xFF,
+        (color >> 8) & 0xFF,
+        (color >> 16) & 0xFF,
+    );
+    if a == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(format!("#{:02x}{:02x}{:02x}", r, g, b)))
+    }
+}
+
 fn icon_cache_dir() -> std::path::PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
@@ -1334,7 +1358,8 @@ fn main() {
             file_preview,
             app_info,
             uninstall_app,
-            backdrop_ok
+            backdrop_ok,
+            get_accent_color
         ])
         .build(tauri::generate_context!())
         .expect("error while building FastSeek");
@@ -1390,6 +1415,9 @@ fn show_spotlight(window: &tauri::Window) {
     if let Some(grab) = capture_backdrop(window) {
         let _ = window.emit("backdrop", grab);
     }
+    // The page resets the search box + selection on this event, so a second
+    // hotkey press opens a fresh launcher, not the previous query.
+    let _ = window.emit("spotlight-open", ());
     let _ = window.show();
     let _ = window.set_focus();
 }
