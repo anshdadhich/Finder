@@ -49,6 +49,29 @@ let lastSearchAt = 0;
 let firstInitDone = false;
 
 const iconCache = new Map();
+
+// Settings deep links have no file to extract an icon from; give them
+// inline glyphs (gear for everything, Wi-Fi/Bluetooth for their own pages).
+const svgIcon = (body) =>
+  `data:image/svg+xml,${encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.9)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`
+  )}`;
+const SETTINGS_ICON = svgIcon(
+  '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>'
+);
+const WIFI_ICON = svgIcon(
+  '<path d="M5 13a10 10 0 0 1 14 0"/><path d="M8.5 16.5a5 5 0 0 1 7 0"/><path d="M2 8.82a15 15 0 0 1 20 0"/><line x1="12" y1="20" x2="12.01" y2="20"/>'
+);
+const BLUETOOTH_ICON = svgIcon('<path d="m7 7 10 10-5 5V2l5 5L7 17"/>');
+const SETTINGS_ICON_BY_PATH = {
+  "ms-settings:wifi": WIFI_ICON,
+  "ms-settings:bluetooth": BLUETOOTH_ICON,
+};
+function settingsIconFor(path) {
+  const low = path.toLowerCase();
+  if (!low.startsWith("ms-settings:")) return null;
+  return SETTINGS_ICON_BY_PATH[low] || SETTINGS_ICON;
+}
 let rowEls = [];
 const rowPool = new Map();
 
@@ -374,6 +397,7 @@ const iconObserver = new IntersectionObserver(
       iconObserver.unobserve(en.target);
       const p = en.target.dataset.path;
       if (!p || iconCache.has(p.toLowerCase())) continue;
+      if (p.toLowerCase().startsWith("ms-settings:")) continue;
       iconQueue.add(p);
       scheduleIconDrain();
     }
@@ -503,29 +527,38 @@ let cardHeightShown = null;
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 function syncCardHeight() {
   clearTimeout(cardHeightTimer);
-  cardHeightTimer = setTimeout(() => {
-    // While the scan page is up the card measures ~210px (its content); pin
-    // that and the ready flip would open at "3 rows" until something else
-    // re-syncs. Skip the pin entirely here — setState("ready") re-syncs it
-    // once the palette is actually visible.
-    if (scanStateEl.classList.contains("visible")) return;
-    // Probe in "auto" (a px value can't measure content), then restore —
-    // the deduped value must be re-set, otherwise the inline style is left
-    // at "auto" and the card stops tracking its content.
-    cardWinEl.classList.add("no-height-transition");
-    cardWinEl.style.height = "auto";
-    const h = Math.max(210, Math.min(cardWinEl.scrollHeight, 520));
-    cardWinEl.style.height = h + "px";
-    cardWinEl.classList.remove("no-height-transition");
-    const prev = cardHeightShown;
-    cardHeightShown = h;
-    if (prev != null && prev !== h && !reduceMotion.matches) {
-      cardWinEl.animate(
-        [{ height: prev + "px" }, { height: h + "px" }],
-        { duration: 180, easing: "cubic-bezier(0.16, 1, 0.3, 1)" }
-      );
-    }
-  }, 90);
+  cardHeightTimer = setTimeout(measureCardHeight, 90);
+}
+function measureCardHeight() {
+  // While the scan page is up the card measures ~210px (its content); pin
+  // that and the ready flip would open at "3 rows" until something else
+  // re-syncs. Skip the pin entirely here — setState("ready") re-syncs it
+  // once the palette is actually visible.
+  if (scanStateEl.classList.contains("visible")) return;
+  // Probe in "auto" (a px value can't measure content), then restore —
+  // the deduped value must be re-set, otherwise the inline style is left
+  // at "auto" and the card stops tracking its content.
+  cardWinEl.classList.add("no-height-transition");
+  cardWinEl.style.height = "auto";
+  const h = Math.max(210, Math.min(cardWinEl.scrollHeight, 520));
+  cardWinEl.style.height = h + "px";
+  cardWinEl.classList.remove("no-height-transition");
+  const prev = cardHeightShown;
+  cardHeightShown = h;
+  if (prev != null && prev !== h && !reduceMotion.matches) {
+    cardWinEl.animate(
+      [{ height: prev + "px" }, { height: h + "px" }],
+      { duration: 180, easing: "cubic-bezier(0.16, 1, 0.3, 1)" }
+    );
+  }
+}
+// The debounce exists for fast typing; a math-query flip (panes dropping out
+// of layout) must re-measure on the spot, or the card sits at its old height
+// with a visible gap under the hero.
+let mathWasOpen = false;
+function syncCardHeightNow() {
+  clearTimeout(cardHeightTimer);
+  measureCardHeight();
 }
 
 function renderNow() {
@@ -611,6 +644,7 @@ function renderNow() {
         img.className = "icon";
         img.alt = "";
         const text = document.createElement("div");
+        text.className = "text";
         const name = document.createElement("div");
         name.className = "name";
         const path = document.createElement("div");
@@ -637,6 +671,7 @@ function renderNow() {
 
       if (el._name !== item.name || el._q !== query) {
         el._nameEl.textContent = "";
+        el._nameEl.title = "";
         if (item.kind === "more") {
           el._nameEl.appendChild(document.createTextNode(item.name));
         } else {
@@ -669,7 +704,8 @@ function renderNow() {
         el._tagText = tagText;
       }
       const iconKey = item.path.toLowerCase();
-      const uri = iconCache.get(iconKey);
+      let uri = iconCache.get(iconKey);
+      if (!uri && item.kind === "app") uri = settingsIconFor(item.path);
       if (el._iconKey !== iconKey) {
         el._iconKey = iconKey;
         if (uri) {
@@ -704,7 +740,13 @@ function renderNow() {
 
   resultsEl.replaceChildren(fragment);
   emptyEl.classList.toggle("visible", flatIndex === 0 && input.value.trim().length > 0);
-  syncCardHeight();
+  const mathOpen = !!math;
+  if (mathOpen !== mathWasOpen) {
+    mathWasOpen = mathOpen;
+    syncCardHeightNow();
+  } else {
+    syncCardHeight();
+  }
   for (let i = 0; i < rowEls.length; i++) {
     const el = rowEls[i];
     if (el && !el._observed && !el.classList.contains("more") && !el.classList.contains("math")) {
@@ -712,7 +754,18 @@ function renderNow() {
       iconObserver.observe(el);
     }
   }
+  setNameTooltips();
   updateSelection();
+}
+
+// Full name on hover, but ONLY when the row actually clipped it ("…").
+function setNameTooltips() {
+  for (const el of rowEls) {
+    if (!el || !el._nameEl) continue;
+    const n = el._nameEl;
+    if (n.scrollWidth > n.clientWidth + 2) n.title = n.textContent;
+    else n.title = "";
+  }
 }
 
 function updateSelection(scroll = true) {
@@ -1100,6 +1153,7 @@ function renderPreview() {
   const iconEl = document.getElementById("pvIcon");
 
   title.textContent = item.name || item.path;
+  title.title = item.name || item.path || "";
   type.textContent =
     item.kind === "app" ? "Application" : item.kind === "more" ? "More results" : item.is_dir ? "Folder" : "File";
   pane.classList.toggle("pv-app", item.kind === "app");
@@ -1151,6 +1205,10 @@ function renderPreview() {
   refreshMetaVisibility();
 }
 
+
+
+
+
 // The previewed item: { item, info } — info (exe target / publisher /
 // uninstall entry) is filled in by app_info for apps, null otherwise.
 let currentSelection = null;
@@ -1177,8 +1235,11 @@ async function previewMetaApp(item) {
       pvModified.textContent = info.modified_secs ? fmtRelative(info.modified_secs) : "—";
       pvPublisher.textContent = info.publisher || "—";
       pvVersion.textContent = info.version || "—";
-      if (openLocBtn) openLocBtn.disabled = !target || info.is_uwp;
-      if (adminBtn) adminBtn.disabled = info.is_uwp;
+      // UWP/Store apps are still actionable: "open file location" shows the
+      // Apps folder (WindowsApps is ACL-protected), "run as administrator"
+      // resolves the package's real exe and elevates it.
+      if (openLocBtn) openLocBtn.disabled = !target && !info.is_uwp;
+      if (adminBtn) adminBtn.disabled = false;
       // Uninstall exists only for installed/downloaded apps (registry entry);
       // system apps like Command Prompt have none — no button at all.
       if (uninstallBtn) uninstallBtn.style.display = info.uninstall_string ? "" : "none";

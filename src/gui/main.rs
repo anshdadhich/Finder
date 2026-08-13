@@ -322,6 +322,11 @@ fn launch_admin(path: String, state: tauri::State<AppState>) -> Result<(), Strin
     let entry = freq.entry(path.to_lowercase()).or_insert(0);
     *entry = entry.saturating_add(1);
     drop(freq);
+    if let Some(rest) = path.strip_prefix("aumid:") {
+        // Windows refuses elevated AppModel activation of packaged apps, so
+        // resolve the package's real executable and elevate THAT instead.
+        return launch_uwp_elevated(rest);
+    }
     launch_with_verb(&path, "runas")
 }
 
@@ -369,6 +374,58 @@ fn launch_with_verb(path: &str, verb: &str) -> Result<(), String> {
         Ok(())
     }
 }
+
+/// Run a packaged (Store/UWP) app elevated. Windows blocks elevated
+/// AppModel activation, but packaged apps are ordinary Win32 exes behind the
+/// package — launch_uwp_elevated maps the AUMID to its package family, finds
+/// the exe in the package's install directory and elevates that file.
+/// Resolution runs as a one-shot PowerShell child process (it returns when
+/// done), so it costs nothing in idle RAM.
+fn launch_uwp_elevated(aumid_rest: &str) -> Result<(), String> {
+    let exe = aumid_exe_token(aumid_rest).ok_or_else(|| {
+        format!("'{}' has no executable to elevate", aumid_rest)
+    })?;
+    // PFN-style AUMID ("FamilyName!AppId") carries the package family
+    // inline; legacy AUMIDs (Office: "Microsoft.Office.WINWORD.EXE.15") map
+    // through the Windows.Launch contract key.
+    let pfn = if let Some(idx) = aumid_rest.find('!') {
+        aumid_rest[..idx].to_string()
+    } else {
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+        use winreg::RegKey;
+        let sub = format!(
+            r"SOFTWARE\Classes\Extensions\ContractId\Windows.Launch\PackageId\{}",
+            aumid_rest
+        );
+        let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(sub, KEY_READ)
+            .ok();
+        key.and_then(|k| k.get_value::<String, _>("").ok())
+            .unwrap_or_default()
+    };
+    if pfn.is_empty() {
+        return Err(format!("no package mapping for '{}'", aumid_rest));
+    }
+    let script = format!(
+        r#"$p = Get-AppxPackage | Where-Object {{ $_.PackageFamilyName -eq '{pfn}' }} | Select-Object -First 1;
+if (-not $p -or -not $p.InstallLocation) {{ exit 1 }}
+$exe = Get-ChildItem -Path $p.InstallLocation -Recurse -Filter '{exe}' -ErrorAction SilentlyContinue | Select-Object -First 1;
+if (-not $exe) {{ exit 1 }}
+Start-Process -FilePath $exe.FullName -Verb RunAs"#
+    );
+    let out = std::process::Command::new("powershell")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW — no console flash
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("could not resolve '{exe}' in package {pfn}"))
+    }
+}
+
+use std::os::windows::process::CommandExt;
 
 fn icon_cache_dir() -> std::path::PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
@@ -982,6 +1039,16 @@ fn open_path(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn open_parent(path: String) -> Result<(), String> {
+    if let Some(rest) = path.strip_prefix("aumid:") {
+        // Packaged (Store) apps live in the ACL-protected WindowsApps folder,
+        // which Explorer won't open for the user. The Apps folder is the
+        // canonical "file location" Windows itself offers for these.
+        return std::process::Command::new("explorer")
+            .arg(format!("shell:AppsFolder\\{}", rest))
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+    }
     let p = Path::new(&path);
     // A bare filename (or a root like "C:\") has an empty/None parent —
     // explorer can't open "", so fall back to the path itself.
@@ -1479,6 +1546,245 @@ fn discover_apps() -> Vec<AppEntry> {
         ),
         ("Registry Editor".to_string(), format!(r"{}\regedit.exe", sys32)),
         ("Windows Explorer".to_string(), format!(r"{}\explorer.exe", sys32)),
+        // Settings deep links. Static strings only — no scanning, no index
+        // growth, a few KB of RAM for the whole list.
+        ("Settings: Wi-Fi".to_string(), "ms-settings:wifi".to_string()),
+        (
+            "Settings: Bluetooth".to_string(),
+            "ms-settings:bluetooth".to_string(),
+        ),
+        ("Settings: Display".to_string(), "ms-settings:display".to_string()),
+        ("Settings: Sound".to_string(), "ms-settings:sound".to_string()),
+        (
+            "Settings: Network & Internet".to_string(),
+            "ms-settings:network".to_string(),
+        ),
+        ("Settings: Ethernet".to_string(), "ms-settings:ethernet".to_string()),
+        (
+            "Settings: Mobile Hotspot".to_string(),
+            "ms-settings:mobilehotspot".to_string(),
+        ),
+        ("Settings: VPN".to_string(), "ms-settings:vpndialup".to_string()),
+        (
+            "Settings: Windows Update".to_string(),
+            "ms-settings:windowsupdate".to_string(),
+        ),
+        (
+            "Settings: Installed Apps".to_string(),
+            "ms-settings:appsfeatures".to_string(),
+        ),
+        (
+            "Settings: Startup Apps".to_string(),
+            "ms-settings:startupapps".to_string(),
+        ),
+        (
+            "Settings: Default Apps".to_string(),
+            "ms-settings:defaultapps".to_string(),
+        ),
+        (
+            "Settings: Notifications".to_string(),
+            "ms-settings:notifications".to_string(),
+        ),
+        ("Settings: Storage".to_string(), "ms-settings:storage".to_string()),
+        (
+            "Settings: Multitasking".to_string(),
+            "ms-settings:multitasking".to_string(),
+        ),
+        ("Settings: About".to_string(), "ms-settings:about".to_string()),
+        (
+            "Settings: Keyboard".to_string(),
+            "ms-settings:keyboard".to_string(),
+        ),
+        ("Settings: Mouse".to_string(), "ms-settings:mouse".to_string()),
+        ("Settings: Typing".to_string(), "ms-settings:typing".to_string()),
+        ("Settings: Touchpad".to_string(), "ms-settings:touchpad".to_string()),
+        (
+            "Settings: Personalization".to_string(),
+            "ms-settings:personalization".to_string(),
+        ),
+        (
+            "Settings: Lock Screen".to_string(),
+            "ms-settings:lockscreen".to_string(),
+        ),
+        ("Settings: Taskbar".to_string(), "ms-settings:taskbar".to_string()),
+        (
+            "Settings: Sign-in Options".to_string(),
+            "ms-settings:signinoptions".to_string(),
+        ),
+        (
+            "Settings: Accounts".to_string(),
+            "ms-settings:accounts".to_string(),
+        ),
+        (
+            "Settings: Date & Time".to_string(),
+            "ms-settings:dateandtime".to_string(),
+        ),
+        (
+            "Settings: Region & Language".to_string(),
+            "ms-settings:regionlanguage".to_string(),
+        ),
+        ("Settings: Gaming".to_string(), "ms-settings:gaming".to_string()),
+        (
+            "Settings: Game Bar".to_string(),
+            "ms-settings:gaming-gamebar".to_string(),
+        ),
+        (
+            "Settings: Accessibility".to_string(),
+            "ms-settings:accessibility".to_string(),
+        ),
+        (
+            "Settings: Camera Privacy".to_string(),
+            "ms-settings:privacy-webcam".to_string(),
+        ),
+        (
+            "Settings: Microphone Privacy".to_string(),
+            "ms-settings:privacy-microphone".to_string(),
+        ),
+        (
+            "Settings: Power & Battery".to_string(),
+            "ms-settings:powersleep".to_string(),
+        ),
+        (
+            "Settings: Battery Saver".to_string(),
+            "ms-settings:batterysaver".to_string(),
+        ),
+        (
+            "Settings: Night Light".to_string(),
+            "ms-settings:nightlight".to_string(),
+        ),
+        (
+            "Settings: Wallpaper".to_string(),
+            "ms-settings:personalization-background".to_string(),
+        ),
+        ("Settings: Colors".to_string(), "ms-settings:colors".to_string()),
+        ("Settings: Themes".to_string(), "ms-settings:themes".to_string()),
+        ("Settings: Fonts".to_string(), "ms-settings:fonts".to_string()),
+        (
+            "Settings: Clipboard".to_string(),
+            "ms-settings:clipboard".to_string(),
+        ),
+        (
+            "Settings: Focus Assist".to_string(),
+            "ms-settings:quiethours".to_string(),
+        ),
+        ("Settings: Phone Link".to_string(), "ms-settings:phone".to_string()),
+        (
+            "Settings: Printers & Scanners".to_string(),
+            "ms-settings:printers".to_string(),
+        ),
+        (
+            "Settings: Location Privacy".to_string(),
+            "ms-settings:privacy-location".to_string(),
+        ),
+        ("Settings: Backup".to_string(), "ms-settings:backup".to_string()),
+        (
+            "Settings: Troubleshoot".to_string(),
+            "ms-settings:troubleshoot".to_string(),
+        ),
+        ("Settings: Recovery".to_string(), "ms-settings:recovery".to_string()),
+        (
+            "Settings: Activation".to_string(),
+            "ms-settings:activation".to_string(),
+        ),
+        (
+            "Settings: Developer Mode".to_string(),
+            "ms-settings:developers".to_string(),
+        ),
+        (
+            "Settings: Windows Security".to_string(),
+            "ms-settings:windowsdefender".to_string(),
+        ),
+        ("Settings: Search".to_string(), "ms-settings:search".to_string()),
+        (
+            "Settings: Optional Features".to_string(),
+            "ms-settings:optionalfeatures".to_string(),
+        ),
+        (
+            "Settings: Project to This PC".to_string(),
+            "ms-settings:project".to_string(),
+        ),
+        (
+            "Settings: Email & Accounts".to_string(),
+            "ms-settings:emailandaccounts".to_string(),
+        ),
+        (
+            "Settings: Time & Language".to_string(),
+            "ms-settings:time-language".to_string(),
+        ),
+        (
+            "Settings: Airplane Mode".to_string(),
+            "ms-settings:network-airplanemode".to_string(),
+        ),
+        (
+            "Settings: Data Usage".to_string(),
+            "ms-settings:network-datausage".to_string(),
+        ),
+        (
+            "Settings: Advanced Network".to_string(),
+            "ms-settings:network-advancedsettings".to_string(),
+        ),
+        (
+            "Settings: Network Status".to_string(),
+            "ms-settings:network-status".to_string(),
+        ),
+        ("Settings: Proxy".to_string(), "ms-settings:network-proxy".to_string()),
+        (
+            "Settings: Bluetooth Devices".to_string(),
+            "ms-settings:bluetoothdevices".to_string(),
+        ),
+        (
+            "Settings: Diagnostics & Feedback".to_string(),
+            "ms-settings:diagnostics".to_string(),
+        ),
+        (
+            "Settings: Activity History".to_string(),
+            "ms-settings:privacy-activityhistory".to_string(),
+        ),
+        (
+            "Settings: Privacy".to_string(),
+            "ms-settings:privacy".to_string(),
+        ),
+        ("Settings: Speech".to_string(), "ms-settings:speech".to_string()),
+        (
+            "Settings: Voice Typing".to_string(),
+            "ms-settings:speech-typing".to_string(),
+        ),
+        (
+            "Settings: Remote Desktop".to_string(),
+            "ms-settings:remote-desktop".to_string(),
+        ),
+        (
+            "Settings: Work or School".to_string(),
+            "ms-settings:workplace".to_string(),
+        ),
+        (
+            "Settings: Other Users".to_string(),
+            "ms-settings:otherusers".to_string(),
+        ),
+        (
+            "Settings: Captures".to_string(),
+            "ms-settings:gaming-captures".to_string(),
+        ),
+        (
+            "Settings: Broadcasting".to_string(),
+            "ms-settings:gaming-broadcasting".to_string(),
+        ),
+        (
+            "Settings: Advanced Display".to_string(),
+            "ms-settings:display-advanced".to_string(),
+        ),
+        (
+            "Settings: Graphics".to_string(),
+            "ms-settings:display-graphics".to_string(),
+        ),
+        (
+            "Settings: Windows Insider".to_string(),
+            "ms-settings:windowsinsider".to_string(),
+        ),
+        (
+            "Settings: Storage Sense".to_string(),
+            "ms-settings:storagesense".to_string(),
+        ),
     ];
     for (name, target) in sys_tools {
         let key = norm_app_name(&name);
@@ -2607,7 +2913,11 @@ fn uninstall_app(name: String, path: String) -> Result<(), String> {
     let _ = target; // (kept for potential future UWP package mapping)
     if let Some(entry) = find_uninstall_entry(&name) {
         if let Some(cmd) = entry.uninstall_string.or(entry.quiet_uninstall_string) {
+            // cmd is a console app — hide its window (same flash issue as
+            // the PowerShell helpers).
+            use std::os::windows::process::CommandExt;
             std::process::Command::new("cmd")
+                .creation_flags(0x0800_0000)
                 .args(["/C", &cmd])
                 .spawn()
                 .map_err(|e| e.to_string())?;

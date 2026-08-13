@@ -697,11 +697,8 @@ body.math-open #results {
   border-right-color: transparent;
 }
 
-/* The hero bleeds past the results padding to sit flush with the card
-   edges — a true full-width calculator display. */
-body.math-open .result.calc-hero-row {
-  margin-left: -8px;
-  margin-right: -8px;
+body.math-open #results {
+  border-right-color: transparent;
 }
 
 input#setAlpha,
@@ -801,7 +798,10 @@ input#setBlur {
 .preview-title {
   font-size: 14.5px;
   font-weight: 600;
-  word-break: break-all;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   letter-spacing: -0.1px;
   color: var(--text-primary);
 }
