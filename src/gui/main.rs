@@ -1033,12 +1033,17 @@ fn hide_spotlight(window: &tauri::Window) {
 /// Frameless or not, Windows gives every window a system menu and pops it
 /// on Alt+Space (and Alt alone can activate it too). That collides with the
 /// Alt+Space summon hotkey and looks broken on a transparent sheet, so
-/// strip WS_SYSMENU once at startup.
+/// strip WS_SYSMENU — AND push the style change to the non-client frame
+/// with SWP_FRAMECHANGED, without which GetWindowLong/SetWindowLong alone
+/// silently leave the old frame (and the menu) in place. Re-applied on
+/// every show as belt-and-braces: some full-screen/DPI paths rebuild the
+/// window frame and re-assert the style.
 #[cfg(windows)]
 fn strip_system_menu(window: &tauri::Window) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWL_STYLE, WS_SYSMENU,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, HWND_TOP, SWP_FRAMECHANGED,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_SYSMENU,
     };
     unsafe {
         // window.hwnd() returns tauri's windows-crate HWND (a different
@@ -1049,6 +1054,15 @@ fn strip_system_menu(window: &tauri::Window) {
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
         if style >= 0 && (style & (WS_SYSMENU.0 as isize)) != 0 {
             SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_SYSMENU.0 as isize));
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
         }
     }
 }
@@ -1553,6 +1567,7 @@ fn position_spotlight(window: &tauri::Window) {
 }
 
 fn show_spotlight(window: &tauri::Window) {
+    strip_system_menu(window);
     position_spotlight(window);
     if let Some(grab) = capture_backdrop(window) {
         let _ = window.emit("backdrop", grab);

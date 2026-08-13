@@ -540,7 +540,10 @@ function measureCardHeight() {
   // at "auto" and the card stops tracking its content.
   cardWinEl.classList.add("no-height-transition");
   cardWinEl.style.height = "auto";
-  const h = Math.max(210, Math.min(cardWinEl.scrollHeight, 520));
+  // Compact mode + empty query = just the search bar: allow the card to
+  // shrink to the header instead of the normal 210px floor.
+  const minH = document.body.classList.contains("compact-empty") ? 62 : 210;
+  const h = Math.max(minH, Math.min(cardWinEl.scrollHeight, 520));
   cardWinEl.style.height = h + "px";
   cardWinEl.classList.remove("no-height-transition");
   const prev = cardHeightShown;

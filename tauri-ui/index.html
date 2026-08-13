@@ -94,7 +94,9 @@
             <div class="settings-group">
               <div class="settings-group-title">Appearance</div>
               <div class="setting-row">
-                <span class="setting-label">Theme</span>
+                <div class="setting-info">
+                  <span class="setting-label">Theme</span>
+                </div>
                 <div class="segmented" id="setTheme">
                   <button data-theme-choice="dark">Dark</button>
                   <button data-theme-choice="light">Light</button>
@@ -102,31 +104,46 @@
                 </div>
               </div>
               <div class="setting-row">
-                <span class="setting-label">Hotkey</span>
+                <div class="setting-info">
+                  <span class="setting-label">Hotkey</span>
+                  <span class="setting-desc">Summon the launcher anywhere</span>
+                </div>
                 <select id="setHotkey" class="setting-select" aria-label="Summon hotkey">
                   <option value="ctrl+space">Ctrl + Space</option>
                   <option value="alt+space">Alt + Space</option>
                 </select>
               </div>
               <div class="setting-row">
-                <span class="setting-label">Match Windows accent</span>
+                <div class="setting-info">
+                  <span class="setting-label">Match Windows accent</span>
+                  <span class="setting-desc">Use your system accent color</span>
+                </div>
                 <button id="setAccent" class="switch" role="switch" aria-checked="false" aria-label="Match Windows accent color"></button>
               </div>
             </div>
             <div class="settings-group">
               <div class="settings-group-title">Window</div>
               <div class="setting-row">
-                <span class="setting-label">Transparency</span>
+                <div class="setting-info">
+                  <span class="setting-label">Transparency</span>
+                  <span class="setting-desc">Opacity of the panel</span>
+                </div>
                 <input id="setAlpha" type="range" min="0" max="100" step="1" value="35" aria-label="Window transparency" />
                 <span id="setAlphaVal" class="setting-value">35%</span>
               </div>
               <div class="setting-row">
-                <span class="setting-label">Blur</span>
+                <div class="setting-info">
+                  <span class="setting-label">Blur</span>
+                  <span class="setting-desc">Frosted background strength</span>
+                </div>
                 <input id="setBlur" type="range" min="0" max="100" step="1" value="50" aria-label="Frosted blur strength" />
                 <span id="setBlurVal" class="setting-value">50%</span>
               </div>
               <div class="setting-row">
-                <span class="setting-label">Corner radius</span>
+                <div class="setting-info">
+                  <span class="setting-label">Corner radius</span>
+                  <span class="setting-desc">Roundness of the panel</span>
+                </div>
                 <input id="setRadius" type="range" min="0" max="32" step="1" value="16" aria-label="Window corner radius" />
                 <span id="setRadiusVal" class="setting-value">16px</span>
               </div>
@@ -134,19 +151,31 @@
             <div class="settings-group">
               <div class="settings-group-title">Behavior</div>
               <div class="setting-row">
-                <span class="setting-label">Preview pane</span>
+                <div class="setting-info">
+                  <span class="setting-label">Preview pane</span>
+                  <span class="setting-desc">Show details for the selected item</span>
+                </div>
                 <button id="setPreview" class="switch" role="switch" aria-checked="true" aria-label="Toggle preview pane"></button>
               </div>
               <div class="setting-row">
-                <span class="setting-label">Instant math</span>
+                <div class="setting-info">
+                  <span class="setting-label">Instant math</span>
+                  <span class="setting-desc">Evaluate expressions as you type</span>
+                </div>
                 <button id="setMath" class="switch" role="switch" aria-checked="true" aria-label="Toggle instant math"></button>
               </div>
               <div class="setting-row">
-                <span class="setting-label">Compact mode</span>
+                <div class="setting-info">
+                  <span class="setting-label">Compact mode</span>
+                  <span class="setting-desc">Only the search bar until you type</span>
+                </div>
                 <button id="setCompact" class="switch" role="switch" aria-checked="false" aria-label="Compact mode: search bar only until you type"></button>
               </div>
               <div class="setting-row">
-                <span class="setting-label">Start with Windows</span>
+                <div class="setting-info">
+                  <span class="setting-label">Start with Windows</span>
+                  <span class="setting-desc">Launch at login, ready for the hotkey</span>
+                </div>
                 <button id="setAutostart" class="switch" role="switch" aria-checked="false" aria-label="Start with Windows"></button>
               </div>
             </div>
