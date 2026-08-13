@@ -571,6 +571,8 @@ function renderNow() {
   // A math query turns the tool into a calculator: the hero spans the whole
   // card width (the preview pane drops out of layout) until the query clears.
   document.body.classList.toggle("math-open", !!math);
+  // Compact mode: an empty query collapses the tool to just the search bar.
+  document.body.classList.toggle("compact-empty", compactMode && !math && !input.value.trim());
   statusEl.style.display = "none";
   const groups = groupItems(items);
   const fragment = document.createDocumentFragment();
@@ -801,6 +803,11 @@ const setAlphaVal = document.getElementById("setAlphaVal");
 const setThemeBtns = document.querySelectorAll("#setTheme button");
 const setAccentSwitch = document.getElementById("setAccent");
 const setAutostartSwitch = document.getElementById("setAutostart");
+const setCompactSwitch = document.getElementById("setCompact");
+const setRadius = document.getElementById("setRadius");
+const setRadiusVal = document.getElementById("setRadiusVal");
+const pvImgEl = document.getElementById("pvImg");
+const pvImgCache = new Map(); // path -> base64 data URI
 let previewHidden = localStorage.getItem("fs-preview-hidden") === "1";
 let previewTimer = null;
 
@@ -1106,6 +1113,38 @@ if (setHotkeySel) {
   });
 }
 
+/* ── Corner radius (CSS var only — the sheet is transparent, so the card's
+   border-radius IS the window's visible corner shape) ─────────────────── */
+let cornerRadius = Math.min(32, Math.max(0, Number(localStorage.getItem("fs-radius")) || 16));
+function applyRadius() {
+  document.documentElement.style.setProperty("--radius-window", `${cornerRadius}px`);
+  if (setRadius) setRadius.value = String(cornerRadius);
+  if (setRadiusVal) setRadiusVal.textContent = `${cornerRadius}px`;
+}
+if (setRadius) {
+  setRadius.addEventListener("input", () => {
+    cornerRadius = Number(setRadius.value);
+    localStorage.setItem("fs-radius", String(cornerRadius));
+    applyRadius();
+  });
+}
+applyRadius();
+
+/* ── Compact mode: until something is typed, show ONLY the search bar ─── */
+let compactMode = localStorage.getItem("fs-compact") === "1";
+function applyCompact() {
+  if (setCompactSwitch) setCompactSwitch.setAttribute("aria-checked", String(compactMode));
+  renderNow(); // re-evaluate compact-empty (query may have changed)
+}
+if (setCompactSwitch) {
+  setCompactSwitch.addEventListener("click", () => {
+    compactMode = !compactMode;
+    localStorage.setItem("fs-compact", compactMode ? "1" : "0");
+    applyCompact();
+  });
+}
+applyCompact();
+
 /* ── Math (Spotlight-style calculator) ─────────────────────────────────── */
 // Pure arithmetic queries (digits + operators, no letters) evaluate locally:
 // typing "2*8" shows "2*8 = 16" as the top result. ^ is exponentiation.
@@ -1278,6 +1317,38 @@ function renderPreview() {
     chipText.textContent = row._chip.textContent;
     iconEl.appendChild(chipText);
     iconEl.style.setProperty("--chip-hue", row._chip.style.getPropertyValue("--chip-hue"));
+  }
+
+  // Real image files show the picture itself (cached per path) instead of
+  // the generic icon. The icon row stays underneath, hidden, so a failed
+  // load or a mid-flight selection change falls back cleanly.
+  const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|svg|ico)$/i;
+  if (item.kind === "file" && item.path && IMAGE_EXT_RE.test(item.path) && pvImgEl) {
+    iconEl.style.display = "none";
+    pvImgEl.hidden = false;
+    const cached = pvImgCache.get(item.path);
+    if (cached) {
+      pvImgEl.src = cached;
+      pvImgEl.alt = item.name || "";
+    } else {
+      pvImgEl.removeAttribute("src");
+      pvImgEl.alt = "Loading…";
+      const selPath = item.path;
+      invoke("image_data", { path: item.path })
+        .then((uri) => {
+          if (!uri || !currentSelection || currentSelection.item.path !== selPath) return;
+          pvImgCache.set(selPath, uri);
+          if (currentSelection.item.path === selPath) {
+            pvImgEl.src = uri;
+            pvImgEl.alt = currentSelection.item.name || "";
+          }
+        })
+        .catch(() => {});
+    }
+  } else if (pvImgEl) {
+    pvImgEl.hidden = true;
+    pvImgEl.removeAttribute("src");
+    iconEl.style.display = "";
   }
 
   const hasStat = item.kind === "file" || item.kind === "dir" || item.kind === "app";

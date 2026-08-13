@@ -735,6 +735,16 @@ body.math-open .settings-pane {
   display: none;
 }
 
+/* Compact mode with an empty query: only the search bar remains. The
+   settings pane stays reachable while the settings gear is open. */
+body.compact-empty #results,
+body.compact-empty .preview-pane {
+  display: none;
+}
+body.compact-empty:not(.settings-open) .settings-pane {
+  display: none;
+}
+
 body.math-open #results {
   border-right-color: transparent;
 }
@@ -829,6 +839,18 @@ input#setBlur {
   height: 100%;
   object-fit: contain;
   border-radius: 0;
+}
+
+/* Real image preview: the picture itself replaces the icon row. Sized to
+   fit the header comfortably; the metadata rows stay visible below. */
+#pvImg.pv-img {
+  width: 100%;
+  max-height: 230px;
+  height: auto;
+  object-fit: contain;
+  border-radius: 8px;
+  margin: 2px 0 10px;
+  background: rgba(0, 0, 0, 0.18);
 }
 
 .preview-large-icon .pv-initial {

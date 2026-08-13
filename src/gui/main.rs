@@ -515,6 +515,41 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
     }
 }
 
+/// Base64 data URI for an image file so the preview pane can show the
+/// actual picture. Capped at 16 MB — anything bigger just falls back to
+/// the regular icon row.
+#[tauri::command]
+fn image_data(path: String) -> Result<Option<String>, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if meta.len() > 16 * 1024 * 1024 {
+        return Ok(None);
+    }
+    let ext = path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        _ => return Ok(None),
+    };
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(Some(format!(
+        "data:{};base64,{}",
+        mime,
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    )))
+}
+
 fn icon_cache_dir() -> std::path::PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
@@ -995,6 +1030,32 @@ fn hide_spotlight(window: &tauri::Window) {
     let _ = window.hide();
 }
 
+/// Frameless or not, Windows gives every window a system menu and pops it
+/// on Alt+Space (and Alt alone can activate it too). That collides with the
+/// Alt+Space summon hotkey and looks broken on a transparent sheet, so
+/// strip WS_SYSMENU once at startup.
+#[cfg(windows)]
+fn strip_system_menu(window: &tauri::Window) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_STYLE, WS_SYSMENU,
+    };
+    unsafe {
+        // window.hwnd() returns tauri's windows-crate HWND (a different
+        // version of the type than our direct `windows` dependency) —
+        // unwrap the raw pointer and re-wrap it in ours.
+        let Ok(hwnd_raw) = window.hwnd() else { return };
+        let hwnd = HWND(hwnd_raw.0 as *mut core::ffi::c_void);
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        if style >= 0 && (style & (WS_SYSMENU.0 as isize)) != 0 {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_SYSMENU.0 as isize));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_system_menu(_window: &tauri::Window) {}
+
 #[tauri::command]
 fn hide_window(window: tauri::Window) {
     hide_spotlight(&window);
@@ -1337,6 +1398,7 @@ fn main() {
         .setup(move |app| {
             let window = app.get_window("main").expect("main window");
             *setup_close_window.lock() = Some(window.clone());
+            strip_system_menu(&window);
             position_spotlight(&window);
             if let Some(grab) = capture_backdrop(&window) {
                 // Harmless if the page hasn't registered listeners yet (the
@@ -1438,7 +1500,8 @@ fn main() {
             autostart_enabled,
             set_autostart,
             get_hotkey,
-            set_hotkey
+            set_hotkey,
+            image_data
         ])
         .build(tauri::generate_context!())
         .expect("error while building FastSeek");

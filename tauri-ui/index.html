@@ -53,6 +53,7 @@
           <div class="preview-inner">
             <div class="preview-header">
               <div id="pvIcon" class="preview-large-icon"></div>
+              <img id="pvImg" class="pv-img" alt="" hidden />
               <div id="pvTitle" class="preview-title"></div>
               <div id="pvType" class="preview-type"></div>
             </div>
@@ -124,6 +125,11 @@
                 <input id="setBlur" type="range" min="0" max="100" step="1" value="50" aria-label="Frosted blur strength" />
                 <span id="setBlurVal" class="setting-value">50%</span>
               </div>
+              <div class="setting-row">
+                <span class="setting-label">Corner radius</span>
+                <input id="setRadius" type="range" min="0" max="32" step="1" value="16" aria-label="Window corner radius" />
+                <span id="setRadiusVal" class="setting-value">16px</span>
+              </div>
             </div>
             <div class="settings-group">
               <div class="settings-group-title">Behavior</div>
@@ -134,6 +140,10 @@
               <div class="setting-row">
                 <span class="setting-label">Instant math</span>
                 <button id="setMath" class="switch" role="switch" aria-checked="true" aria-label="Toggle instant math"></button>
+              </div>
+              <div class="setting-row">
+                <span class="setting-label">Compact mode</span>
+                <button id="setCompact" class="switch" role="switch" aria-checked="false" aria-label="Compact mode: search bar only until you type"></button>
               </div>
               <div class="setting-row">
                 <span class="setting-label">Start with Windows</span>
