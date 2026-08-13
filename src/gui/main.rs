@@ -1346,12 +1346,13 @@ fn main() {
             let _ = window.show();
             let _ = window.set_focus();
 
-            // Primary summon hotkey. NB: Win+Space is RESERVED by Windows 11
-            // (language switcher) and RegisterHotKey refuses it, so Super+Space
-            // is deliberately not used here. Ctrl+Space is primary; Ctrl+Alt+
-            // Space is the collision-free (IME-safe) backup, registered last.
-            register_shortcut(app, "Ctrl+Space", window.clone());
-            register_shortcut(app, "Ctrl+Alt+Space", window.clone());
+            // Primary summon hotkey, configurable in Settings (Ctrl+Space or
+            // Alt+Space, persisted in HKCU\Software\FastSeek\Hotkey). NB:
+            // Win+Space is RESERVED by Windows 11 (language switcher) and
+            // RegisterHotKey refuses it, so Super+Space is never offered.
+            let hotkey = hotkey_name();
+            log_line(&format!("hotkey configured: {}", hotkey));
+            register_shortcut(&app.handle(), &hotkey, window.clone());
 
             start_backend(
                 Arc::clone(&setup_index),
@@ -1435,7 +1436,9 @@ fn main() {
             backdrop_ok,
             get_accent_color,
             autostart_enabled,
-            set_autostart
+            set_autostart,
+            get_hotkey,
+            set_hotkey
         ])
         .build(tauri::generate_context!())
         .expect("error while building FastSeek");
@@ -1495,7 +1498,52 @@ fn show_spotlight(window: &tauri::Window) {
     let _ = window.set_focus();
 }
 
-fn register_shortcut(app: &tauri::App, shortcut: &str, window: tauri::Window) {
+/// Persisted summon-hotkey choice, HKCU\Software\FastSeek\Hotkey (REG_SZ).
+fn hotkey_name() -> String {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(r"Software\FastSeek", KEY_READ)
+        .and_then(|k| k.get_value("Hotkey"))
+        .unwrap_or_else(|_| "ctrl+space".to_string())
+}
+
+fn set_hotkey_name(name: &str) {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    if let Ok((key, _)) =
+        RegKey::predef(HKEY_CURRENT_USER).create_subkey(r"Software\FastSeek")
+    {
+        let _ = key.set_value("Hotkey", &name.to_string());
+    }
+}
+
+#[tauri::command]
+fn get_hotkey() -> String {
+    hotkey_name()
+}
+
+/// Switch the summon hotkey live: unregister the old combo, register the
+/// new one, persist the choice so the next boot uses it too.
+#[tauri::command]
+fn set_hotkey(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    if name != "ctrl+space" && name != "alt+space" {
+        return Err(format!("unsupported hotkey: {}", name));
+    }
+    let current = hotkey_name();
+    if current == name {
+        return Ok(());
+    }
+    let _ = app.global_shortcut_manager().unregister(&current);
+    let Some(window) = app.get_window("main") else {
+        return Err("main window not found".to_string());
+    };
+    register_shortcut(&app, &name, window);
+    set_hotkey_name(&name);
+    Ok(())
+}
+
+fn register_shortcut(app: &tauri::AppHandle, shortcut: &str, window: tauri::Window) {
     let label = shortcut.to_string();
     let handler = {
         let window = window.clone();
@@ -1515,7 +1563,7 @@ fn register_shortcut(app: &tauri::App, shortcut: &str, window: tauri::Window) {
             // conflicts (IME, another app briefly holding the combo) clear
             // within a couple of seconds.
             log_line(&format!("hotkey {} register failed: {}; retrying", label, e));
-            let handle = app.handle().clone();
+            let handle = app.clone();
             let label2 = label;
             std::thread::spawn(move || {
                 for attempt in 1..=3u32 {

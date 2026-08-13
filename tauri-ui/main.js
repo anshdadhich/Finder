@@ -1000,12 +1000,17 @@ window.__TAURI__?.event?.listen("backdrop", (e) => applyBackdrop(e.payload));
 // speed), so the query/selection reset is done before the window ever
 // repaints hidden. The next show is a fresh launcher with zero visible
 // flash. Covers every hide path: hotkey, Esc, losing focus, close.
-window.__TAURI__?.event?.listen("spotlight-hide", () => {
+// scrollTop is explicitly reset too — replaceChildren alone leaves a
+// residual scroll when the new list is about as tall as the old one,
+// which pushes the first group label ("Applications") out of view.
+window.__TAURI__?.event?.listen("spotlight-hide", async () => {
   input.value = "";
   selected = 0;
   searchSeq += 1; // cancel any in-flight search page
   fileTotal = 0;
-  runSearchSafe();
+  resultsEl.scrollTop = 0;
+  await runSearchSafe();
+  resultsEl.scrollTop = 0;
 });
 
 // Theme: dark / light / system (system follows the OS live).
@@ -1076,6 +1081,27 @@ if (setAutostartSwitch) {
       .catch((error) => {
         setAutostartSwitch.setAttribute("aria-checked", String(!want));
         showActionError("Start with Windows", error);
+      });
+  });
+}
+
+/* ── Summon hotkey (Ctrl+Space / Alt+Space, persisted by the backend) ─── */
+const setHotkeySel = document.getElementById("setHotkey");
+if (setHotkeySel) {
+  invoke("get_hotkey")
+    .then((h) => {
+      if (h === "ctrl+space" || h === "alt+space") setHotkeySel.value = h;
+    })
+    .catch(() => {});
+  setHotkeySel.addEventListener("change", () => {
+    const want = setHotkeySel.value;
+    invoke("set_hotkey", { name: want })
+      .then(() => {
+        setHotkeySel.value = want;
+      })
+      .catch((error) => {
+        setHotkeySel.value = want === "ctrl+space" ? "alt+space" : "ctrl+space";
+        showActionError("Hotkey", error);
       });
   });
 }

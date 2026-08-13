@@ -669,6 +669,28 @@ body:not(.settings-open) .settings-pane {
   text-align: right;
 }
 
+.setting-select {
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-badge);
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  font-family: var(--font-mac);
+  font-size: 11.5px;
+  padding: 4px 22px 4px 9px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5' viewBox='0 0 8 5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%23888'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+.setting-select:focus-visible {
+  outline: 1px solid var(--accent-blue);
+}
+.setting-select option {
+  background: var(--bg-card);
+  color: var(--text-primary);
+}
+
 .switch {
   width: 36px;
   height: 20px;
