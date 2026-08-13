@@ -1102,27 +1102,28 @@ static BACKDROP_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
 const BACKDROP_TTL_MS: u128 = 800;
 
 /// Desktop fingerprint: a tiny 64×36 downscaled grab of the window rect,
-/// hashed. If the desktop behind the launcher did not change, the webview's
-/// existing backdrop is still accurate — so the TTL alone would still push
-/// a fresh screen-sized capture + ~5 MB decode/texture through the renderer
-/// every 800 ms of hotkey mashing; the hash gate makes that zero.
-static BACKDROP_THUMB: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
+/// reduced to a dHash (bit = "pixel brighter than its left neighbor"). If
+/// the desktop behind the launcher did not change, the webview's existing
+/// backdrop is still accurate — the TTL alone would still push a fresh
+/// screen-sized capture + ~5 MB decode/texture through the renderer every
+/// 800 ms of hotkey mashing; the perceptual gate makes that zero. A dHash
+/// (not a raw checksum) tolerates cursor blinks, clock digits and noise —
+/// those flip a few bits, a real desktop change flips hundreds.
+static BACKDROP_THUMB: Mutex<Option<Vec<u32>>> = Mutex::new(None);
 const THUMB_W: i32 = 64;
 const THUMB_H: i32 = 36;
+/// Max differing dHash bits (~1% of 2268) that still counts as "same
+/// desktop". Meaningful visual changes flip far more.
+const THUMB_MAX_DIFF_BITS: u32 = 24;
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+fn hamming_bits(a: &[u32], b: &[u32]) -> u32 {
+    a.iter().zip(b.iter()).map(|(x, y)| (x ^ y).count_ones()).sum()
 }
 
 /// Downscale the desktop behind the window rect into a tiny thumbnail and
-/// hash it. Returns None on any failure — callers then fall back to a full
-/// capture.
-fn thumb_hash(window: &tauri::Window, rect: Option<(i32, i32, i32, i32)>) -> Option<u64> {
+/// return its dHash as u32 words (63×36 = 2268 bits). None on any failure —
+/// callers then fall back to a full capture.
+fn thumb_dhash(window: &tauri::Window, rect: Option<(i32, i32, i32, i32)>) -> Option<Vec<u32>> {
     let (left, top, right, bottom) = rect?;
     let w = (right - left).max(1);
     let h = (bottom - top).max(1);
@@ -1187,7 +1188,23 @@ fn thumb_hash(window: &tauri::Window, rect: Option<(i32, i32, i32, i32)>) -> Opt
     if n < 1 {
         return None;
     }
-    Some(fnv1a64(&pixels))
+    // dHash over the BGRA pixels using approximate luminance.
+    let tw = THUMB_W as usize;
+    let th = THUMB_H as usize;
+    let bits = (tw - 1) * th;
+    let mut out = vec![0u32; bits.div_ceil(32)];
+    for y in 0..th {
+        for x in 0..tw - 1 {
+            let i0 = (y * tw + x) * 4;
+            let i1 = i0 + 4;
+            let l = (pixels[i0] as u32 + pixels[i0 + 1] as u32 + pixels[i0 + 2] as u32) / 3;
+            let r = (pixels[i1] as u32 + pixels[i1 + 1] as u32 + pixels[i1 + 2] as u32) / 3;
+            let bit = (l > r) as u32;
+            let b = y * (tw - 1) + x;
+            out[b / 32] |= bit << (b % 32);
+        }
+    }
+    Some(out)
 }
 
 /// Capture the desktop behind the window and cache it. Returns the grab and
@@ -1227,12 +1244,12 @@ fn capture_backdrop(window: &tauri::Window) -> Option<(BackdropGrab, bool)> {
     }
 
     // Fingerprint path: the TTL expired, so check whether the desktop under
-    // the window actually changed via a tiny hashed thumbnail. Unchanged →
+    // the window actually changed via a tiny dHash thumbnail. Unchanged →
     // the webview's backdrop is still accurate: reuse silently and refresh
     // the timestamp, so mashing the hotkey never produces a full capture.
     if rect_ok && age_ms >= BACKDROP_TTL_MS {
-        let same = match (thumb_hash(window, rect), *BACKDROP_THUMB.lock()) {
-            (Some(a), Some((b, _))) => a == b,
+        let same = match (thumb_dhash(window, rect), BACKDROP_THUMB.lock().as_ref()) {
+            (Some(a), Some(b)) => hamming_bits(&a, b) <= THUMB_MAX_DIFF_BITS,
             _ => false,
         };
         if same {
@@ -1322,9 +1339,15 @@ fn capture_backdrop(window: &tauri::Window) -> Option<(BackdropGrab, bool)> {
         }
         let img = image::RgbaImage::from_raw(w as u32, h as u32, pixels)
             .ok_or_else(|| "image buffer invalid".to_string())?;
+        // The backdrop is heavily blurred and dimmed — full resolution buys
+        // nothing. Downscale to half before encoding: ~4× smaller payload,
+        // and the browser decodes/retains a ~4× smaller texture per capture.
+        let small = image::imageops::thumbnail(&img, (w / 2).max(1) as u32, (h / 2).max(1) as u32);
         let mut out = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut out, image::ImageFormat::Jpeg)
-            .map_err(|e| e.to_string())?;
+        // Quality 55: barely perceptible under blur(20px)+dim, ~40% smaller
+        // than the old default, and the retain-path memory shrinks with it.
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 55);
+        enc.encode_image(&small).map_err(|e| e.to_string())?;
         Ok(BackdropGrab {
             uri: format!("data:image/jpeg;base64,{}", B64.encode(out.into_inner())),
             w_css: w as f64 / scale,
@@ -1337,9 +1360,7 @@ fn capture_backdrop(window: &tauri::Window) -> Option<(BackdropGrab, bool)> {
             *BACKDROP.lock() = Some(g.clone());
             *BACKDROP_AT.lock() = Some(Instant::now());
             *BACKDROP_RECT.lock() = rect;
-            if let Some(h) = thumb_hash(window, rect) {
-                *BACKDROP_THUMB.lock() = Some((h, Instant::now()));
-            }
+            *BACKDROP_THUMB.lock() = thumb_dhash(window, rect);
             Some((g, true))
         }
         Err(e) => {
