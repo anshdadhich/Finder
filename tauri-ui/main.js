@@ -492,11 +492,15 @@ function render() {
 
 /* The card's height follows its content but `height: auto` can't be
    transitioned, so we measure and set it explicitly — debounced by ~90ms so
-   fast typing settles before the card glides (same easing as the width).
-   Auto→px never animates, so the first measure on load is instant. */
+   fast typing settles before the card glides. The probe (auto → read →
+   px) runs with transitions OFF inside a single synchronous frame, so it
+   never paints; the glide itself is then driven with the Web Animations
+   API from the previous px height, so every results-count change animates
+   the card's bottom edge. */
 const cardWinEl = document.querySelector(".launcher-window");
 let cardHeightTimer = null;
 let cardHeightShown = null;
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 function syncCardHeight() {
   clearTimeout(cardHeightTimer);
   cardHeightTimer = setTimeout(() => {
@@ -505,13 +509,22 @@ function syncCardHeight() {
     // re-syncs. Skip the pin entirely here — setState("ready") re-syncs it
     // once the palette is actually visible.
     if (scanStateEl.classList.contains("visible")) return;
-    // Probe in "auto" (a px value can't measure content), then always
-    // restore — the deduped value must be re-set, otherwise the inline
-    // style is left at "auto" and the card stops tracking its content.
+    // Probe in "auto" (a px value can't measure content), then restore —
+    // the deduped value must be re-set, otherwise the inline style is left
+    // at "auto" and the card stops tracking its content.
+    cardWinEl.classList.add("no-height-transition");
     cardWinEl.style.height = "auto";
     const h = Math.max(210, Math.min(cardWinEl.scrollHeight, 520));
-    cardHeightShown = h;
     cardWinEl.style.height = h + "px";
+    cardWinEl.classList.remove("no-height-transition");
+    const prev = cardHeightShown;
+    cardHeightShown = h;
+    if (prev != null && prev !== h && !reduceMotion.matches) {
+      cardWinEl.animate(
+        [{ height: prev + "px" }, { height: h + "px" }],
+        { duration: 180, easing: "cubic-bezier(0.16, 1, 0.3, 1)" }
+      );
+    }
   }, 90);
 }
 
@@ -746,6 +759,10 @@ applyPreviewVisibility();
 
 if (settingsBtn) {
   settingsBtn.addEventListener("click", () => {
+    // A math query is a calculator — the card belongs to the result box
+    // (both side panes drop out). Opening settings while it is active would
+    // do nothing visible and pop open later when the query clears.
+    if (document.body.classList.contains("math-open")) return;
     const open = !document.body.classList.contains("settings-open");
     document.body.classList.toggle("settings-open", open);
     settingsBtn.setAttribute("aria-pressed", String(open));

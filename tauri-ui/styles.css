@@ -143,6 +143,13 @@ body {
   transition: width 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), height 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
+/* Height probe (syncCardHeight) runs with the height transition off so the
+   auto→px measurement swap never paints a frame; the actual glide is then
+   animated by JS. The width transition stays live. */
+.launcher-window.no-height-transition {
+  transition: width 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
 body.preview-off .launcher-window {
   width: 560px;
 }
@@ -674,15 +681,23 @@ body:not(.settings-open) .settings-pane {
 }
 
 /* A math query is a calculator: the hero card takes the WHOLE card width,
-   so the preview pane drops out of layout entirely (display:none — width 0
-   alone would leave its tall content still stretching the card, which is
+   so BOTH side panes drop out of layout entirely (display:none — width 0
+   alone would leave their tall content still stretching the card, which is
    the "extra space under the result box"). */
-body.math-open .preview-pane {
+body.math-open .preview-pane,
+body.math-open .settings-pane {
   display: none;
 }
 
 body.math-open #results {
   border-right-color: transparent;
+}
+
+/* The hero bleeds past the results padding to sit flush with the card
+   edges — a true full-width calculator display. */
+body.math-open .result.calc-hero-row {
+  margin-left: -8px;
+  margin-right: -8px;
 }
 
 input#setAlpha,
