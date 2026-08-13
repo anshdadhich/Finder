@@ -184,7 +184,11 @@ async fn search_files(
     // State<'_, _>: tauri 1.8 cannot hold a borrowed state across an await.)
     let state = app.state::<AppState>().inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if !state.ready.load(Ordering::Relaxed) || query.trim().is_empty() {
+        // No ready gate: the launcher stays usable while the cache loads or
+        // a rebuild runs, serving whatever the shared store holds so far.
+        // The RwLock serializes against the builder thread; a search during
+        // the very first empty instant simply returns nothing.
+        if query.trim().is_empty() {
             return FileResults { items: Vec::new(), total: 0 };
         }
 

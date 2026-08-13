@@ -42,6 +42,11 @@
 
   --shadow-mac: 0 0 0 1px var(--glass-border), 0 2px 8px rgba(0, 0, 0, 0.22), 0 0 22px rgba(0, 0, 0, 0.14);
   --snippet-bg: rgba(0, 0, 0, 0.3);
+
+  /* Gooey slider colors (dark): faint light track, light inner border. */
+  --slider-track: rgba(255, 255, 255, 0.14);
+  --gooey-stroke: rgba(255, 255, 255, 0.3);
+  --gooey-shadow: rgba(0, 0, 0, 0.55);
 }
 
 /* ── Light (follows the OS theme) ──────────────────────────────────────── */
@@ -70,6 +75,12 @@
 
   --shadow-mac: 0 0 0 1px var(--glass-border), 0 2px 8px rgba(0, 0, 0, 0.12), 0 0 22px rgba(0, 0, 0, 0.08);
   --snippet-bg: rgba(0, 0, 0, 0.05);
+
+  /* Gooey slider colors (light, the reference design): #dddddd track,
+     soft dark border and shadow. */
+  --slider-track: #dddddd;
+  --gooey-stroke: rgba(0, 0, 0, 0.22);
+  --gooey-shadow: rgba(0, 0, 0, 0.1);
 }
 
 * {
@@ -141,7 +152,7 @@ body {
   position: relative;
   overflow: hidden;
   will-change: height;
-  transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), height 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: width 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), height 0.18s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 body.preview-off .launcher-window {
@@ -326,7 +337,7 @@ input#search::placeholder {
   overflow-y: auto;
   overflow-x: hidden;
   border-right: 1px solid var(--border-subtle);
-  transition: border-right-color 0.24s ease;
+  transition: border-right-color 0.16s ease;
 }
 
 #results::-webkit-scrollbar {
@@ -573,7 +584,7 @@ input#search::placeholder {
   overflow-x: hidden;
   overflow-y: auto;
   opacity: 1;
-  transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), padding 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
+  transition: width 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), padding 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.12s ease;
 }
 
 body.preview-off .preview-pane,
@@ -600,7 +611,7 @@ body.settings-open #results {
   overflow-x: hidden;
   overflow-y: auto;
   opacity: 1;
-  transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), padding 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
+  transition: width 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), padding 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.12s ease;
 }
 
 body:not(.settings-open) .settings-pane {
@@ -680,11 +691,72 @@ body:not(.settings-open) .settings-pane {
   background: #ffffff;
 }
 
-input#setAlpha {
+/* A math query is a calculator: the hero card takes the WHOLE card width,
+   so the preview pane drops out of layout entirely (display:none — width 0
+   alone would leave its tall content still stretching the card, which is
+   the "extra space under the result box"). */
+body.math-open .preview-pane {
+  display: none;
+}
+
+body.math-open #results {
+  border-right-color: transparent;
+}
+
+/* ── Liquid (gooey) sliders ────────────────────────────────────────────── */
+/* The reference design's viscous ease-in slider: a physics-driven SVG blob
+   (surface-tension filter + trailing tail) that eases into drags and
+   springs back on release. Colors are theme variables — dark mode gets a
+   faint light track and brighter border, light mode the reference #dddddd. */
+.liquid-slider {
+  position: relative;
   flex: 1;
   min-width: 0;
-  accent-color: var(--accent-blue);
-  cursor: pointer;
+  height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  touch-action: none;
+  outline: none;
+}
+
+.liquid-slider:active {
+  cursor: grabbing;
+}
+
+.liquid-slider:focus-visible .track {
+  box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.4);
+}
+
+.liquid-slider .track {
+  position: absolute;
+  width: calc(100% - 48px);
+  height: 12px;
+  background: var(--slider-track);
+  border-radius: 6px;
+}
+
+.liquid-slider .svg-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.liquid-slider .liquid-thumb {
+  fill: #ffffff;
+}
+
+.liquid-slider .liquid-border {
+  fill: none;
+  stroke: var(--gooey-stroke);
+  stroke-width: 2.8px;
+  filter: blur(0.4px);
+  pointer-events: none;
 }
 
 .segmented {
