@@ -1090,11 +1090,54 @@ struct BackdropGrab {
 /// the grab would contain the app's own panel.
 static BACKDROP: Mutex<Option<BackdropGrab>> = Mutex::new(None);
 
-/// Capture the desktop behind the window and cache it. Returns the grab so
-/// the caller can push it to the webview BEFORE the window becomes visible —
-/// the JPEG decode then overlaps the still-hidden period and the user never
+/// The window rect the cached grab covers, plus when it was taken. A grab
+/// is reused while it is recent AND covers the same rect: rapid hotkey
+/// cycles must not push a fresh screen-sized JPEG through the IPC channel
+/// on every single show — while the window is hidden the renderer is
+/// throttled, so dozens of multi-MB events can pile up in the queue (and
+/// WebView2 keeps their decoded textures around), which is what drove RAM
+/// toward 1 GB under fast open/close mashing.
+static BACKDROP_AT: Mutex<Option<Instant>> = Mutex::new(None);
+static BACKDROP_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
+const BACKDROP_TTL_MS: u128 = 800;
+
+/// Capture the desktop behind the window and cache it. Returns the grab and
+/// whether it is a FRESH capture (the webview already holds any reused one —
+/// it is never cleared on hide — so only fresh grabs need emitting). The
+/// caller can push a fresh grab to the webview BEFORE the window becomes
+/// visible — the JPEG decode then overlaps the still-hidden period and the user never
 /// sees the previous (stale) backdrop flash in.
-fn capture_backdrop(window: &tauri::Window) -> Option<BackdropGrab> {
+fn capture_backdrop(window: &tauri::Window) -> Option<(BackdropGrab, bool)> {
+    // The window rect this grab would cover — also the reuse validity check.
+    let rect = (|| -> Option<(i32, i32, i32, i32)> {
+        let hwnd_tauri = window.hwnd().ok()?;
+        let hwnd = HWND(hwnd_tauri.0 as *mut std::os::raw::c_void);
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut r).ok()?; }
+        Some((r.left, r.top, r.right, r.bottom))
+    })();
+
+    // Reuse a recent grab that still covers the same rect. The webview keeps
+    // the last applied backdrop across hides, so a reused grab needs NO emit:
+    // rapid open/close then costs a single capture and no IPC traffic beyond
+    // the first show.
+    let fresh = {
+        let age_ok = match *BACKDROP_AT.lock() {
+            Some(t) => t.elapsed().as_millis() < BACKDROP_TTL_MS,
+            None => false,
+        };
+        let rect_ok = match (*BACKDROP_RECT.lock(), rect) {
+            (Some(c), Some(r)) => c == r,
+            _ => false,
+        };
+        !(age_ok && rect_ok)
+    };
+    if !fresh {
+        if let Some(g) = BACKDROP.lock().clone() {
+            return Some((g, false));
+        }
+    }
+
     let grab = (|| -> Result<BackdropGrab, String> {
         // tauri's HWND comes from its own pinned `windows` crate version;
         // unwrap the raw pointer and rebuild it as our crate's handle type.
@@ -1187,7 +1230,9 @@ fn capture_backdrop(window: &tauri::Window) -> Option<BackdropGrab> {
     match grab {
         Ok(g) => {
             *BACKDROP.lock() = Some(g.clone());
-            Some(g)
+            *BACKDROP_AT.lock() = Some(Instant::now());
+            *BACKDROP_RECT.lock() = rect;
+            Some((g, true))
         }
         Err(e) => {
             log_line(&format!("backdrop capture failed: {}", e));
@@ -1569,8 +1614,12 @@ fn position_spotlight(window: &tauri::Window) {
 fn show_spotlight(window: &tauri::Window) {
     strip_system_menu(window);
     position_spotlight(window);
-    if let Some(grab) = capture_backdrop(window) {
-        let _ = window.emit("backdrop", grab);
+    if let Some((grab, fresh)) = capture_backdrop(window) {
+        // Reused grabs are already applied in the webview (it is never
+        // cleared on hide) — only a genuinely fresh capture is emitted.
+        if fresh {
+            let _ = window.emit("backdrop", grab);
+        }
     }
     let _ = window.show();
     let _ = window.set_focus();

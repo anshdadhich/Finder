@@ -1348,6 +1348,10 @@ function renderPreview() {
         .then((uri) => {
           if (!uri || !currentSelection || currentSelection.item.path !== selPath) return;
           pvImgCache.set(selPath, uri);
+          // Bounded cache: a handful of recent previews is plenty; evicting
+          // the oldest keeps the map from growing without limit over a long
+          // session (its decoded images are dropped with it).
+          if (pvImgCache.size > 12) pvImgCache.delete(pvImgCache.keys().next().value);
           if (currentSelection.item.path === selPath) {
             pvImgEl.src = uri;
             pvImgEl.alt = currentSelection.item.name || "";
@@ -1593,10 +1597,13 @@ document.addEventListener("mousedown", (event) => {
 
 // Webview-level safety net: some outside clicks never surface as a page
 // mousedown (nor as a Rust Focused(false) — e.g. clicking another
-// always-on-top window), but they always blur the webview.
+// always-on-top window), but they always blur the webview. The backdrop is
+// deliberately NOT cleared here: while hidden it is invisible anyway, and
+// keeping it lets a reused Rust-side grab skip its emit entirely — rapid
+// open/close cycles otherwise queue a multi-MB image event per show into
+// the throttled hidden renderer (the memory accumulation source).
 window.addEventListener("blur", () => {
   stopGlassLoop();
-  clearBackdrop();
   if (invoke) invoke("hide_window");
 });
 

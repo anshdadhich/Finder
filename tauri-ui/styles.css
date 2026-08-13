@@ -649,6 +649,12 @@ body.settings-open .preview-pane {
   min-height: 100%;
 }
 
+/* The Theme row has no description, so its lone label is nudged down to
+   sit in line with the label position of rows that have one. */
+.settings-pane .settings-group:first-child .setting-row:first-child .setting-info {
+  transform: translateY(2px);
+}
+
 .settings-group {
   display: flex;
   flex-direction: column;
@@ -919,7 +925,7 @@ body.math-open #results {
 }
 
 .preview-metadata {
-  margin-top: 6px;
+  margin-top: 2px;
   display: flex;
   flex-direction: column;
 }
@@ -983,7 +989,9 @@ body.math-open #results {
   color: var(--text-primary);
   font-size: 12px;
   font-weight: 500;
-  /* No horizontal inset: the label aligns flush with the meta-data keys. */
+  /* No horizontal inset: the label aligns flush with the meta-data keys,
+     and the hover plate spans the whole row like the meta rows do. */
+  width: 100%;
   padding: 7px 0;
   border-radius: var(--radius-item);
   cursor: pointer;
