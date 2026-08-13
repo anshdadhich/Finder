@@ -157,13 +157,11 @@ body.preview-off .launcher-window {
 
 /* Compact mode with an empty query collapses to just the search bar: the
    card must be allowed to shrink to the header instead of the 210px floor,
-   and the bar itself sits higher and slimmer — tighter window padding and
-   a reduced header so it reads as a small launcher, not a tall box. */
+   and the bar itself is slimmer — a reduced header so it reads as a small
+   launcher, not a tall box. Placement (window padding) stays identical to
+   normal mode: the bar sits exactly where the full card sits. */
 body.compact-empty .launcher-window {
   min-height: 52px;
-}
-body.compact-empty {
-  padding: 44px 70px;
 }
 body.compact-empty .search-header {
   padding: 9px 16px;
@@ -623,7 +621,7 @@ body.settings-open #results {
   flex-direction: column;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 12px 28px 32px;
+  padding: 8px 28px 32px;
 }
 body.settings-open .settings-pane {
   display: flex;
@@ -655,6 +653,11 @@ body.settings-open .preview-pane {
   display: flex;
   flex-direction: column;
   margin-top: 16px;
+}
+
+/* The first section starts right under the header border — no extra gap. */
+.settings-group:first-child {
+  margin-top: 0;
 }
 
 /* A guaranteed sliver of breathing room after the last row, even when the
@@ -916,7 +919,7 @@ body.math-open #results {
 }
 
 .preview-metadata {
-  margin-top: 14px;
+  margin-top: 6px;
   display: flex;
   flex-direction: column;
 }
@@ -971,7 +974,7 @@ body.math-open #results {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  margin-top: 14px;
+  margin-top: 8px;
 }
 
 .pv-btn {
@@ -980,7 +983,8 @@ body.math-open #results {
   color: var(--text-primary);
   font-size: 12px;
   font-weight: 500;
-  padding: 7px 8px;
+  /* No horizontal inset: the label aligns flush with the meta-data keys. */
+  padding: 7px 0;
   border-radius: var(--radius-item);
   cursor: pointer;
   text-align: left;
