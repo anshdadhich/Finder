@@ -1497,6 +1497,7 @@ fn discover_apps() -> Vec<AppEntry> {
     // point at the SAME executable but have different display names (e.g.
     // Start Menu "Word.lnk" + registry "WINWORD", or "Antigravity IDE" vs
     // "Antigravity IDE (User)"). The better-looking name wins.
+    dedupe_exact_path(&mut apps);
     dedupe_by_target(&mut apps);
 
     apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -1511,23 +1512,47 @@ fn app_target_exe(app: &AppEntry) -> Option<String> {
     let lower = p.to_lowercase();
     // Curated system-tool entries carry a real exe path behind the aumid:
     // prefix ("aumid:C:\...\python.exe") — use the path itself as the key.
-    let path: &str = if let Some(rest) = lower.strip_prefix("aumid:") {
-        if rest.ends_with(".exe") {
-            rest
+    let path: String = if let Some(rest) = lower.strip_prefix("aumid:") {
+        if let Some(expanded) = expand_aumid_path(rest) {
+            expanded
+        } else if rest.ends_with(".exe") {
+            rest.to_string()
         } else {
             return None;
         }
     } else {
-        p
+        p.to_string()
     };
     let pl = path.to_lowercase();
     if pl.ends_with(".lnk") {
-        resolve_lnk_target(path)
+        resolve_lnk_target(&path)
     } else if pl.ends_with(".exe") {
-        Some(path.to_string())
+        Some(path)
     } else {
         None
     }
+}
+
+/// Well-known folder SIDs that AppsFolder aumid paths are relative to
+/// ("aumid:{1AC14E77-...}\mdsched.exe" = System32\mdsched.exe). Resolving
+/// them gives real paths, so the same exe discovered via a Start Menu .lnk
+/// collapses onto the aumid entry (Memory Diagnostics Tool == Windows Memory
+/// Diagnostic). Verified against the live machine: System32/SysWOW64/
+/// Program Files.
+fn expand_aumid_path(rest: &str) -> Option<String> {
+    let (sid, tail) = rest.split_once('\\')?;
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
+    let prog = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+    let base = if sid.eq_ignore_ascii_case("{1ac14e77-02e7-4e5d-b744-2eb1ae5198b7}") {
+        Some(format!(r"{}\System32", windir))
+    } else if sid.eq_ignore_ascii_case("{d65231b0-b2f1-4857-a4ce-a8e7c6ea7d27}") {
+        Some(format!(r"{}\SysWOW64", windir))
+    } else if sid.eq_ignore_ascii_case("{6d809377-6af0-444b-8957-a3773f02200e}") {
+        Some(prog)
+    } else {
+        None
+    }?;
+    Some(format!(r"{}\{}", base, tail))
 }
 
 /// Normalize a resolved target for dedupe keys: canonicalize (long names,
@@ -1585,6 +1610,13 @@ fn app_name_score(app: &AppEntry) -> i32 {
     score
 }
 
+/// Some apps register the exact same entry twice (e.g. ZCode appears as two
+/// identical aumid registrations) — keep the first copy per lowercase path.
+fn dedupe_exact_path(apps: &mut Vec<AppEntry>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    apps.retain(|a| seen.insert(a.path.to_lowercase()));
+}
+
 /// Collapse entries that resolve to the same executable. Two layers:
 /// 1. full canonical target path — Start Menu .lnk targets vs registry .exe
 ///    paths vs aumid:-entries that carry a real path behind the prefix;
@@ -1602,19 +1634,35 @@ fn dedupe_by_target(apps: &mut Vec<AppEntry>) {
         let p = apps[i].path.trim();
         let pl = p.to_lowercase();
         let (path_key, name_key, name_is_aumid): (Option<String>, Option<String>, bool) =
-            if pl.ends_with(".lnk") {
+            if let Some(rest) = pl.strip_prefix("aumid:") {
+                if let Some(expanded) = expand_aumid_path(rest) {
+                    let el = expanded.to_lowercase();
+                    if el.ends_with(".exe") {
+                        (
+                            Some(canonical_target(&expanded)),
+                            file_name_key(&expanded),
+                            false,
+                        )
+                    } else if el.ends_with(".lnk") {
+                        match resolve_lnk_target(&expanded) {
+                            Some(t) => (Some(canonical_target(&t)), file_name_key(&t), false),
+                            None => (None, None, false),
+                        }
+                    } else {
+                        (None, None, false)
+                    }
+                } else if rest.ends_with(".exe") {
+                    (Some(canonical_target(rest)), file_name_key(rest), false)
+                } else {
+                    (None, aumid_exe_token(rest), true)
+                }
+            } else if pl.ends_with(".lnk") {
                 match resolve_lnk_target(p) {
                     Some(t) => (Some(canonical_target(&t)), file_name_key(&t), false),
                     None => (None, None, false),
                 }
             } else if pl.ends_with(".exe") {
                 (Some(canonical_target(p)), file_name_key(p), false)
-            } else if let Some(rest) = pl.strip_prefix("aumid:") {
-                if rest.ends_with(".exe") {
-                    (Some(canonical_target(rest)), file_name_key(rest), false)
-                } else {
-                    (None, aumid_exe_token(rest), true)
-                }
             } else {
                 (None, None, false)
             };
@@ -1697,13 +1745,18 @@ fn aumid_exe_token(aumid: &str) -> Option<String> {
 }
 
 /// Installer/shell noise Windows lists as apps but a launcher should not:
-/// URL shortcuts (nodejs.org docs/website, Windows Kits .url samples) and
-/// installer entry points ("Install Additional Tools for Node.js",
-/// "Uninstall Node.js", "* command prompt" shells).
+/// URL shortcuts (nodejs.org docs/website, Windows Kits .url samples),
+/// web-page links (Git Release Notes, Python docs) and installer entry
+/// points ("Install Additional Tools for Node.js", "Uninstall Node.js",
+/// "* command prompt" shells).
 fn is_shell_junk(name: &str, path: &str) -> bool {
     let pl = path.to_lowercase();
     if let Some(rest) = pl.strip_prefix("aumid:") {
-        if rest.starts_with("http") || rest.ends_with(".url") {
+        if rest.starts_with("http")
+            || rest.ends_with(".url")
+            || rest.ends_with(".html")
+            || rest.ends_with(".htm")
+        {
             return true;
         }
     }
@@ -1713,9 +1766,19 @@ fn is_shell_junk(name: &str, path: &str) -> bool {
         || lower.ends_with(" command prompt")
 }
 
-/// Shortcut-target noise: a .lnk resolving to a shell interpreter or an
-/// uninstaller stub is not a launchable app.
+/// Shortcut-target noise: a .lnk resolving to a shell interpreter, an
+/// uninstaller stub, or a web page (.url/.html/URL links like "Git Release
+/// Notes", "Samples for Desktop Apps", "Python Manuals") is not a launchable
+/// app.
 fn is_shortcut_target_junk(target: &str) -> bool {
+    let tl = target.to_lowercase();
+    if tl.starts_with("http")
+        || tl.ends_with(".url")
+        || tl.ends_with(".html")
+        || tl.ends_with(".htm")
+    {
+        return true;
+    }
     let Some(stem) = Path::new(target)
         .file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
