@@ -27,7 +27,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    GetObjectW, ReleaseDC, SelectObject, BITMAP, BITMAPINFO, BI_RGB, DIB_RGB_COLORS,
+    GetObjectW, ReleaseDC, SelectObject, StretchBlt, BITMAP, BITMAPINFO, BI_RGB, DIB_RGB_COLORS,
     HGDIOBJ, HBITMAP, RGBQUAD, SRCCOPY,
 };
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
@@ -1101,6 +1101,95 @@ static BACKDROP_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static BACKDROP_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
 const BACKDROP_TTL_MS: u128 = 800;
 
+/// Desktop fingerprint: a tiny 64×36 downscaled grab of the window rect,
+/// hashed. If the desktop behind the launcher did not change, the webview's
+/// existing backdrop is still accurate — so the TTL alone would still push
+/// a fresh screen-sized capture + ~5 MB decode/texture through the renderer
+/// every 800 ms of hotkey mashing; the hash gate makes that zero.
+static BACKDROP_THUMB: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
+const THUMB_W: i32 = 64;
+const THUMB_H: i32 = 36;
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Downscale the desktop behind the window rect into a tiny thumbnail and
+/// hash it. Returns None on any failure — callers then fall back to a full
+/// capture.
+fn thumb_hash(window: &tauri::Window, rect: Option<(i32, i32, i32, i32)>) -> Option<u64> {
+    let (left, top, right, bottom) = rect?;
+    let w = (right - left).max(1);
+    let h = (bottom - top).max(1);
+    let hdc_screen = unsafe { GetDC(None) };
+    let hdc_mem = unsafe { CreateCompatibleDC(Some(hdc_screen)) };
+    if hdc_mem.0.is_null() {
+        let _ = unsafe { ReleaseDC(None, hdc_screen) };
+        return None;
+    }
+    let bmp = unsafe { CreateCompatibleBitmap(hdc_screen, THUMB_W, THUMB_H) };
+    if bmp.0.is_null() {
+        let _ = unsafe { DeleteDC(hdc_mem) };
+        let _ = unsafe { ReleaseDC(None, hdc_screen) };
+        return None;
+    }
+    let old = unsafe { SelectObject(hdc_mem, HGDIOBJ(bmp.0)) };
+    let ok = unsafe {
+        StretchBlt(
+            hdc_mem, 0, 0, THUMB_W, THUMB_H,
+            Some(hdc_screen), left, top, w, h, SRCCOPY,
+        )
+    };
+    if !ok.as_bool() {
+        unsafe {
+            let _ = SelectObject(hdc_mem, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(hdc_mem);
+            let _ = ReleaseDC(None, hdc_screen);
+        }
+        return None;
+    }
+    let mut bmi = BITMAPINFO {
+        bmiHeader: windows::Win32::Graphics::Gdi::BITMAPINFOHEADER {
+            biSize: size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32,
+            biWidth: THUMB_W,
+            biHeight: -THUMB_H,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        bmiColors: [RGBQUAD::default()],
+    };
+    let mut pixels = vec![0u8; (THUMB_W * THUMB_H * 4) as usize];
+    let n = unsafe {
+        GetDIBits(
+            hdc_mem,
+            bmp,
+            0,
+            THUMB_H as u32,
+            Some(pixels.as_mut_ptr() as *mut std::os::raw::c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        )
+    };
+    unsafe {
+        let _ = SelectObject(hdc_mem, old);
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(hdc_mem);
+        let _ = ReleaseDC(None, hdc_screen);
+    }
+    if n < 1 {
+        return None;
+    }
+    Some(fnv1a64(&pixels))
+}
+
 /// Capture the desktop behind the window and cache it. Returns the grab and
 /// whether it is a FRESH capture (the webview already holds any reused one —
 /// it is never cleared on hide — so only fresh grabs need emitting). The
@@ -1121,20 +1210,36 @@ fn capture_backdrop(window: &tauri::Window) -> Option<(BackdropGrab, bool)> {
     // the last applied backdrop across hides, so a reused grab needs NO emit:
     // rapid open/close then costs a single capture and no IPC traffic beyond
     // the first show.
-    let fresh = {
-        let age_ok = match *BACKDROP_AT.lock() {
-            Some(t) => t.elapsed().as_millis() < BACKDROP_TTL_MS,
-            None => false,
-        };
-        let rect_ok = match (*BACKDROP_RECT.lock(), rect) {
-            (Some(c), Some(r)) => c == r,
-            _ => false,
-        };
-        !(age_ok && rect_ok)
+    let rect_ok = match (*BACKDROP_RECT.lock(), rect) {
+        (Some(c), Some(r)) => c == r,
+        _ => false,
     };
-    if !fresh {
+    let age_ms = match *BACKDROP_AT.lock() {
+        Some(t) => t.elapsed().as_millis(),
+        None => u128::MAX,
+    };
+
+    // Fast path: the grab is recent AND covers the same rect — reuse.
+    if rect_ok && age_ms < BACKDROP_TTL_MS {
         if let Some(g) = BACKDROP.lock().clone() {
             return Some((g, false));
+        }
+    }
+
+    // Fingerprint path: the TTL expired, so check whether the desktop under
+    // the window actually changed via a tiny hashed thumbnail. Unchanged →
+    // the webview's backdrop is still accurate: reuse silently and refresh
+    // the timestamp, so mashing the hotkey never produces a full capture.
+    if rect_ok && age_ms >= BACKDROP_TTL_MS {
+        let same = match (thumb_hash(window, rect), *BACKDROP_THUMB.lock()) {
+            (Some(a), Some((b, _))) => a == b,
+            _ => false,
+        };
+        if same {
+            *BACKDROP_AT.lock() = Some(Instant::now());
+            if let Some(g) = BACKDROP.lock().clone() {
+                return Some((g, false));
+            }
         }
     }
 
@@ -1232,6 +1337,9 @@ fn capture_backdrop(window: &tauri::Window) -> Option<(BackdropGrab, bool)> {
             *BACKDROP.lock() = Some(g.clone());
             *BACKDROP_AT.lock() = Some(Instant::now());
             *BACKDROP_RECT.lock() = rect;
+            if let Some(h) = thumb_hash(window, rect) {
+                *BACKDROP_THUMB.lock() = Some((h, Instant::now()));
+            }
             Some((g, true))
         }
         Err(e) => {
