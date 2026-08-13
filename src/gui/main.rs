@@ -1415,9 +1415,6 @@ fn show_spotlight(window: &tauri::Window) {
     if let Some(grab) = capture_backdrop(window) {
         let _ = window.emit("backdrop", grab);
     }
-    // The page resets the search box + selection on this event, so a second
-    // hotkey press opens a fresh launcher, not the previous query.
-    let _ = window.emit("spotlight-open", ());
     let _ = window.show();
     let _ = window.set_focus();
 }

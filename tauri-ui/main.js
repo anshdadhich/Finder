@@ -995,11 +995,14 @@ refreshBackdrop();
 // decode overlaps the hidden period — no stale background ever flashes in.
 window.__TAURI__?.event?.listen("backdrop", (e) => applyBackdrop(e.payload));
 
-// Every hotkey/tray re-show opens a FRESH launcher: the previous query,
-// selection and scroll position are dropped, the default list renders from
-// the top. (The very first show at startup never emits this event — the
-// initial load flow already starts clean.)
-window.__TAURI__?.event?.listen("spotlight-open", () => {
+// Reset while HIDDEN so a re-show never flashes the previous query: the
+// moment the window hides (hotkey/Esc), the query is cleared, the selection
+// reset and the default list re-rendered. By the time the window is visible
+// again the DOM is already fresh — no repaint races the first frame. The
+// visibilityState check keeps this from firing when the user merely clicks
+// another app while the launcher stays visible on top.
+window.addEventListener("blur", () => {
+  if (document.visibilityState !== "hidden") return;
   input.value = "";
   selected = 0;
   searchSeq += 1; // cancel any in-flight search page
