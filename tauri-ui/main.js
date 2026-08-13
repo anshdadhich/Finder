@@ -542,7 +542,7 @@ function measureCardHeight() {
   cardWinEl.style.height = "auto";
   // Compact mode + empty query = just the search bar: allow the card to
   // shrink to the header instead of the normal 210px floor.
-  const minH = document.body.classList.contains("compact-empty") ? 62 : 210;
+  const minH = document.body.classList.contains("compact-empty") ? 52 : 210;
   const h = Math.max(minH, Math.min(cardWinEl.scrollHeight, 520));
   cardWinEl.style.height = h + "px";
   cardWinEl.classList.remove("no-height-transition");
@@ -1014,6 +1014,12 @@ window.__TAURI__?.event?.listen("backdrop", (e) => applyBackdrop(e.payload));
 // residual scroll when the new list is about as tall as the old one,
 // which pushes the first group label ("Applications") out of view.
 window.__TAURI__?.event?.listen("spotlight-hide", async () => {
+  // The next show must be a fresh launcher: close Settings too, or the
+  // panel would still be open on the next summon.
+  if (document.body.classList.contains("settings-open")) {
+    document.body.classList.remove("settings-open");
+    if (settingsBtn) settingsBtn.setAttribute("aria-pressed", "false");
+  }
   input.value = "";
   selected = 0;
   searchSeq += 1; // cancel any in-flight search page
@@ -1095,25 +1101,26 @@ if (setAutostartSwitch) {
   });
 }
 
-/* ── Summon hotkey (Ctrl+Space / Alt+Space, persisted by the backend) ─── */
-const setHotkeySel = document.getElementById("setHotkey");
-if (setHotkeySel) {
+/* ── Summon hotkey (Ctrl+Space / Alt+Space, persisted by the backend) ───
+   Segmented control, same language as the Theme row. */
+const setHotkeyBtns = document.querySelectorAll("#setHotkey button");
+if (setHotkeyBtns.length) {
   invoke("get_hotkey")
     .then((h) => {
-      if (h === "ctrl+space" || h === "alt+space") setHotkeySel.value = h;
+      for (const btn of setHotkeyBtns)
+        btn.classList.toggle("active", btn.dataset.hotkeyChoice === h);
     })
     .catch(() => {});
-  setHotkeySel.addEventListener("change", () => {
-    const want = setHotkeySel.value;
-    invoke("set_hotkey", { name: want })
-      .then(() => {
-        setHotkeySel.value = want;
-      })
-      .catch((error) => {
-        setHotkeySel.value = want === "ctrl+space" ? "alt+space" : "ctrl+space";
-        showActionError("Hotkey", error);
-      });
-  });
+  for (const btn of setHotkeyBtns) {
+    btn.addEventListener("click", () => {
+      const want = btn.dataset.hotkeyChoice;
+      invoke("set_hotkey", { name: want })
+        .then(() => {
+          for (const b of setHotkeyBtns) b.classList.toggle("active", b === btn);
+        })
+        .catch((error) => showActionError("Hotkey", error));
+    });
+  }
 }
 
 /* ── Corner radius (CSS var only — the sheet is transparent, so the card's
