@@ -319,6 +319,20 @@ input#search::placeholder {
   transition: width 0.4s ease;
 }
 
+/* No known total (direct MFT read, cache load): a moving gradient reads as
+   progress better than a static empty bar next to a climbing counter. */
+#progressFill.indeterminate {
+  width: 100%;
+  background: linear-gradient(90deg, transparent, var(--accent-blue), transparent);
+  background-size: 200% 100%;
+  animation: fs-progress-sweep 1.4s linear infinite;
+}
+
+@keyframes fs-progress-sweep {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
 /* ── Body: results + preview ───────────────────────────────────────────── */
 .body-container {
   display: flex;

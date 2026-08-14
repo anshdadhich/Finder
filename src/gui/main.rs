@@ -7,7 +7,7 @@ use std::{
     mem::size_of,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
     thread,
@@ -65,6 +65,10 @@ struct AppState {
     index: Arc<RwLock<IndexStore>>,
     ready: Arc<AtomicBool>,
     status: Arc<RwLock<String>>,
+    /// Scan/build progress, fixed point 0..=1000 (% × 10); u32::MAX means
+    /// indeterminate (e.g. phase with no known total). Drives the status
+    /// strip bar so a first-run scan reads as moving progress.
+    progress: Arc<AtomicU32>,
     apps: Arc<RwLock<Vec<AppEntry>>>,
     /// Bumped whenever the app pool is swapped (install/uninstall detected),
     /// so the UI knows to re-fetch without polling the full list down.
@@ -135,16 +139,20 @@ struct IndexStatus {
     first_scan: bool,
     /// App pool version; the UI re-fetches get_all_apps when it moves.
     apps_rev: u64,
+    /// 0.0..=1.0 while scanning/building; -1.0 = indeterminate phase.
+    progress: f32,
 }
 
 #[tauri::command]
 fn get_index_status(state: tauri::State<AppState>) -> IndexStatus {
+    let p = state.progress.load(Ordering::Relaxed);
     IndexStatus {
         ready: state.ready.load(Ordering::Relaxed),
         count: state.index.read().len(),
         message: state.status.read().clone(),
         first_scan: state.first_scan.load(Ordering::Relaxed),
         apps_rev: state.app_rev.load(Ordering::Relaxed),
+        progress: if p == u32::MAX { -1.0 } else { p as f32 / 1000.0 },
     }
 }
 
@@ -1837,6 +1845,7 @@ fn main() {
     let ready = Arc::new(AtomicBool::new(false));
     let status = Arc::new(RwLock::new(String::from("Starting...")));
     let first_scan = Arc::new(AtomicBool::new(false));
+    let progress = Arc::new(AtomicU32::new(u32::MAX));
     let apps = Arc::new(RwLock::new(discover_apps()));
     log_app_pool(&apps.read());
     let app_rev = Arc::new(AtomicU64::new(0));
@@ -1854,6 +1863,7 @@ fn main() {
         index: Arc::clone(&index),
         ready: Arc::clone(&ready),
         status: Arc::clone(&status),
+        progress: Arc::clone(&progress),
         apps: Arc::clone(&apps),
         app_rev: Arc::clone(&app_rev),
         icon_cache: Arc::clone(&icon_cache),
@@ -1873,6 +1883,7 @@ fn main() {
     let setup_index = Arc::clone(&index);
     let setup_ready = Arc::clone(&ready);
     let setup_status = Arc::clone(&status);
+    let setup_progress = Arc::clone(&progress);
     let close_index = Arc::clone(&index);
     let close_window: Arc<Mutex<Option<tauri::Window>>> = Arc::new(Mutex::new(None));
     let setup_close_window = Arc::clone(&close_window);
@@ -1911,6 +1922,7 @@ fn main() {
                 Arc::clone(&setup_index),
                 Arc::clone(&setup_ready),
                 Arc::clone(&setup_status),
+                Arc::clone(&setup_progress),
                 Arc::clone(&first_scan),
             );
             Ok(())
@@ -3115,6 +3127,7 @@ fn start_backend(
     index: Arc<RwLock<IndexStore>>,
     ready: Arc<AtomicBool>,
     status: Arc<RwLock<String>>,
+    progress: Arc<AtomicU32>,
     first_scan: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
@@ -3162,7 +3175,7 @@ fn start_backend(
             if first_run {
                 first_scan.store(true, Ordering::Relaxed);
             }
-            build_full_index(&index, &drives, &cache_path, &status);
+            build_full_index(&index, &drives, &cache_path, &status, &progress);
             first_scan.store(false, Ordering::Relaxed);
         }
 
@@ -3352,6 +3365,7 @@ fn build_full_index(
     drives: &[fastsearch::mft::types::NtfsDrive],
     cache_path: &Path,
     status: &Arc<RwLock<String>>,
+    progress: &Arc<AtomicU32>,
 ) {
     *index.write() = IndexStore::new();
     log_line(&format!("scan begin: {} drive(s)", drives.len()));
@@ -3389,14 +3403,41 @@ fn build_full_index(
         // $MFT file read is slower and kept only as a fallback, so a
         // drive where the IOCTL misbehaves still indexes.
         let forced_direct = std::env::var_os("FASTSEEK_DIRECT").is_some();
+        // Live progress: the ioctl enumeration reports records parsed so far
+        // after every 16 MB buffer. The total is an estimate ($MFT capacity),
+        // so the text says "~" and the bar may jump to 100% when reading
+        // actually finishes before the estimated capacity is reached.
+        let mut on_read = |parsed: usize, total: usize| {
+            let overall = if total > 0 {
+                (((i as f64 + (parsed as f64 / total as f64).min(1.0))
+                    / total_drives as f64)
+                    * 1000.0)
+                    .round()
+                    .min(1000.0) as u32
+            } else {
+                u32::MAX
+            };
+            progress.store(overall, Ordering::Relaxed);
+            *status.write() = if total > 0 {
+                format!(
+                    "Reading drive {} — {} of ~{} records...",
+                    drive.letter, parsed, total
+                )
+            } else {
+                format!("Reading drive {} — {} records...", drive.letter, parsed)
+            };
+        };
         let (scan, method): (_, &str) = if forced_direct {
+            progress.store(u32::MAX, Ordering::Relaxed);
+            *status.write() = format!("Reading drive {} (direct MFT read)...", drive.letter);
             match reader.scan_direct() {
                 Some(scan) if !scan.records.is_empty() => (scan, "direct"),
-                _ => (reader.scan(), "ioctl"),
+                _ => (reader.scan_with_progress(&mut on_read), "ioctl"),
             }
         } else {
-            let scan = reader.scan();
+            let scan = reader.scan_with_progress(&mut on_read);
             if scan.records.is_empty() {
+                progress.store(u32::MAX, Ordering::Relaxed);
                 match reader.scan_direct() {
                     Some(direct) if !direct.records.is_empty() => (direct, "direct-fallback"),
                     _ => (scan, "ioctl"),
@@ -3530,10 +3571,12 @@ fn rebuild_index(state: tauri::State<AppState>) {
 fn rebuild_index_impl(state: &AppState) {
     state.ready.store(false, Ordering::Relaxed);
     state.first_scan.store(false, Ordering::Relaxed);
+    state.progress.store(u32::MAX, Ordering::Relaxed);
     *state.status.write() = String::from("Rebuilding index...");
     let index = Arc::clone(&state.index);
     let ready = Arc::clone(&state.ready);
     let status = Arc::clone(&state.status);
+    let progress = Arc::clone(&state.progress);
     thread::spawn(move || {
         let cache_path = index_cache_path();
         let _ = std::fs::remove_file(&cache_path);
@@ -3542,7 +3585,7 @@ fn rebuild_index_impl(state: &AppState) {
             *status.write() = String::from("No NTFS drives found. Run as Administrator.");
             return;
         }
-        build_full_index(&index, &drives, &cache_path, &status);
+        build_full_index(&index, &drives, &cache_path, &status, &progress);
         if index.read().len() == 0 {
             *status.write() = String::from(
                 "Rebuild finished but nothing could be read — run as Administrator and try again.",

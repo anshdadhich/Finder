@@ -242,8 +242,13 @@ impl MftReader {
     // ---------------------------------------------------------------
 
     pub fn scan(&self) -> ScanResult {
+        self.scan_with_progress(&mut |_, _| {})
+    }
+
+    pub fn scan_with_progress(&self, on_progress: &mut dyn FnMut(usize, usize)) -> ScanResult {
         let mut records: Vec<CompactRecord> = Vec::with_capacity(3_000_000);
         let mut name_data: Vec<u16> = Vec::with_capacity(40_000_000);
+        let estimate = self.estimated_record_count().unwrap_or(0);
 
         let mut enum_data = MFT_ENUM_DATA_V0 {
             StartFileReferenceNumber: 0,
@@ -279,6 +284,7 @@ impl MftReader {
             }
 
             if bytes_returned <= 8 {
+                on_progress(records.len(), estimate);
                 break;
             }
 
@@ -321,6 +327,8 @@ impl MftReader {
 
                 offset += rec_len;
             }
+
+            on_progress(records.len(), estimate);
         }
 
         ScanResult {
@@ -359,6 +367,16 @@ impl MftReader {
         };
 
         Some(record_size)
+    }
+
+    /// Best-effort total MFT record *capacity* ($MFT size ÷ record size) for
+    /// progress estimation. None when the file can't be read (e.g. sparse
+    /// placeholder volumes) — callers then fall back to indeterminate bars.
+    fn estimated_record_count(&self) -> Option<usize> {
+        let mft_path = format!("{}$MFT", self.drive.root);
+        let size = std::fs::metadata(&mft_path).ok()?.len();
+        let rec = self.read_mft_record_size().unwrap_or(1024);
+        Some((size / rec as u64) as usize)
     }
 
     /// Parse one record-aligned slice: each record is copied out of the

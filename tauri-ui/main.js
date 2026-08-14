@@ -450,6 +450,10 @@ function scheduleIconDrain() {
           if (img && img.src !== uri) {
             img.src = uri;
             img.closest(".result")?.classList.add("has-icon");
+            // The preview pane mirrors the selected row — refresh it when the
+            // real icon lands, or it keeps the letter chip until the user
+            // happens to move the selection.
+            if (rowEls[selected] === img.closest(".result")) renderPreview();
           }
         }
       }
@@ -1595,7 +1599,15 @@ async function refreshStatus() {
       }
       setState("ready");
       statusEl.style.display = "";
-      progressFill.style.display = "none";
+      progressFill.style.display = "block";
+      if (status && typeof status.progress === "number" && status.progress >= 0) {
+        progressFill.classList.remove("indeterminate");
+        progressFill.style.width = Math.round(status.progress * 100) + "%";
+      } else {
+        // No known total (direct MFT read, counting phase): the bar sweeps
+        // indefinitely while the record counter keeps climbing.
+        progressFill.classList.add("indeterminate");
+      }
       statusText.textContent = (status && status.message) || "Indexing…";
       return;
     }
