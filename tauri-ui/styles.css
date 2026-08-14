@@ -610,7 +610,8 @@ input#search::placeholder {
 }
 
 body.preview-off .preview-pane,
-body.settings-open .preview-pane {
+body.settings-open .preview-pane,
+body.no-results .preview-pane {
   width: 0;
   padding: 22px 0;
   opacity: 0;
@@ -619,7 +620,8 @@ body.settings-open .preview-pane {
 }
 
 body.preview-off #results,
-body.settings-open #results {
+body.settings-open #results,
+body.no-results #results {
   border-right-color: transparent;
 }
 

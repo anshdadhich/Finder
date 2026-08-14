@@ -207,6 +207,17 @@ function paintFromPools(query) {
     render();
     return true;
   }
+  // A leading "@" is a web search: one row, Enter opens the browser.
+  // (Schedule side skips the index search for these.)
+  if (q.startsWith("@")) {
+    const web = q.slice(1);
+    if (web) {
+      items = [{ kind: "web", name: `Search the web for “${web}”`, path: web }];
+      selected = 0;
+      render();
+      return true;
+    }
+  }
   const parts = [];
   if (appPoolLoaded && appPool.length) {
     for (const app of clientApps(q)) {
@@ -249,9 +260,12 @@ function syncScanNotice() {
     for (const el of [...resultsEl.children]) {
       if (el !== scanNoticeEl) el.remove();
     }
+    // Nothing to preview while the notice owns the column either.
+    document.body.classList.add("no-results");
     fileTotal = 0;
   } else {
     scanNoticeEl.classList.remove("visible");
+    document.body.classList.remove("no-results");
     // The scan finished while the notice stood in for the app list —
     // restore it (only when nothing is typed).
     if (appState === "ready" && !input.value.trim()) paintFromPools("");
@@ -262,6 +276,10 @@ async function runSearch() {
   if (!invoke) return;
   const query = input.value.trim();
   const seq = ++searchSeq;
+
+  // A leading "@" never touches the index — paintFromPools owns the single
+  // web-search row and Enter hands the query to the browser directly.
+  if (query.startsWith("@") && query.length > 1) return;
 
   // Path queries bypass the index entirely — the backend walks the live
   // filesystem (Exact hit → one row; partial path → bounded subtree walk).
@@ -404,13 +422,16 @@ function groupItems() {
   const apps = [];
   const dirs = [];
   const files = [];
+  const web = [];
   for (const item of items) {
     if (item.kind === "math") math.push(item);
     else if (item.kind === "app") apps.push(item);
     else if (item.kind === "dir") dirs.push(item);
+    else if (item.kind === "web") web.push(item);
     else if (item.kind !== "more") files.push(item);
   }
   const groups = [];
+  if (web.length) groups.push({ label: "Web", rows: web });
   if (math.length) groups.push({ label: "Calculation", rows: math });
   if (apps.length) groups.push({ label: "Applications", rows: apps });
   if (dirs.length) groups.push({ label: "Folders", rows: dirs });
@@ -759,7 +780,7 @@ function renderNow() {
         el._pathEl.title = "";
         el._path = pathText;
       }
-      const tagText = item.kind === "app" ? "App" : item.kind === "more" ? "More" : item.kind === "math" ? "Math" : item.is_dir ? "Folder" : "File";
+      const tagText = item.kind === "app" ? "App" : item.kind === "more" ? "More" : item.kind === "math" ? "Math" : item.kind === "web" ? "Web" : item.is_dir ? "Folder" : "File";
       if (el._tagText !== tagText) {
         el._tag.textContent = tagText;
         el._tagText = tagText;
@@ -801,6 +822,10 @@ function renderNow() {
 
   resultsEl.replaceChildren(fragment);
   emptyEl.classList.toggle("visible", flatIndex === 0 && input.value.trim().length > 0);
+  // With nothing to preview the pane adds nothing but an empty plate —
+  // collapse it along with the "No results" state (renderPreview also
+  // falls back to the empty plate when no row is selected).
+  document.body.classList.toggle("no-results", flatIndex === 0 && input.value.trim().length > 0);
   const mathOpen = !!math;
   if (mathOpen !== mathWasOpen) {
     mathWasOpen = mathOpen;
@@ -1251,13 +1276,89 @@ function isPathQuery(s) {
 }
 
 const MATH_RE = /^[0-9+\-*/().%\s^]+$/;
+// Safe expression evaluator for the math-query feature. The input charset
+// is locked down by MATH_RE (digits + operators + parens only), but CSP
+// script-src 'self' (no 'unsafe-eval') blocks new Function(), so a tiny
+// recursive-descent parser computes the value instead — no eval anywhere.
+// Precedence: unary +/- < ^ (right-assoc) < * / % < + -, parens override.
+function evalMath(s) {
+  let i = 0;
+  const peek = () => (i < s.length ? s[i] : "");
+  const skip = () => { while (i < s.length && /\s/.test(s[i])) i++; };
+  const num = () => {
+    const start = i;
+    while (i < s.length && /[0-9.]/.test(s[i])) i++;
+    const tok = s.slice(start, i);
+    if (!tok || (tok.match(/\./g) || []).length > 1 || tok.replace(".", "").length === 0) throw new Error("bad number");
+    return parseFloat(tok);
+  };
+  const primary = () => {
+    skip();
+    const ch = peek();
+    if (ch === "(") {
+      i++;
+      const v = expr();
+      skip();
+      if (peek() !== ")") throw new Error("unbalanced parens");
+      i++;
+      return v;
+    }
+    if (/[0-9.]/.test(ch)) return num();
+    throw new Error("unexpected char");
+  };
+  const expr = () => {
+    let v = term();
+    for (;;) {
+      skip();
+      const ch = peek();
+      if (ch === "+") { i++; v += term(); }
+      else if (ch === "-") { i++; v -= term(); }
+      else break;
+    }
+    return v;
+  };
+  const term = () => {
+    let v = unary();
+    for (;;) {
+      skip();
+      const ch = peek();
+      if (ch === "*") { i++; v *= unary(); }
+      else if (ch === "/") { i++; v /= unary(); }
+      else if (ch === "%") { i++; v %= unary(); }
+      else break;
+    }
+    return v;
+  };
+  const unary = () => {
+    skip();
+    const ch = peek();
+    if (ch === "-") { i++; return -unary(); }
+    if (ch === "+") { i++; return +unary(); }
+    return power();
+  };
+  const power = () => {
+    const base = primary();
+    skip();
+    if (peek() === "^") {
+      i++;
+      return Math.pow(base, unary());
+    }
+    return base;
+  };
+  skip();
+  const v = expr();
+  skip();
+  if (i < s.length) throw new Error("trailing chars");
+  return v;
+}
+
 function tryMath(query) {
   const s = query.trim();
   if (!s || s.length > 80 || !MATH_RE.test(s)) return null;
   if (!/\d/.test(s) || !/[+\-*/%^]/.test(s)) return null;
   let value;
   try {
-    value = Function(`"use strict"; return (${s.replace(/\^/g, "**")});`)();
+    value = evalMath(s);
   } catch {
     return null;
   }
@@ -1388,7 +1489,15 @@ function renderPreview() {
   title.textContent = item.name || item.path;
   title.title = item.name || item.path || "";
   type.textContent =
-    item.kind === "app" ? "Application" : item.kind === "more" ? "More results" : item.is_dir ? "Folder" : "File";
+    item.kind === "app"
+      ? "Application"
+      : item.kind === "more"
+        ? "More results"
+        : item.kind === "web"
+          ? "Web search"
+          : item.is_dir
+            ? "Folder"
+            : "File";
   pane.classList.toggle("pv-app", item.kind === "app");
   pane.classList.toggle("pv-plain", !!item.is_dir);
   path.textContent = truncatePath(item.path || "");
@@ -1586,6 +1695,15 @@ async function openSelected(mode) {
   }
   if (item.kind === "more") {
     await loadMoreFiles();
+    return;
+  }
+  if (item.kind === "web") {
+    try {
+      await invoke("open_web_search", { query: item.path });
+      await invoke("hide_window");
+    } catch (error) {
+      showActionError(item.name || item.path, error);
+    }
     return;
   }
   const cmd =
