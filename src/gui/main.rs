@@ -3448,7 +3448,7 @@ fn build_full_index(
         // buffers) is the fast scan path (~6s for a 4 GB MFT). The raw
         // $MFT file read is slower and kept only as a fallback, so a
         // drive where the IOCTL misbehaves still indexes.
-        let forced_direct = std::env::var_os("FASTSEEK_DIRECT").is_some();
+        let forced_direct = std::env::var_os("FINDER_DIRECT").is_some();
         // Live progress: the ioctl enumeration reports records parsed so far
         // after every 16 MB buffer. The total is an estimate ($MFT capacity),
         // so the text says "~" and the bar may jump to 100% when reading

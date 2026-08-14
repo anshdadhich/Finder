@@ -495,7 +495,12 @@ let appState = "unknown";
 function setState(state) {
   if (state === appState) return;
   appState = state;
-  if (state === "scan") {
+  if (state === "onboarding") {
+    onboardingEl.classList.add("visible");
+    cardEl.style.display = "none";
+    scanStateEl.classList.remove("visible");
+  } else if (state === "scan") {
+    onboardingEl.classList.remove("visible");
     scanStateEl.classList.add("visible");
     cardEl.style.display = "none";
     if (!scanStartAt) scanStartAt = Date.now();
@@ -505,6 +510,7 @@ function setState(state) {
       scanRetryBtn.textContent = "Try again";
     }
   } else {
+    onboardingEl.classList.remove("visible");
     scanStateEl.classList.remove("visible");
     cardEl.style.display = "";
     scanStartAt = 0;
@@ -1607,15 +1613,23 @@ async function refreshStatus() {
       loadApps(true);
     }
     const fatal = !!(status && /No files were indexed|No NTFS drives/.test(status.message || ""));
-    if (!status || !status.ready || fatal) {
-      if (fatal) {
-        setState("scan");
-        scanTitle.textContent = "Index unavailable";
-        scanSub.textContent =
-          "Finder could not read any files. Make sure it is running as Administrator, then try again.";
-        scanStatusText.textContent = status.message || "Index unavailable";
-        return;
-      }
+    if (fatal) {
+      setState("scan");
+      scanTitle.textContent = "Index unavailable";
+      scanSub.textContent =
+        "Finder could not read any files. Make sure it is running as Administrator, then try again.";
+      scanStatusText.textContent = status.message || "Index unavailable";
+      return;
+    }
+    // First run: the onboarding owns the screen while the index builds
+    // underneath — by the time the steps are done, the scan is far along
+    // (or finished), so the wait reads as seconds, not minutes.
+    if (status && status.first_scan && !obDone) {
+      setState("onboarding");
+      obSyncProgress(status);
+      return;
+    }
+    if (!status || !status.ready) {
       setState("ready");
       statusEl.style.display = "";
       progressFill.style.display = "block";
@@ -1640,6 +1654,106 @@ async function refreshStatus() {
 }
 
 let lastNavKeyAt = 0; // hover never yanks the selection right after a keystroke
+
+/* ── First-run onboarding ────────────────────────────────────────────────
+   Shows only while the backend's very first scan runs (first_scan). Three
+   animated steps (theme → hotkey → settings teaser) paced by the user; the
+   scan ticks away underneath and the status bar on the card mirrors it. */
+const onboardingEl = document.getElementById("onboarding");
+const obSteps = document.querySelectorAll(".ob-step");
+const obDots = document.querySelectorAll(".ob-dots .dot");
+const obNext = document.getElementById("obNext");
+const obFill = document.querySelector(".ob-progress .ob-fill");
+const obStatusText = document.querySelector(".ob-status");
+const obThemeBtns = document.querySelectorAll("#obTheme button");
+const obHotkeyBtns = document.querySelectorAll("#obHotkey button");
+let obDone = false;
+let obStep = 0;
+
+function obShowStep(i) {
+  obSteps.forEach((s, k) => {
+    s.classList.remove("active", "leaving");
+    if (k === i) s.classList.add("active");
+    else if (k < i) s.classList.add("leaving");
+  });
+  obDots.forEach((d, k) => d.classList.toggle("active", k === i));
+  if (obNext) obNext.textContent = i === 2 ? "Start searching" : "Continue";
+}
+
+function obAdvance() {
+  if (obStep < 2) {
+    obStep += 1;
+    obShowStep(obStep);
+    return;
+  }
+  finishOnboarding();
+}
+
+// Morph the onboarding card into the launcher: the card scales up and fades,
+// then the search tool drops in with its own entrance animation — one window,
+// no hard cut.
+function finishOnboarding() {
+  obDone = true;
+  onboardingEl.classList.add("done");
+  setTimeout(() => {
+    onboardingEl.classList.remove("visible", "done");
+    cardEl.style.display = "";
+    cardEl.classList.remove("card-enter");
+    void cardEl.offsetWidth;
+    cardEl.classList.add("card-enter");
+    input.focus();
+  }, 360);
+}
+
+// The thin bar under the steps mirrors the backend's live scan progress, so
+// the user can see the index building while they pick their preferences.
+function obSyncProgress(status) {
+  if (!obFill || !obStatusText || !status) return;
+  const p = status.progress;
+  if (typeof p === "number" && p >= 0) {
+    obFill.classList.remove("indeterminate");
+    obFill.style.width = Math.round(p * 100) + "%";
+  } else {
+    obFill.classList.add("indeterminate");
+  }
+  obStatusText.textContent = status.message || "";
+}
+
+if (obNext) obNext.addEventListener("click", obAdvance);
+
+// Theme segmented — same storage as the Settings control; choosing here
+// marks the preference so Settings mirrors it.
+for (const btn of obThemeBtns) {
+  btn.classList.toggle("active", btn.dataset.themeChoice === userTheme);
+  btn.addEventListener("click", () => {
+    userTheme = btn.dataset.themeChoice;
+    localStorage.setItem("fs-theme", userTheme);
+    applyThemeChoice();
+    for (const b of obThemeBtns) b.classList.toggle("active", b === btn);
+  });
+}
+
+// Hotkey segmented — persisted by the backend exactly like Settings.
+if (obHotkeyBtns.length) {
+  invoke("get_hotkey")
+    .then((h) => {
+      for (const btn of obHotkeyBtns)
+        btn.classList.toggle("active", btn.dataset.hotkeyChoice === h);
+    })
+    .catch(() => {});
+  for (const btn of obHotkeyBtns) {
+    btn.addEventListener("click", () => {
+      const want = btn.dataset.hotkeyChoice;
+      invoke("set_hotkey", { name: want })
+        .then(() => {
+          for (const b of obHotkeyBtns) b.classList.toggle("active", b === btn);
+        })
+        .catch((error) => showActionError("Hotkey", error));
+    });
+  }
+}
+
+obShowStep(0);
 
 // The UI is a product surface, not a debug surface: no right-click context
 // menu (WebView2's includes "Inspect"), no devtools shortcuts. Devtools are
@@ -1699,6 +1813,10 @@ window.addEventListener("keydown", async (event) => {
     }
     return;
   }
+
+  // The onboarding owns the screen until it finishes — ignore launcher
+  // shortcuts (Enter would otherwise "open" a stale selection).
+  if (onboardingEl.classList.contains("visible") && !obDone) return;
 
   if (
     event.ctrlKey &&

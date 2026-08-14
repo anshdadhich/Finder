@@ -1,11 +1,11 @@
-﻿{
+{
     "version":  "0.1.0",
     "notes":  "",
     "pub_date":  "2026-08-09T07:49:07.142Z",
     "platforms":  {
                       "windows-x86_64":  {
                                              "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUZGs1SkZSOG5Jak5rcmlyTzEzQmlDNlJxbFcvSEVCY2xZRjU3M0FSdzYzZ3FxQmtReEoxMkYyNVE0dFhFQTltWkpTN2NyZlFtOG9oRUZoVWh6RFk0eFZob0ZwNFJGaGcwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2MjYxNzQ3CWZpbGU6RmFzdFNlZWtfMC4xLjBfeDY0LXNldHVwLmV4ZQpEeVNYY1ZKMkp4azRSVm5LcGJPNUZWajhBNjJscXZZT01rdG1CUmhvRzZMd0VaV2ZnMmQxNDlNb2h4YWt0YjJ6cWg5UUlrT0R2bGRFcE1LK2ZnL2tBUT09Cg==",
-                                             "url":  "https://github.com/anshdadhich/Finder/releases/download/v0.1.0/FastSeek_0.1.0_x64-setup.exe"
+                                             "url":  "https://github.com/anshdadhich/Finder/releases/download/v0.1.0/Finder_0.1.0_x64-setup.exe"
                                          }
                   }
 }

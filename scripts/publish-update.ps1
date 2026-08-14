@@ -13,11 +13,11 @@ $conf = Get-Content (Join-Path $repoRoot "tauri.conf.json") -Raw | ConvertFrom-J
 $version = $conf.package.version
 
 $keyDir = Join-Path $env:USERPROFILE ".tauri"
-$key = Join-Path $keyDir "fastseek.key"
+$key = Join-Path $keyDir "finder.key"
 if (-not (Test-Path $key)) {
   throw "signing key not found at $key - generate one with: cargo tauri signer generate"
 }
-$passwordFile = Join-Path $keyDir "fastseek.key.password"
+$passwordFile = Join-Path $keyDir "finder.key.password"
 if (-not (Test-Path $passwordFile)) {
   throw "key password not found at $passwordFile"
 }
