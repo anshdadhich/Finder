@@ -770,30 +770,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
-name = "fastsearch"
-version = "0.1.0"
-dependencies = [
- "base64 0.21.7",
- "bincode",
- "crossbeam-channel",
- "ctrlc",
- "fuzzy-matcher",
- "image 0.24.9",
- "lz4_flex",
- "memmap2",
- "once_cell",
- "parking_lot",
- "rayon",
- "rustc-hash",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "windows 0.60.0",
- "winreg 0.52.0",
-]
-
-[[package]]
 name = "fax"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -834,6 +810,30 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "finder"
+version = "0.1.0"
+dependencies = [
+ "base64 0.21.7",
+ "bincode",
+ "crossbeam-channel",
+ "ctrlc",
+ "fuzzy-matcher",
+ "image 0.24.9",
+ "lz4_flex",
+ "memmap2",
+ "once_cell",
+ "parking_lot",
+ "rayon",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "windows 0.60.0",
+ "winreg 0.52.0",
+]
 
 [[package]]
 name = "fixedbitset"

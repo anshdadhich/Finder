@@ -1,18 +1,18 @@
 [package]
-name = "fastsearch"
+name = "finder"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "fastsearch"
+name = "finder"
 path = "src/lib.rs"
 
 [[bin]]
-name = "fastsearch"
+name = "finder"
 path = "src/main.rs"
 
 [[bin]]
-name = "fastsearch-gui"
+name = "finder-gui"
 path = "src/gui/main.rs"
 
 [dependencies]

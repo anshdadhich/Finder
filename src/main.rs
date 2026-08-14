@@ -6,12 +6,12 @@ use std::io::{self, Write};
 use parking_lot::RwLock;
 use crossbeam_channel::unbounded;
 
-use fastsearch::index::store::IndexStore;
-use fastsearch::index::search::search;
-use fastsearch::mft::reader::MftReader;
-use fastsearch::mft::watcher::UsnWatcher;
-use fastsearch::mft::types::IndexEvent;
-use fastsearch::utils::drives::get_ntfs_drives;
+use finder::index::store::IndexStore;
+use finder::index::search::search;
+use finder::mft::reader::MftReader;
+use finder::mft::watcher::UsnWatcher;
+use finder::mft::types::IndexEvent;
+use finder::utils::drives::get_ntfs_drives;
 
 fn main() {
     println!("╔══════════════════════════════════╗");
@@ -21,7 +21,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "--apps" {
-        let apps = unsafe { fastsearch::index::apps::get_installed_apps() };
+        let apps = unsafe { finder::index::apps::get_installed_apps() };
         for app in apps {
             println!("{}", app.name);
             if let Some(loc) = app.install_location {
@@ -48,7 +48,7 @@ fn main() {
         match std::fs::File::open(&cache_path) {
             Ok(file) => {
                 let mut dec = lz4_flex::frame::FrameDecoder::new(std::io::BufReader::new(file));
-                match bincode::deserialize_from::<_, fastsearch::index::store::CacheData>(&mut dec) {
+                match bincode::deserialize_from::<_, finder::index::store::CacheData>(&mut dec) {
                             Ok(cache) => {
                                 if cache.entries.is_empty() {
                                     println!("empty cache, rescanning...");
@@ -313,7 +313,7 @@ fn main() {
     // Show apps on startup
     {
         let store = index.read();
-        let apps = fastsearch::index::search::apps(&store, 50);
+        let apps = finder::index::search::apps(&store, 50);
         if !apps.is_empty() {
             println!("📱 Installed Apps ({} shown):", apps.len());
             println!();
@@ -434,7 +434,7 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                 let start = std::time::Instant::now();
 
                 let results: Vec<_> = if let Some(ref ext) = parsed.ext_filter {
-                    use fastsearch::index::search::SearchResult;
+                    use finder::index::search::SearchResult;
                     let dot_ext = format!(".{}", ext);
                     store.entries.iter().filter_map(|entry| {
                         let name = store.name_lower(entry);
@@ -443,12 +443,12 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                         }
                         let kind_ok = match parsed.filter {
                             Filter::All   => true,
-                            Filter::Dirs  => matches!(entry.kind(), fastsearch::mft::types::FileKind::Directory),
-                            Filter::Files => !matches!(entry.kind(), fastsearch::mft::types::FileKind::Directory),
+                            Filter::Dirs  => matches!(entry.kind(), finder::mft::types::FileKind::Directory),
+                            Filter::Files => !matches!(entry.kind(), finder::mft::types::FileKind::Directory),
                         };
                         if !kind_ok { return None; }
 
-                        let full_path = fastsearch::index::search::build_path(
+                        let full_path = finder::index::search::build_path(
                             entry, &store
                         );
 
@@ -466,7 +466,7 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
                             full_path,
                             name: store.name(entry).to_string(),
                             rank: 0,
-                            is_dir: matches!(entry.kind(), fastsearch::mft::types::FileKind::Directory),
+                            is_dir: matches!(entry.kind(), finder::mft::types::FileKind::Directory),
                             modified_time: None,
                             file_type_priority: 0,
                         })
@@ -543,7 +543,7 @@ fn config_dir() -> std::path::PathBuf {
     let dir = std::env::var("APPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir())
-        .join("fastsearch");
+        .join("finder");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -563,7 +563,7 @@ fn save_exclusions(path: &std::path::Path, dirs: &[String]) {
 }
 
 fn persist_cache(
-    cache: &fastsearch::index::store::CacheData,
+    cache: &finder::index::store::CacheData,
     cache_path: &std::path::Path,
     verbose: bool,
 ) {

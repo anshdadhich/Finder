@@ -437,5 +437,5 @@ never be treated as a trust boundary. The surface is small (no remote navigation
 - Logs: `%LOCALAPPDATA%\Finder\log.txt`.
 - Cache/scan timeline example (one machine): 2,885,165 records, read+parse 26.26 s, index
   1.41 s, finalize 0.12 s, save 0.33 s — index ready in 28.13 s.
-- Rebuild loop: quit from tray → `cargo build --release --bin fastsearch-gui` → relaunch
+- Rebuild loop: quit from tray → `cargo build --release --bin finder-gui` → relaunch
   via `Start-Process … -Verb RunAs`.

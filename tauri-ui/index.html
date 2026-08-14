@@ -39,7 +39,13 @@
       <div id="status"><span id="statusText">Indexing...</span><div class="progress"><div id="progressFill"></div></div></div>
 
       <div class="body-container">
-        <section id="results"></section>
+        <section id="results">
+          <div id="scanNotice" class="scan-notice">
+            <div class="scan-notice-icon"></div>
+            <span class="scan-notice-title">Scanning your files…</span>
+            <span class="scan-notice-sub">Apps &amp; settings are ready now — searching gets faster as the index builds</span>
+          </div>
+        </section>
         <div id="empty" class="empty"><span>No results</span><span class="empty-sub">Press Enter to search the web</span></div>
         <aside id="previewPane" class="preview-pane">
           <div class="preview-inner">
@@ -209,57 +215,6 @@
         <div class="scan-actions">
           <button id="scanRetry" class="scan-btn">Try again</button>
           <button id="scanQuit" class="scan-btn secondary">Quit</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- ── State: first-run onboarding — exclusive with #card/#scanState ── -->
-    <div id="onboarding" class="onboarding">
-      <div class="ob-card">
-        <div class="ob-logo"><img src="./logo.png" alt="Finder" /></div>
-        <div class="ob-titles">
-          <h1 class="ob-title">Welcome to Finder</h1>
-          <p class="ob-sub">Your files, one keypress away</p>
-        </div>
-        <div class="ob-steps">
-          <div class="ob-step active" data-step="0">
-            <p class="ob-desc">Search every file on your drives instantly — right from anywhere on Windows.</p>
-            <div class="ob-row">
-              <span class="ob-label">Look</span>
-              <div class="segmented" id="obTheme">
-                <button data-theme-choice="dark">Dark</button>
-                <button data-theme-choice="light">Light</button>
-                <button data-theme-choice="system">System</button>
-              </div>
-            </div>
-          </div>
-          <div class="ob-step" data-step="1">
-            <p class="ob-desc">Summon the launcher with a hotkey, no matter what you're doing.</p>
-            <div class="ob-row">
-              <span class="ob-label">Hotkey</span>
-              <div class="segmented" id="obHotkey">
-                <button data-hotkey-choice="ctrl+space">Ctrl + Space</button>
-                <button data-hotkey-choice="alt+space">Alt + Space</button>
-              </div>
-            </div>
-          </div>
-          <div class="ob-step" data-step="2">
-            <p class="ob-desc">Everything else lives in Settings — open it from the header gear:</p>
-            <ul class="ob-list">
-              <li>Window transparency, blur &amp; corner radius</li>
-              <li>Compact mode for an empty query</li>
-              <li>Preview pane on/off</li>
-              <li>Re-index files anytime</li>
-            </ul>
-          </div>
-        </div>
-        <div class="ob-progress"><div class="ob-fill"></div></div>
-        <p class="ob-status"></p>
-        <div class="ob-foot">
-          <div class="ob-dots">
-            <span class="dot"></span><span class="dot"></span><span class="dot"></span>
-          </div>
-          <button id="obNext" class="ob-next">Continue</button>
         </div>
       </div>
     </div>

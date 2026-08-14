@@ -50,7 +50,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 
-use fastsearch::{
+use finder::{
     index::{search, store::IndexStore},
     mft::{
         reader::MftReader,
@@ -1943,6 +1943,20 @@ fn main() {
                         api.prevent_close();
                     }
                     tauri::WindowEvent::Focused(false) => {
+                        // First run: while the index is being built the
+                        // shell often never grants foreground to a freshly
+                        // elevated process (foreground lock), which fires
+                        // Focused(false) right after setup's show+focus —
+                        // the launcher would vanish before it is seen.
+                        // Hold the window up until the first scan ends.
+                        if event
+                            .window()
+                            .state::<AppState>()
+                            .first_scan
+                            .load(Ordering::Relaxed)
+                        {
+                            return;
+                        }
                         if let Some(window) = event_close_window.lock().as_ref() {
                             if window.is_visible().unwrap_or(false) {
                                 hide_spotlight(window);
@@ -2228,7 +2242,7 @@ fn discover_apps() -> Vec<AppEntry> {
     // launch/icon path comes from DisplayIcon (e.g. "C:\app\app.exe,0") or, as a
     // fallback, the first .exe under InstallLocation. This surfaces installed
     // apps that have no Start Menu shortcut or Store entry.
-    for app in unsafe { fastsearch::index::apps::get_installed_apps() } {
+    for app in unsafe { finder::index::apps::get_installed_apps() } {
         let key = norm_app_name(&app.name);
         if seen.contains(&key) {
             continue;
@@ -2857,7 +2871,7 @@ fn log_app_pool(apps: &[AppEntry]) {
 /// (strip a trailing ",icon-index" and expand env vars; only .exe/.lnk count —
 /// for .ico/.dll icons we hunt for an .exe in the same folder instead), else
 /// InstallLocation.
-fn registry_app_path(app: &fastsearch::index::apps::InstalledApp) -> Option<String> {
+fn registry_app_path(app: &finder::index::apps::InstalledApp) -> Option<String> {
     if let Some(icon) = &app.icon {
         let raw = icon.split(',').next().unwrap_or(icon).trim().trim_matches('"');
         if !raw.is_empty() {
@@ -3335,7 +3349,7 @@ fn start_backend(
 
 fn load_cache_and_catch_up(
     index: &Arc<RwLock<IndexStore>>,
-    drives: &[fastsearch::mft::types::NtfsDrive],
+    drives: &[finder::mft::types::NtfsDrive],
     cache_path: &Path,
 ) -> bool {
     if !cache_path.exists() {
@@ -3347,7 +3361,7 @@ fn load_cache_and_catch_up(
     // frame header check and are rejected below (one fresh rescan).
     let cache = std::fs::File::open(cache_path).ok().and_then(|file| {
         let mut dec = lz4_flex::frame::FrameDecoder::new(std::io::BufReader::new(file));
-        bincode::deserialize_from::<_, fastsearch::index::store::CacheData>(&mut dec).ok()
+        bincode::deserialize_from::<_, finder::index::store::CacheData>(&mut dec).ok()
     });
     match cache {
         Some(cache) => {
@@ -3408,7 +3422,7 @@ fn load_cache_and_catch_up(
 
 fn build_full_index(
     index: &Arc<RwLock<IndexStore>>,
-    drives: &[fastsearch::mft::types::NtfsDrive],
+    drives: &[finder::mft::types::NtfsDrive],
     cache_path: &Path,
     status: &Arc<RwLock<String>>,
     progress: &Arc<AtomicU32>,
