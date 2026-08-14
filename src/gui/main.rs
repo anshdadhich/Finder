@@ -3147,30 +3147,32 @@ fn start_backend(
 
         let (tx, rx) = unbounded();
         let cache_path = index_cache_path();
-        if let Some(dir) = cache_path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         // One-time rebrand migration: the app used to store everything under
         // %LOCALAPPDATA%\FastSeek. Move that whole directory to Finder so the
         // cached index and log survive the rename; afterwards the legacy
         // cache FILENAME may still linger inside (fastseek_cache.bin), which
         // the load below also accepts.
+        let legacy_dir = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("FastSeek");
         {
-            let old_dir = std::env::var_os("LOCALAPPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join("FastSeek");
             let new_dir = cache_path
                 .parent()
                 .and_then(|p| p.parent())
                 .map(PathBuf::from);
-            if old_dir.exists() {
+            if legacy_dir.exists() {
+                // NB: the Finder dir must NOT exist yet — create_dir_all for
+                // the cache path happens AFTER this block, on purpose.
                 if let Some(target) = new_dir {
                     if !target.exists() {
-                        let _ = std::fs::rename(&old_dir, &target);
+                        let _ = std::fs::rename(&legacy_dir, &target);
                     }
                 }
             }
+        }
+        if let Some(dir) = cache_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
         }
         if !cache_path.exists() {
             if legacy_index_cache_path().exists() {
@@ -3183,6 +3185,18 @@ fn start_backend(
                     let _ = std::fs::rename(&old, &cache_path);
                 }
             }
+        }
+        // The directory move above can be skipped when the Finder dir already
+        // exists (e.g. this fix shipped after a first migration run); the
+        // cache file was still lifted out, so sweep the vacated relics
+        // (stale log, marker, empty index/) rather than leaving them behind.
+        if legacy_dir.exists()
+            && !legacy_dir
+                .join("index")
+                .join("fastseek_cache.bin")
+                .exists()
+        {
+            let _ = std::fs::remove_dir_all(&legacy_dir);
         }
 
         // One-time "install" marker: the full-screen welcome/scanning overlay
