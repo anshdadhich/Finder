@@ -162,7 +162,11 @@ fn search_by_ext(
         return (Vec::new(), 0);
     };
 
-    let mut ranked: Vec<(ResultMeta, SearchResult)> = bucket
+    // Rank pass: lean (ResultMeta, idx) rows only. The full path is built
+    // (and dropped) here because `user`/`depth` are sort keys, but names and
+    // PathBufs are only materialized for the ~limit visible rows after the
+    // page is sliced.
+    let mut ranked: Vec<(ResultMeta, u32)> = bucket
         .par_iter()
         .filter_map(|&idx| {
             let entry = &store.entries[idx as usize];
@@ -199,14 +203,7 @@ fn search_by_ext(
                     name_len,
                     ext_prio: 0, // every row shares the queried extension
                 },
-                SearchResult {
-                    full_path,
-                    name: store.name(entry).to_string(),
-                    rank: base_rank,
-                    is_dir: entry.is_dir(),
-                    modified_time: None,
-                    file_type_priority: 0,
-                },
+                idx,
             ))
         })
         .collect();
@@ -217,7 +214,26 @@ fn search_by_ext(
         .into_iter()
         .skip(skip)
         .take(limit)
-        .map(|(_, r)| r)
+        .filter_map(|(_, idx)| {
+            let entry = &store.entries[idx as usize];
+            let full_path = build_path(entry, store);
+            let name_lower = store.name_lower(entry);
+            let base_rank = if name_lower == q {
+                1u8
+            } else if name_lower.starts_with(q) {
+                2
+            } else {
+                3
+            };
+            Some(SearchResult {
+                full_path,
+                name: store.name(entry).to_string(),
+                rank: base_rank,
+                is_dir: entry.is_dir(),
+                modified_time: None,
+                file_type_priority: 0,
+            })
+        })
         .collect();
     (results, total)
 }
@@ -413,7 +429,13 @@ fn fuzzy_fill(
     limit: usize,
 ) {
     use fuzzy_matcher::FuzzyMatcher;
-    let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+    use std::cmp::Reverse;
+
+    // SkimMatcherV2 carries internal fuzzy state — constructing it once per
+    // process instead of once per query is the bigger win here.
+    static MATCHER: std::sync::OnceLock<fuzzy_matcher::skim::SkimMatcherV2> =
+        std::sync::OnceLock::new();
+    let matcher = MATCHER.get_or_init(fuzzy_matcher::skim::SkimMatcherV2::default);
 
     let need = (limit - results.len()).min(200);
     if need == 0 {
@@ -423,24 +445,58 @@ fn fuzzy_fill(
     let entries = &store.entries;
     let name_lower_arena = &store.name_lower_arena;
 
-    let mut best: Vec<(i64, u32)> = entries
-        .par_iter()
-        .enumerate()
-        .filter_map(|(idx, entry)| {
-            if used_refs.contains(&entry.file_ref) {
-                return None;
+    // Bounded top-K: each worker keeps a min-heap (Reverse) of at most
+    // `need` entries and pops the worst (lowest score, then largest arena
+    // index) on overflow — identical to collecting all, sorting, and
+    // truncating, but O(K) memory per worker instead of O(matches).
+    let mut best: Vec<(i64, u32)> = {
+        let merge = |mut a: std::collections::BinaryHeap<Reverse<(i64, Reverse<u32>)>>,
+                     mut b: std::collections::BinaryHeap<Reverse<(i64, Reverse<u32>)>>| {
+            if a.len() < b.len() {
+                std::mem::swap(&mut a, &mut b);
             }
-            let n = unsafe {
-                std::str::from_utf8_unchecked(
-                    &name_lower_arena[entry.name_lower_off as usize
-                        ..(entry.name_lower_off as usize + entry.name_lower_len as usize)],
-                )
-            };
-            matcher.fuzzy_match(n, q).map(|score| (score, idx as u32))
-        })
-        .collect();
-    best.par_sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    best.truncate(need);
+            for item in b {
+                a.push(item);
+                if a.len() > need {
+                    a.pop();
+                }
+            }
+            a
+        };
+        entries
+            .par_iter()
+            .enumerate()
+            .fold(
+                || std::collections::BinaryHeap::new(),
+                |mut heap, (idx, entry)| {
+                    if !used_refs.contains(&entry.file_ref) {
+                        let n = unsafe {
+                            std::str::from_utf8_unchecked(
+                                &name_lower_arena[entry.name_lower_off as usize
+                                    ..(entry.name_lower_off as usize
+                                        + entry.name_lower_len as usize)],
+                            )
+                        };
+                        if let Some(score) = matcher.fuzzy_match(n, q) {
+                            heap.push(Reverse((score, Reverse(idx as u32))));
+                            if heap.len() > need {
+                                heap.pop();
+                            }
+                        }
+                    }
+                    heap
+                },
+            )
+            .reduce(
+                || std::collections::BinaryHeap::new(),
+                |a, b| merge(a, b),
+            )
+            .into_iter()
+            .map(|Reverse((score, Reverse(idx)))| (score, idx))
+            .collect()
+    };
+    // Restore the exact deterministic order the old full-collect sort had.
+    best.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
     for (_, idx) in best {
         if results.len() >= limit {

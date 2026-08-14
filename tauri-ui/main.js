@@ -625,7 +625,7 @@ function renderNow() {
         el.dataset.path = item.path;
         el._item = item;
         if (el._expr !== item.expr) {
-          el._tokensEl.innerHTML = mathTokens(item.expr);
+          el._tokensEl.replaceChildren(mathTokens(item.expr));
           el._expr = item.expr;
         }
         if (el._value !== item.value) {
@@ -986,6 +986,7 @@ function stopGlassLoop() {
 
 function applyBackdrop(g) {
   if (!g || !g.uri || !glassLayerEl) return;
+  if (!/^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(g.uri)) return;
   glassBackdrop = { uri: g.uri, w: g.w_css, h: g.h_css };
   glassLayerEl.style.backgroundImage = `url("${g.uri}")`;
   glassRect = null;
@@ -1181,17 +1182,20 @@ function tryMath(query) {
 // operators as red symbols (× ÷), exactly like a calculator's readout.
 function mathTokens(expr) {
   const parts = expr.split(/([+\-*/%^])/g).filter((t) => t.trim() !== "");
-  let html = "";
+  const frag = document.createDocumentFragment();
   for (const part of parts) {
     const t = part.trim();
+    const span = document.createElement("span");
     if (/^[+\-*/%^]$/.test(t)) {
-      const sym = t === "*" ? "×" : t === "/" ? "÷" : t;
-      html += `<span class="tag-op">${sym}</span>`;
+      span.className = "tag-op";
+      span.textContent = t === "*" ? "×" : t === "/" ? "÷" : t;
     } else {
-      html += `<span class="tag-num">${t}</span>`;
+      span.className = "tag-num";
+      span.textContent = t;
     }
+    frag.appendChild(span);
   }
-  return html;
+  return frag;
 }
 
 async function copyText(text) {

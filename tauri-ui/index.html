@@ -4,17 +4,9 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FastSeek</title>
-    <script>
-      // Theme is FOLLOWED from the OS, not chosen by the user. A manual
-      // dark/light choice in Settings overrides it (fs-theme). Read before
-      // first paint so there is no flash of the wrong scheme.
-      document.documentElement.setAttribute(
-        "data-theme",
-        (localStorage.getItem("fs-theme") || "system") === "system"
-          ? matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"
-          : localStorage.getItem("fs-theme")
-      );
-    </script>
+    <!-- Theme must set before first paint; external file so script-src 'self'
+         (CSP) can stay strict — inline script blocks would be blocked by it. -->
+    <script src="./theme.js"></script>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>

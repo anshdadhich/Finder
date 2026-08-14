@@ -298,6 +298,11 @@ impl MftReader {
 
                 let name_offset = record.FileNameOffset as usize;
                 let name_len = record.FileNameLength as usize / 2;
+                // Same guard the watcher applies: the name must live inside
+                // the record — malformed input must never reach from_raw_parts.
+                if name_offset + name_len * 2 > rec_len {
+                    break;
+                }
                 let name_ptr = unsafe {
                     buffer.as_ptr().add(offset + name_offset) as *const u16
                 };
@@ -447,7 +452,9 @@ impl MftReader {
                 break;
             }
     
-            if atype == 0x30 && record[aoff + 8] == 0 {
+            // Resident attribute header is 22 bytes — guard before indexing
+            // [aoff+8 .. aoff+22] (crafted MFT media must not panic the scan).
+            if atype == 0x30 && alen >= 22 && record[aoff + 8] == 0 {
                 let vlen =
                     u32::from_le_bytes(record[aoff + 16..aoff + 20].try_into().unwrap()) as usize;
     

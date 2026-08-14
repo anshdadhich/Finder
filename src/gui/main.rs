@@ -121,7 +121,7 @@ struct UiResult {
     name: String,
     path: String,
     is_dir: bool,
-    kind: String,
+    kind: &'static str,
     rank: u8,
 }
 
@@ -158,7 +158,7 @@ fn get_all_apps(state: tauri::State<AppState>) -> Vec<UiResult> {
             name: app.name.clone(),
             path: app.path.clone(),
             is_dir: false,
-            kind: "app".to_string(),
+            kind: "app",
             rank: 0,
         })
         .collect()
@@ -209,7 +209,7 @@ async fn search_files(
                     name: r.name,
                     path: r.full_path.to_string_lossy().to_string(),
                     is_dir: r.is_dir,
-                    kind: if r.is_dir { "dir".to_string() } else { "file".to_string() },
+                    kind: if r.is_dir { "dir" } else { "file" },
                     rank: r.rank,
                 })
                 .collect(),
@@ -252,7 +252,7 @@ fn search_apps(query: String, state: tauri::State<AppState>) -> Vec<UiResult> {
             name: app.name.clone(),
             path: app.path.clone(),
             is_dir: false,
-            kind: "app".to_string(),
+            kind: "app",
             rank,
         })
         .collect()
@@ -406,6 +406,14 @@ fn launch_uwp_elevated(aumid_rest: &str) -> Result<(), String> {
     if pfn.is_empty() {
         return Err(format!("no package mapping for '{}'", aumid_rest));
     }
+    // Package family names are a strict charset; anything else is a forged
+    // renderer value and must never reach a PowerShell script.
+    if !pfn
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return Err(format!("invalid package family name: '{}'", pfn));
+    }
     let script = format!(
         r#"$p = Get-AppxPackage | Where-Object {{ $_.PackageFamilyName -eq '{pfn}' }} | Select-Object -First 1;
 if (-not $p -or -not $p.InstallLocation) {{ exit 1 }}
@@ -413,9 +421,13 @@ $exe = Get-ChildItem -Path $p.InstallLocation -Recurse -Filter '{exe}' -ErrorAct
 if (-not $exe) {{ exit 1 }}
 Start-Process -FilePath $exe.FullName -Verb RunAs"#
     );
+    // -EncodedCommand: the script travels as base64(UTF-16LE), so no
+    // character in it can ever be re-parsed as PowerShell syntax.
+    let encoded: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&encoded);
     let out = std::process::Command::new("powershell")
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW — no console flash
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
         .output()
         .map_err(|e| e.to_string())?;
     if out.status.success() {
@@ -487,32 +499,48 @@ fn autostart_enabled() -> bool {
 /// folder — no admin, no UAC at login, runs unelevated with the session).
 #[tauri::command]
 fn set_autostart(enabled: bool) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
     let lnk = autostart_lnk();
     if !enabled {
         let _ = std::fs::remove_file(&lnk);
         return Ok(());
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let target = exe.to_string_lossy().to_string();
+    // IShellLinkW + IPersistFile write the .lnk directly — no PowerShell,
+    // no shell string interpolation anywhere in this path.
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, IPersistFile,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
+        .map_err(|e| e.to_string())?;
+    let target: Vec<u16> = exe
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let dir = exe
         .parent()
         .map(|d| d.to_string_lossy().to_string())
         .unwrap_or_default();
-    let lnk_str = lnk.to_string_lossy().to_string();
-    let script = format!(
-        r#"$w = New-Object -ComObject WScript.Shell; $s = $w.CreateShortcut('{lnk_str}'); $s.TargetPath = '{target}'; $s.WorkingDirectory = '{dir}'; $s.Save()"#
-    );
-    let out = std::process::Command::new("powershell")
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW — no console flash
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    let wdir: Vec<u16> = dir.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        link.SetPath(PCWSTR(target.as_ptr()))
+            .map_err(|e| e.to_string())?;
+        link.SetWorkingDirectory(PCWSTR(wdir.as_ptr()))
+            .map_err(|e| e.to_string())?;
     }
+    let persist = link.cast::<IPersistFile>().map_err(|e| e.to_string())?;
+    let lnk_wide: Vec<u16> = lnk.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        persist
+            .Save(PCWSTR(lnk_wide.as_ptr()), true) // fRemember = true
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Base64 data URI for an image file so the preview pane can show the
@@ -521,11 +549,7 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
 #[tauri::command]
 fn image_data(path: String) -> Result<Option<String>, String> {
     use std::io::Read;
-    let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-    let meta = file.metadata().map_err(|e| e.to_string())?;
-    if meta.len() > 16 * 1024 * 1024 {
-        return Ok(None);
-    }
+    // Extension gate BEFORE anything is opened.
     let ext = path
         .rsplit('.')
         .next()
@@ -541,8 +565,28 @@ fn image_data(path: String) -> Result<Option<String>, String> {
         "ico" => "image/x-icon",
         _ => return Ok(None),
     };
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    // No ADS tricks (file.png:secret) and no device/UNC-name paths.
+    if path.rsplit(['\\', '/']).next().unwrap_or("").contains(':') {
+        return Ok(None);
+    }
+    // symlink_metadata: reject symlinks, directories, devices and pipes —
+    // only a plain regular file is ever read (and encoded).
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return Ok(None);
+    };
+    if !meta.file_type().is_file() {
+        return Ok(None);
+    }
+    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    // Hard cap at read time too — no TOCTOU between a metadata check and
+    // the read (a growing file cannot blow past 16 MB anymore).
+    let mut bytes = Vec::with_capacity(meta.len().min(16 * 1024 * 1024) as usize);
+    file.take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Ok(None);
+    }
     Ok(Some(format!(
         "data:{};base64,{}",
         mime,
@@ -1758,10 +1802,21 @@ fn show_spotlight(window: &tauri::Window) {
 fn hotkey_name() -> String {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
     use winreg::RegKey;
-    RegKey::predef(HKEY_CURRENT_USER)
+    let name = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey_with_flags(r"Software\FastSeek", KEY_READ)
         .and_then(|k| k.get_value("Hotkey"))
-        .unwrap_or_else(|_| "ctrl+space".to_string())
+        .unwrap_or_else(|_| "ctrl+space".to_string());
+    // The registry value is user-writable — validate it exactly like the
+    // runtime setter does, else a garbage value would leave boot with no
+    // registered hotkey at all.
+    if name != "ctrl+space" && name != "alt+space" {
+        log_line(&format!(
+            "hotkey: rejecting invalid persisted value {:?}, using ctrl+space",
+            name
+        ));
+        return "ctrl+space".to_string();
+    }
+    name
 }
 
 fn set_hotkey_name(name: &str) {
@@ -2968,11 +3023,14 @@ fn load_cache_and_catch_up(
         return false;
     }
 
-    match std::fs::read(cache_path)
-        .ok()
-        .and_then(|compressed| lz4_flex::decompress_size_prepended(&compressed).ok())
-        .and_then(|bytes| bincode::deserialize::<fastsearch::index::store::CacheData>(&bytes).ok())
-    {
+    // v3 cache layout: lz4 frame stream, deserialized straight off disk —
+    // no full-blob decompress allocation. Old prepended-size caches fail the
+    // frame header check and are rejected below (one fresh rescan).
+    let cache = std::fs::File::open(cache_path).ok().and_then(|file| {
+        let mut dec = lz4_flex::frame::FrameDecoder::new(std::io::BufReader::new(file));
+        bincode::deserialize_from::<_, fastsearch::index::store::CacheData>(&mut dec).ok()
+    });
+    match cache {
         Some(cache) => {
             if cache.entries.is_empty() {
                 let _ = std::fs::remove_file(cache_path);
@@ -3127,17 +3185,25 @@ fn build_full_index(
     let _ = writeln!(io::stderr(), "FastSeek index ready in {:.2}s", total_secs);
 }
 
+/// Serialize the cache straight into an lz4 frame on disk — one pass, no
+/// full-size intermediates. The snapshot clone is kept so the read lock is
+/// released before serialization runs (searches never block on a save).
 fn save_cache(index: &Arc<RwLock<IndexStore>>, cache_path: &Path) {
-    let store = index.read();
-    if store.entries.is_empty() {
-        return;
-    }
-
-    let cache = store.to_cache();
-    if let Ok(bytes) = bincode::serialize(&cache) {
-        let compressed = lz4_flex::compress_prepend_size(&bytes);
-        let _ = write_atomic(cache_path, &compressed);
-    }
+    let cache = {
+        let store = index.read();
+        if store.entries.is_empty() {
+            return;
+        }
+        store.to_cache()
+    };
+    let _ = write_atomic_with(cache_path, |tmp| {
+        let file = std::fs::File::create(tmp)?;
+        let mut enc = lz4_flex::frame::FrameEncoder::new(std::io::BufWriter::new(file));
+        bincode::serialize_into(&mut enc, &cache)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, Box::new(e)))?;
+        enc.finish().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(())
+    });
 }
 
 /// Path of the one-time install marker that gates the first-run overlay.
@@ -3318,14 +3384,22 @@ fn uninstall_app(name: String, path: String) -> Result<(), String> {
     let _ = target; // (kept for potential future UWP package mapping)
     if let Some(entry) = find_uninstall_entry(&name) {
         if let Some(cmd) = entry.uninstall_string.or(entry.quiet_uninstall_string) {
-            // cmd is a console app — hide its window (same flash issue as
-            // the PowerShell helpers).
-            use std::os::windows::process::CommandExt;
-            std::process::Command::new("cmd")
-                .creation_flags(0x0800_0000)
-                .args(["/C", &cmd])
-                .spawn()
-                .map_err(|e| e.to_string())?;
+            // Registry UninstallString runs DIRECTLY (no cmd.exe): the first
+            // token is parsed quote-aware as the executable and the rest is
+            // passed raw to the child's own argv parser — no shell
+            // metacharacter chaining is possible.
+            if let Some((exe, args)) = split_uninstall_command(&cmd) {
+                if !uninstall_exe_allowed(&exe) {
+                    return Err(format!("unsafe uninstall command: {}", exe));
+                }
+                let mut c = std::process::Command::new(&exe);
+                c.creation_flags(0x0800_0000); // no console flash
+                if !args.is_empty() {
+                    use std::os::windows::process::CommandExt;
+                    c.raw_arg(&args);
+                }
+                c.spawn().map_err(|e| e.to_string())?;
+            }
             return Ok(());
         }
     }
@@ -3334,6 +3408,70 @@ fn uninstall_app(name: String, path: String) -> Result<(), String> {
         .arg("ms-settings:appsfeatures")
         .spawn();
     Ok(())
+}
+
+/// Quote-aware split of a registry UninstallString into (executable, args).
+/// Only the FIRST token (the exe) is parsed — everything after it is passed
+/// through untouched, so embedded quotes/escapes survive for the child's own
+/// CommandLineToArgvW-equivalent parsing.
+fn split_uninstall_command(cmdline: &str) -> Option<(String, String)> {
+    let s = cmdline.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    let (exe, rest) = if s.starts_with('"') {
+        let mut exe = String::new();
+        let mut rest = String::new();
+        let mut it = s[1..].char_indices();
+        let mut in_quotes = true;
+        while let Some((i, c)) = it.next() {
+            if !in_quotes {
+                rest = s[1 + i..].trim_start().to_string();
+                break;
+            }
+            match c {
+                '"' => {
+                    in_quotes = false;
+                    if it.as_str().is_empty() {
+                        break;
+                    }
+                }
+                '\\' if it.clone().next().map(|(_, n)| n == '"').unwrap_or(false) => {
+                    it.next();
+                    exe.push('"');
+                }
+                _ => exe.push(c),
+            }
+        }
+        if in_quotes {
+            // Unterminated quote: treat the whole string as the executable.
+            (exe, String::new())
+        } else {
+            (exe, rest)
+        }
+    } else {
+        let sp = s.find(char::is_whitespace).unwrap_or(s.len());
+        (s[..sp].to_string(), s[sp..].trim_start().to_string())
+    };
+    (!exe.is_empty()).then_some((exe, rest))
+}
+
+/// Refuse to run script interpreters / argument-chaining hosts as
+/// uninstallers — a planted registry entry must not be able to reach a
+/// shell. msiexec stays allowed (MSI uninstalls are the canonical case),
+/// and bare (PATH-resolved) names are refused for anything else.
+fn uninstall_exe_allowed(exe: &str) -> bool {
+    let stem = std::path::Path::new(exe)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let interpreter = matches!(
+        stem.as_str(),
+        "cmd" | "powershell" | "pwsh" | "wscript" | "cscript" | "mshta" | "rundll32"
+            | "regsvr32"
+    );
+    let bare = !exe.contains('\\') && !exe.contains('/');
+    !interpreter && !(bare && stem != "msiexec")
 }
 
 struct UninstallEntry {
@@ -3352,11 +3490,14 @@ fn find_uninstall_entry(app_name: &str) -> Option<UninstallEntry> {
     if want.is_empty() {
         return None;
     }
+    // HKLM first: admin-written entries are trusted. HKCU entries are
+    // user-writable (any process can plant a fake one), so they only win
+    // when no system entry exists — per-user apps keep their uninstall.
     const SUB: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
     let bases = [
-        (HKEY_CURRENT_USER, SUB.to_string()),
         (HKEY_LOCAL_MACHINE, SUB.to_string()),
         (HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall".to_string()),
+        (HKEY_CURRENT_USER, SUB.to_string()),
     ];
     for (hive, base) in bases {
         let Ok(root) = RegKey::predef(hive).open_subkey_with_flags(&base, KEY_READ) else {
@@ -3433,11 +3574,14 @@ fn first_run_marker() -> PathBuf {
     base.join("FastSeek").join("first-run-complete")
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_atomic_with(
+    path: &Path,
+    write: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let _guard = SAVE_LOCK.lock();
     let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
-    std::fs::write(&tmp, bytes)?;
+    write(&tmp)?;
     match std::fs::rename(&tmp, path) {
         Ok(_) => Ok(()),
         Err(_) => {

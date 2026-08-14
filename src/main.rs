@@ -45,11 +45,10 @@ fn main() {
     let cache_loaded = if cache_path.exists() {
         print!("Loading cached index... ");
         io::stdout().flush().unwrap();
-        match std::fs::read(&cache_path) {
-            Ok(compressed) => {
-                match lz4_flex::decompress_size_prepended(&compressed) {
-                    Ok(bytes) => {
-                        match bincode::deserialize::<fastsearch::index::store::CacheData>(&bytes) {
+        match std::fs::File::open(&cache_path) {
+            Ok(file) => {
+                let mut dec = lz4_flex::frame::FrameDecoder::new(std::io::BufReader::new(file));
+                match bincode::deserialize_from::<_, fastsearch::index::store::CacheData>(&mut dec) {
                             Ok(cache) => {
                                 if cache.entries.is_empty() {
                                     println!("empty cache, rescanning...");
@@ -132,9 +131,6 @@ fn main() {
                             }
                             Err(_) => { println!("cache corrupt, rescanning..."); false }
                         }
-                    }
-                    Err(_) => { println!("cache corrupt, rescanning..."); false }
-                }
             }
             Err(_) => { println!("cache unreadable, rescanning..."); false }
         }
