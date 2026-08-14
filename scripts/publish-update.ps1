@@ -1,4 +1,4 @@
-# Publishes a FastSeek update to users.
+# Publishes a Finder update to users.
 #
 #  1. Bump "version" in tauri.conf.json (e.g. 0.1.0 -> 0.2.0).
 #  2. Optionally drop release notes into notes.txt (repo root).

@@ -8,7 +8,7 @@
     "withGlobalTauri": true
   },
   "package": {
-    "productName": "FastSeek",
+    "productName": "Finder",
     "version": "0.1.0"
   },
   "tauri": {
@@ -28,7 +28,7 @@
     },
     "bundle": {
       "active": false,
-      "identifier": "com.fastseek.search",
+      "identifier": "com.finder.search",
       "icon": ["icons/icon.ico"]
     },
     "systemTray": {
@@ -50,7 +50,7 @@
     },
     "windows": [
       {
-        "title": "FastSeek",
+        "title": "Finder",
         "width": 1050,
         "height": 690,
         "center": false,

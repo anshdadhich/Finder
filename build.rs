@@ -1,7 +1,7 @@
 fn main() {
     // Elevation is required to read the NTFS MFT (SeBackupPrivilege); without
     // it the scan finds zero records and the app would present an empty,
-    // useless index. FastSeek ALWAYS runs elevated, so the requireAdministrator
+    // useless index. Finder ALWAYS runs elevated, so the requireAdministrator
     // manifest is embedded unconditionally on Windows. The `embed-resources`
     // cargo feature is retained (older builds/scripts still pass it) but is no
     // longer required for elevation.

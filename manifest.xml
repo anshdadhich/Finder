@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <!-- FastSeek is a pure x64 app; elevation (requireAdministrator) is required
+  <!-- Finder is a pure x64 app; elevation (requireAdministrator) is required
        to read the NTFS MFT. The Common-Controls v6 dependency is CRITICAL:
        without it Windows loads legacy comctl32.dll v5 and the app fails at
        startup with "procedure entry point TaskDialogIndirect could not be
@@ -11,7 +11,7 @@
     name="fastsearch"
     type="win32"
   />
-  <description>FastSeek - Instant File Search</description>
+  <description>Finder - Instant File Search</description>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity

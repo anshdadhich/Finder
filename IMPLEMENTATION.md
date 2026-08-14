@@ -1,6 +1,6 @@
-# FastSeek — Implementation Details
+# Finder — Implementation Details
 
-A comprehensive record of how FastSeek works under the hood — every subsystem with its real
+A comprehensive record of how Finder works under the hood — every subsystem with its real
 data structures, algorithms, memory profile, and security posture. Written from the code
 (source at `src/`, UI at `tauri-ui/`), shipping state as of commit `ca100d5`.
 
@@ -8,7 +8,7 @@ data structures, algorithms, memory profile, and security posture. Written from 
 
 ## 1. Overview
 
-FastSeek is a Windows-native launcher in the style of Spotlight/Raycast.
+Finder is a Windows-native launcher in the style of Spotlight/Raycast.
 
 - **Backend**: Rust + Tauri v1 (WebView2 for the UI), `windows` 0.60 crate for Win32, raw
   NTFS MFT scanning for whole-drive indexing (~3M records in ~28 s), Win32 global hotkey
@@ -46,13 +46,13 @@ FastSeek is a Windows-native launcher in the style of Spotlight/Raycast.
    overwrite the original.
 2. **Single-instance**: a named mutex; a second instance pokes the first (shows the launcher)
    and exits.
-3. **Logging**: `%LOCALAPPDATA%\FastSeek\log.txt`, monotonic `+seconds.millis pid=…` lines.
+3. **Logging**: `%LOCALAPPDATA%\Finder\log.txt`, monotonic `+seconds.millis pid=…` lines.
 4. **Index load** (`store.rs::from_cache`): cache file read, arenas travel byte-for-byte;
    only `ref_lookup` + `ext_index` are rebuilt (parallel). Cache format is versioned with a
    magic; foreign formats are rejected (a stale/older version triggers a fresh scan).
 5. **App pool** (`apps.rs`): WinRT `GetInstalledApps`-style enumeration **plus** Start Menu
    `.lnk` scanning; each app logs `app-pool | name | aumid/target | score`.
-6. **Hotkey**: reads `HKCU\Software\FastSeek\Hotkey` (default `ctrl+space`), spawns the
+6. **Hotkey**: reads `HKCU\Software\Finder\Hotkey` (default `ctrl+space`), spawns the
    dedicated message loop thread: `RegisterHotKey` + `GetMessage` + tray icon +
    `CreateWindowExW` hidden hotkey window (log `hotkey registered: …`).
 7. **Watchers** (`watcher.rs`): opens the USN journal per drive (log `index ready —
@@ -167,8 +167,8 @@ HWND type.
 | Preview pane | `localStorage fs-preview-hidden` | — | body class `preview-off` |
 | Instant math | `localStorage fs-math` | — | local evaluator (no IPC) |
 | Compact mode | `localStorage fs-compact` | — | body class `compact-empty` (query empty) → 400px slim bar, normal placement |
-| Summon hotkey | `HKCU\Software\FastSeek\Hotkey` | `get_hotkey`/`set_hotkey` | unregister old + register new live; only `ctrl+space`/`alt+space` (Win+Space reserved) |
-| Start with Windows | Startup folder .lnk | `get_autostart`/`set_autostart` | WScript.Shell → `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\FastSeek.lnk` |
+| Summon hotkey | `HKCU\Software\Finder\Hotkey` | `get_hotkey`/`set_hotkey` | unregister old + register new live; only `ctrl+space`/`alt+space` (Win+Space reserved) |
+| Start with Windows | Startup folder .lnk | `get_autostart`/`set_autostart` | WScript.Shell → `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Finder.lnk` |
 
 **Settings panel** (redesigned): full-width flat panel that takes over the card below the
 search bar (results + preview hidden) — APPEARANCE / WINDOW / BEHAVIOR muted uppercase
@@ -407,7 +407,7 @@ never be treated as a trust boundary. The surface is small (no remote navigation
 | 5 | Low/Medium | `set_autostart` interpolates self-derived paths into a PowerShell single-quoted script with no `'` escaping — a path containing `'` breaks or mutates the script. | `main.rs:503–509` | Escape `'` as `''` (or use `-EncodedCommand`) | ✅ **Fixed** — PowerShell removed entirely; `IShellLinkW` + `IPersistFile` write the `.lnk` directly |
 | 6 | Low (DoS, elevated) | `parse_file_record` reads `record[aoff+16..aoff+22]` with no `alen >= 22` guard → a malformed MFT record (crafted USB/VHD) panics the scan thread. | `reader.rs:437–455` | Add `aoff + 22 <= record.len()` / `alen >= 24` guards | ✅ **Fixed** — `alen >= 22` gate before the resident-attribute header reads |
 | 7 | Low (UB) | FSCTL-fallback scan builds a `u16` slice via `from_raw_parts` from kernel offsets without the watcher's bounds check (`name_offset > rec_len \|\| name_bytes > rec_len - name_offset`). | `reader.rs:288–318` vs `watcher.rs:457` | Copy the watcher's check before `from_raw_parts` | ✅ **Fixed** — `name_offset + name_len*2 > rec_len → break` before `from_raw_parts` |
-| 8 | Low (DoS) | Startup hotkey is read from `HKCU\Software\FastSeek\Hotkey` without the runtime allowlist check — any same-user process can write a garbage accelerator and break summon at boot. | `main.rs:1758–1765` vs `1786` | Validate `hotkey_name()` against the same allowlist before `register` | ✅ **Fixed** — validated at read; invalid values rejected with a log line and ctrl+space fallback |
+| 8 | Low (DoS) | Startup hotkey is read from `HKCU\Software\Finder\Hotkey` without the runtime allowlist check — any same-user process can write a garbage accelerator and break summon at boot. | `main.rs:1758–1765` vs `1786` | Validate `hotkey_name()` against the same allowlist before `register` | ✅ **Fixed** — validated at read; invalid values rejected with a log line and ctrl+space fallback |
 | 9 | Low (defense-in-depth) | `mathTokens()` is the only `innerHTML` with interpolated values (math-only input today — `MATH_RE` filters it); `glassLayerEl.style.backgroundImage` is the only CSS-string sink (Rust-built `data:image/jpeg;base64,` today). | `main.js:628, 990` | Build tokens with `createElement`/`textContent`; JS-side check of the `data:image/jpeg;base64,` prefix | ✅ **Fixed** — tokens built as DOM nodes (`replaceChildren`), backdrop URI regex-gated before assignment |
 | 10 | Info | Elevated-by-design (full-drive index + `runas` launches); updater signed, https-only, passive — correct as-is. | everywhere / `tauri.conf.json:38–47` | Documented tradeoff; #1–#4 keep the renderer path hardened | ✅ as-is |
 
@@ -434,7 +434,7 @@ never be treated as a trust boundary. The surface is small (no remote navigation
 
 - The exe cannot be overwritten while running (it's elevated) — quit from the tray before
   rebuilding.
-- Logs: `%LOCALAPPDATA%\FastSeek\log.txt`.
+- Logs: `%LOCALAPPDATA%\Finder\log.txt`.
 - Cache/scan timeline example (one machine): 2,885,165 records, read+parse 26.26 s, index
   1.41 s, finalize 0.12 s, save 0.33 s — index ready in 28.13 s.
 - Rebuild loop: quit from tray → `cargo build --release --bin fastsearch-gui` → relaunch

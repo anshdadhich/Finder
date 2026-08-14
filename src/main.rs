@@ -15,7 +15,7 @@ use fastsearch::utils::drives::get_ntfs_drives;
 
 fn main() {
     println!("╔══════════════════════════════════╗");
-    println!("║       FastSeek - File Search      ║");
+    println!("║       Finder - File Search      ║");
     println!("╚══════════════════════════════════╝");
     println!();
 
@@ -39,7 +39,7 @@ fn main() {
 
     let index: Arc<RwLock<IndexStore>> = Arc::new(RwLock::new(IndexStore::new()));
     let (tx, rx) = unbounded();
-    let cache_path = std::env::temp_dir().join("fastseek_cache.bin");
+    let cache_path = std::env::temp_dir().join("finder_cache.bin");
 
     // --- Try loading from cache ---
     let cache_loaded = if cache_path.exists() {
@@ -306,7 +306,7 @@ fn main() {
             }
             store.to_cache()
         };
-        persist_cache(&cache, &std::env::temp_dir().join("fastseek_cache.bin"), false);
+        persist_cache(&cache, &std::env::temp_dir().join("finder_cache.bin"), false);
         std::process::exit(0);
     }).ok();
 
@@ -372,9 +372,9 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
             }
 
             "rescan" => {
-                let cache_path = std::env::temp_dir().join("fastseek_cache.bin");
+                let cache_path = std::env::temp_dir().join("finder_cache.bin");
                 let _ = std::fs::remove_file(&cache_path);
-                println!("Cache cleared. Restart fastseek to rescan.\n");
+                println!("Cache cleared. Restart Finder to rescan.\n");
             }
 
             "case" => {

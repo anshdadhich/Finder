@@ -1612,7 +1612,7 @@ async function refreshStatus() {
         setState("scan");
         scanTitle.textContent = "Index unavailable";
         scanSub.textContent =
-          "FastSeek could not read any files. Make sure it is running as Administrator, then try again.";
+          "Finder could not read any files. Make sure it is running as Administrator, then try again.";
         scanStatusText.textContent = status.message || "Index unavailable";
         return;
       }
@@ -1907,7 +1907,7 @@ const updateBtnEl = document.querySelector("#updateBtn");
 const updateDismissEl = document.querySelector("#updateDismiss");
 const updateProgressEl = document.querySelector("#updateProgress");
 const UPDATE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-const UPDATE_KEY = "fastseek_last_update_check";
+const UPDATE_KEY = "finder_last_update_check";
 let updateInProgress = false;
 
 function hideUpdateBanner() {

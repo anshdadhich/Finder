@@ -753,7 +753,7 @@ $c = $u.GetColorValue([Windows.UI.ViewManagement.UIColorType]::Accent)
 fn autostart_lnk() -> std::path::PathBuf {
     std::env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
-        .map(|p| p.join(r"Microsoft\Windows\Start Menu\Programs\Startup\FastSeek.lnk"))
+        .map(|p| p.join(r"Microsoft\Windows\Start Menu\Programs\Startup\Finder.lnk"))
         .unwrap_or_default()
 }
 
@@ -865,7 +865,7 @@ fn icon_cache_dir() -> std::path::PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    base.join("FastSeek").join("icons")
+    base.join("Finder").join("icons")
 }
 
 fn icon_disk_path(path: &str) -> std::path::PathBuf {
@@ -1757,7 +1757,7 @@ fn looks_like_url(value: &str) -> bool {
         || lower.contains(".org")
 }
 
-/// Append a lifecycle line to %LOCALAPPDATA%\FastSeek\log.txt — the tray
+/// Append a lifecycle line to %LOCALAPPDATA%\Finder\log.txt — the tray
 /// app has no console, so this file is the only place panic/exit evidence
 /// survives.
 fn log_line(msg: &str) {
@@ -1770,7 +1770,7 @@ fn log_line(msg: &str) {
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(base.join("FastSeek").join("log.txt"))
+        .open(base.join("Finder").join("log.txt"))
         .and_then(|mut f| {
             use std::io::Write;
             writeln!(
@@ -1911,7 +1911,7 @@ fn main() {
             let _ = window.set_focus();
 
             // Primary summon hotkey, configurable in Settings (Ctrl+Space or
-            // Alt+Space, persisted in HKCU\Software\FastSeek\Hotkey). NB:
+            // Alt+Space, persisted in HKCU\Software\Finder\Hotkey). NB:
             // Win+Space is RESERVED by Windows 11 (language switcher) and
             // RegisterHotKey refuses it, so Super+Space is never offered.
             let hotkey = hotkey_name();
@@ -2008,7 +2008,7 @@ fn main() {
             image_data
         ])
         .build(tauri::generate_context!())
-        .expect("error while building FastSeek");
+        .expect("error while building Finder");
 
     log_line("run: event loop starting");
     app.run(|_handle, event| match event {
@@ -2070,13 +2070,19 @@ fn show_spotlight(window: &tauri::Window) {
     let _ = window.set_focus();
 }
 
-/// Persisted summon-hotkey choice, HKCU\Software\FastSeek\Hotkey (REG_SZ).
+/// Persisted summon-hotkey choice, HKCU\Software\Finder\Hotkey (REG_SZ).
+/// Falls back to the pre-rebrand HKCU\Software\FastSeek key on first run.
 fn hotkey_name() -> String {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
     use winreg::RegKey;
     let name = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags(r"Software\FastSeek", KEY_READ)
+        .open_subkey_with_flags(r"Software\Finder", KEY_READ)
         .and_then(|k| k.get_value("Hotkey"))
+        .or_else(|_| {
+            RegKey::predef(HKEY_CURRENT_USER)
+                .open_subkey_with_flags(r"Software\FastSeek", KEY_READ)
+                .and_then(|k| k.get_value("Hotkey"))
+        })
         .unwrap_or_else(|_| "ctrl+space".to_string());
     // The registry value is user-writable — validate it exactly like the
     // runtime setter does, else a garbage value would leave boot with no
@@ -2095,7 +2101,7 @@ fn set_hotkey_name(name: &str) {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
     if let Ok((key, _)) =
-        RegKey::predef(HKEY_CURRENT_USER).create_subkey(r"Software\FastSeek")
+        RegKey::predef(HKEY_CURRENT_USER).create_subkey(r"Software\Finder")
     {
         let _ = key.set_value("Hotkey", &name.to_string());
     }
@@ -3144,12 +3150,38 @@ fn start_backend(
         if let Some(dir) = cache_path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        // Migrate the old %TEMP% cache once — TEMP is regularly wiped, which
-        // used to silently force a full rescan on the next boot.
+        // One-time rebrand migration: the app used to store everything under
+        // %LOCALAPPDATA%\FastSeek. Move that whole directory to Finder so the
+        // cached index and log survive the rename; afterwards the legacy
+        // cache FILENAME may still linger inside (fastseek_cache.bin), which
+        // the load below also accepts.
+        {
+            let old_dir = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("FastSeek");
+            let new_dir = cache_path
+                .parent()
+                .and_then(|p| p.parent())
+                .map(PathBuf::from);
+            if old_dir.exists() {
+                if let Some(target) = new_dir {
+                    if !target.exists() {
+                        let _ = std::fs::rename(&old_dir, &target);
+                    }
+                }
+            }
+        }
         if !cache_path.exists() {
-            let old = std::env::temp_dir().join("fastseek_cache.bin");
-            if old.exists() {
-                let _ = std::fs::rename(&old, &cache_path);
+            if legacy_index_cache_path().exists() {
+                let _ = std::fs::rename(legacy_index_cache_path(), &cache_path);
+            } else {
+                // Migrate the old %TEMP% cache once — TEMP is regularly
+                // wiped, which used to silently force a full rescan.
+                let old = std::env::temp_dir().join("fastseek_cache.bin");
+                if old.exists() {
+                    let _ = std::fs::rename(&old, &cache_path);
+                }
             }
         }
 
@@ -3184,7 +3216,7 @@ fn start_backend(
         // with an actionable message instead of silently searching nothing.
         if index.read().len() == 0 {
             *status.write() = String::from(
-                "No files were indexed — FastSeek needs administrator rights to read the NTFS journal. Relaunch as Administrator and press \"Try again\".",
+                "No files were indexed — Finder needs administrator rights to read the NTFS journal. Relaunch as Administrator and press \"Try again\".",
             );
             eprintln!("Error: index has 0 files — running elevated? NTFS readable?");
             return;
@@ -3488,7 +3520,7 @@ fn build_full_index(
         "index ready in {:.2}s (finalize {:.2}s, save {:.2}s, drives {})",
         total_secs, fin_secs, save_secs, total_drives
     ));
-    let _ = writeln!(io::stderr(), "FastSeek index ready in {:.2}s", total_secs);
+    let _ = writeln!(io::stderr(), "Finder index ready in {:.2}s", total_secs);
 }
 
 /// Serialize the cache straight into an lz4 frame on disk — one pass, no
@@ -3525,6 +3557,14 @@ fn index_cache_path() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
+    base.join("Finder").join("index").join("finder_cache.bin")
+}
+
+/// The pre-rebrand data dir, used only by the one-time migration.
+fn legacy_index_cache_path() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     base.join("FastSeek").join("index").join("fastseek_cache.bin")
 }
 
@@ -3536,13 +3576,13 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Returns the existing FastSeek window when an instance is already running.
+/// Returns the existing Finder window when an instance is already running.
 /// Double-guarded: a `Global\`-namespace mutex plus a live-window check, so two
 /// instances can never both claim ownership (which would make them fight over
 /// the same global hotkeys).
 fn ensure_single_instance() -> Option<HWND> {
-    let existing = find_fastseek_window();
-    let mut name: Vec<u16> = "Global\\FastSeek_SingleInstance"
+    let existing = find_finder_window();
+    let mut name: Vec<u16> = "Global\\Finder_SingleInstance"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -3557,13 +3597,13 @@ fn ensure_single_instance() -> Option<HWND> {
     if already_running {
         return existing;
     }
-    // Mutex says we're first — but if a FastSeek window already exists (mutex
+    // Mutex says we're first — but if a Finder window already exists (mutex
     // namespace quirk), defer to it instead of starting a second index.
     existing
 }
 
-fn find_fastseek_window() -> Option<HWND> {
-    let mut title: Vec<u16> = "FastSeek".encode_utf16().chain(std::iter::once(0)).collect();
+fn find_finder_window() -> Option<HWND> {
+    let mut title: Vec<u16> = "Finder".encode_utf16().chain(std::iter::once(0)).collect();
     let title_ptr = PCWSTR(title.as_mut_ptr());
     unsafe { FindWindowW(PCWSTR::null(), title_ptr).ok().filter(|h| !h.0.is_null()) }
 }
@@ -3879,7 +3919,7 @@ fn first_run_marker() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    base.join("FastSeek").join("first-run-complete")
+    base.join("Finder").join("first-run-complete")
 }
 
 fn write_atomic_with(
