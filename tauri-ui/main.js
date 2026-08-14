@@ -139,8 +139,11 @@ function fuzzyApp(nameLower, q) {
 function clientApps(query) {
   const q = query.trim().toLowerCase();
   // Empty query = "browse all installed apps" — no 16-item cap, just the
-  // hard list guard. Typed queries keep the ranked top-16.
-  if (!q) return appPool.slice(0, MAX_ITEMS);
+  // hard list guard. Settings subpages ("Settings: Wi-Fi", ...) are searchable
+  // but are NOT apps: they never appear in the browse list.
+  if (!q) {
+    return appPool.filter((a) => !a.name.startsWith("Settings: ")).slice(0, MAX_ITEMS);
+  }
   const scored = [];
   for (const app of appPool) {
     const name = app.name.toLowerCase();

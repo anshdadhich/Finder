@@ -227,6 +227,9 @@ fn search_apps(query: String, state: tauri::State<AppState>) -> Vec<UiResult> {
 
     let mut scored: Vec<(u8, u32, &AppEntry)> = if q.is_empty() {
         apps.iter()
+            // Settings subpages ("Settings: Wi-Fi", ...) are searchable but not
+            // apps — the browse list only ever shows the Settings app itself.
+            .filter(|app| !app.name.starts_with("Settings: "))
             .map(|app| (1u8, freq.get(&app.path.to_lowercase()).copied().unwrap_or(0), app))
             .collect()
     } else {
