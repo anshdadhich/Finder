@@ -3420,11 +3420,12 @@ fn build_full_index(
             progress.store(overall, Ordering::Relaxed);
             *status.write() = if total > 0 {
                 format!(
-                    "Reading drive {} — {} of ~{} records...",
-                    drive.letter, parsed, total
+                    "Scanning drive {} — {}% done...",
+                    drive.letter,
+                    (parsed as f64 / total as f64 * 100.0).round() as u32
                 )
             } else {
-                format!("Reading drive {} — {} records...", drive.letter, parsed)
+                format!("Scanning drive {}...", drive.letter)
             };
         };
         let (scan, method): (_, &str) = if forced_direct {
@@ -3448,11 +3449,16 @@ fn build_full_index(
         };
         let read_secs = t_read.elapsed().as_secs_f64();
         indexed += scan.records.len();
+        // Drive i of N is fully read; report the completed fraction (the
+        // read loop already put the bar at 100% of this drive's share).
+        progress.store(
+            ((i + 1) as f64 / total_drives as f64 * 1000.0).round() as u32,
+            Ordering::Relaxed,
+        );
         *status.write() = format!(
-            "Indexing {} records (drive {}/{})...",
-            scan.records.len(),
-            i + 1,
-            total_drives
+            "Indexing drive {} — {}% done...",
+            drive.letter,
+            ((i + 1) as f64 / total_drives as f64 * 100.0).round() as u32
         );
         let t_index = Instant::now();
         index.write().populate_from_scan(scan, drive);
@@ -3466,7 +3472,6 @@ fn build_full_index(
             index_secs,
             rayon::current_num_threads()
         ));
-        *status.write() = format!("Indexed {indexed} files so far...");
     }
 
     *status.write() = "Optimizing index (sorting + buckets)...".to_string();

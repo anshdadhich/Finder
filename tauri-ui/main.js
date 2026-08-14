@@ -915,7 +915,10 @@ function applyAlpha(v, persist = true) {
   document.body.style.setProperty("--bg-window", `rgba(${base[0]}, ${base[1]}, ${base[2]}, ${a})`);
   document.body.style.setProperty("--bg-preview", `rgba(${preview[0]}, ${preview[1]}, ${preview[2]}, ${pa})`);
   document.body.style.setProperty("--window-alpha", String(a));
-  if (setAlpha) setAlpha.value = String(v);
+  if (setAlpha) {
+    setAlpha.value = String(v);
+    updateSliderFill(setAlpha);
+  }
   if (setAlphaVal) setAlphaVal.textContent = v + "%";
   if (persist) localStorage.setItem("fs-alpha2", String(v));
 }
@@ -940,7 +943,10 @@ function applyBlur(v, persist = true) {
   blurValue = v;
   const px = Math.round((v / 100) * 40); // 0 → 0px, 100 → 40px
   document.body.style.setProperty("--blur-px", px + "px");
-  if (setBlur) setBlur.value = String(v);
+  if (setBlur) {
+    setBlur.value = String(v);
+    updateSliderFill(setBlur);
+  }
   if (setBlurVal) setBlurVal.textContent = v + "%";
   if (persist) localStorage.setItem("fs-blur", String(v));
 }
@@ -1154,10 +1160,23 @@ if (setHotkeyBtns.length) {
 
 /* ── Corner radius (CSS var only — the sheet is transparent, so the card's
    border-radius IS the window's visible corner shape) ─────────────────── */
-let cornerRadius = Math.min(32, Math.max(0, Number(localStorage.getItem("fs-radius")) || 16));
-function applyRadius() {
+
+// Drives the custom slider fill: --fill is the accent portion of the
+// track's gradient, computed from the input's own min/max so the radius
+// slider (0–32) fills proportionally like the two 0–100 ones.
+function updateSliderFill(el) {
+  const min = parseFloat(el.min) || 0;
+  const max = parseFloat(el.max) || 100;
+  const pct = ((parseFloat(el.value) - min) / (max - min)) * 100;
+  el.style.setProperty("--fill", pct + "%");
+}
+
+let cornerRadius = Math.min(32, Math.max(0, Number(localStorage.getItem("fs-radius")) || 16));function applyRadius() {
   document.documentElement.style.setProperty("--radius-window", `${cornerRadius}px`);
-  if (setRadius) setRadius.value = String(cornerRadius);
+  if (setRadius) {
+    setRadius.value = String(cornerRadius);
+    updateSliderFill(setRadius);
+  }
   if (setRadiusVal) setRadiusVal.textContent = `${cornerRadius}px`;
 }
 if (setRadius) {

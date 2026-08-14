@@ -719,11 +719,43 @@ body.settings-open .preview-pane {
   min-width: 200px;
 }
 
+/* Fully custom sliders: the native WebView2 range renders a white track
+   and thumb interior that fights the glass look. The filled portion is a
+   gradient whose cut point comes from the JS --fill variable; the thumb is
+   an accent dot with a panel-colored ring so it reads as part of the card. */
 .setting-control input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
   flex: 1;
   width: 110px;
   min-width: 0;
-  accent-color: var(--accent-blue);
+  height: 4px;
+  border-radius: 4px;
+  background: var(--track);
+  cursor: pointer;
+  outline: none;
+}
+
+.setting-control input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 4px;
+  background: linear-gradient(
+    90deg,
+    var(--accent-blue) var(--fill, 0%),
+    var(--track) var(--fill, 0%)
+  );
+}
+
+.setting-control input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  margin-top: -4.5px;
+  border-radius: 50%;
+  background: var(--accent-blue);
+  border: 2px solid var(--bg-window);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
   cursor: pointer;
 }
 
@@ -799,11 +831,11 @@ body.math-open .settings-pane {
   display: none;
 }
 
-/* Compact mode with an empty query: only the search bar remains, and it
-   narrows to a proportionate bar — a 560/760px wide strip with just an
-   icon + input would look stretched. */
+/* Compact mode with an empty query: only the search bar remains, at the
+   same 560px the card has when results show without the preview pane — the
+   bar sits exactly where it will once the user starts typing. */
 body.compact-empty:not(.settings-open) .launcher-window {
-  width: 400px;
+  width: 560px;
 }
 body.compact-empty #results,
 body.compact-empty .preview-pane {
@@ -845,9 +877,10 @@ body.math-open #results {
 }
 
 .segmented button.active {
-  background: var(--bg-hover);
-  color: var(--text-primary);
+  background: var(--accent-blue);
+  color: #fff;
   font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
 }
 
 /* File action buttons now live inside the preview pane. */
@@ -1003,11 +1036,13 @@ body.math-open #results {
   color: var(--text-primary);
   font-size: 12px;
   font-weight: 500;
-  /* No horizontal inset: the label aligns flush with the meta-data keys,
-     and the hover plate spans the whole row like the meta rows do. */
-  width: 100%;
-  padding: 7px 0;
-  border-radius: var(--radius-item);
+  /* The plate bleeds through the pane's 22px side padding — the hover
+     band runs from the pane's left edge to its right edge, while the
+     label keeps its original position via matching inner padding. */
+  width: calc(100% + 44px);
+  margin: 0 -22px;
+  padding: 10px 22px;
+  border-radius: 0;
   cursor: pointer;
   text-align: left;
   transition: background 0.08s ease;

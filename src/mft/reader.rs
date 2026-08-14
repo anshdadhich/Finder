@@ -284,7 +284,9 @@ impl MftReader {
             }
 
             if bytes_returned <= 8 {
-                on_progress(records.len(), estimate);
+                // Enumeration complete: close the bar at 100% (the estimate
+                // is MFT capacity, which always overshoots the active count).
+                on_progress(records.len(), records.len());
                 break;
             }
 
