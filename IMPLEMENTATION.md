@@ -253,7 +253,26 @@ everything except the store itself dropped after `finalize`.
 
 ---
 
-## 6. Search (`index/search.rs`)
+## 6. Search (`index/search.rs` + path mode in `gui/main.rs`)
+
+### 6.0 Path mode (queries that look like paths)
+
+Queries matching `PATH_QUERY_RE`/`PATH_BARE_RE` (frontend) never touch the index —
+they resolve against the **live filesystem**, so pruned trees (AppData, Program
+Files, node_modules) stay reachable:
+
+- Input forms: `C:\...`, UNC `\\server\...`, `%ENV%\...` (any tokens, expanded in
+  Rust), `~` → user profile, bare aliases `appdata | localappdata | temp |
+  userprofile | programfiles | programfilesx86 | windows | system32`.
+- Exactly-existing path → a single row (file or folder; Enter opens).
+- Partial path → chop to the deepest existing dir, then a **bounded** recursive
+  walk of just the remainder (≤25K entries visited, ≤5K per dir, depth ≤3, ≤200
+  rows; reparse points skipped so junctions can't loop). Multi-segment remainders
+  can't match (names contain no `\`), so `%appdata%\Default\Prefer` never drowns
+  in every "Default" folder.
+- Rows are ordinary `file`/`dir` `UiResult`s — icons, preview, copy, open_parent,
+  properties all work on real paths. New command `search_path` (`gui/main.rs:222`,
+  registered in the handler); walk caps make it ~tens of ms.
 
 ### 6.1 Query classification
 
@@ -264,7 +283,9 @@ everything except the store itself dropped after `finalize`.
 
 `search_by_ext`: one hash lookup → the whole bucket (all files of that ext) is ranked in
 **parallel**, sorted, sliced by page. That's why `.py` returns *all* python files instead of
-the first 500 containment hits.
+the first 500 containment hits. Dot-named DIRECTORIES (`.config`, `.ssh`) join their
+bucket (post-dot name), so a `.config` query surfaces the folder at rank 1 — dot-FILES
+(`.gitignore`) stay bucket-free by design and only match via generic containment.
 
 ### 6.3 Generic search (`generic_paged`) — the hot path
 

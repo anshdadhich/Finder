@@ -163,8 +163,16 @@ impl IndexStore {
                     let i = base + k;
                     let name_lower = self.name_lower(entry);
                     // File extension = the suffix after the final dot (ignoring
-                    // dotfiles like ".gitignore" and names ending in a dot).
+                    // dotfiles like ".gitignore" and names ending in a dot —
+                    // EXTRA: dot-named DIRECTORIES (.config, .ssh, .cache) DO
+                    // get bucketed under the post-dot name, so `.config` finds
+                    // the folder, not just app.config-style files).
                     match name_lower.rfind('.') {
+                        Some(pos) if pos + 1 < name_lower.len() && pos == 0 && entry.is_dir() => {
+                            map.entry(name_lower[1..].to_string())
+                                .or_default()
+                                .push(i as u32);
+                        }
                         Some(pos) if pos + 1 < name_lower.len() && pos == 0 => {}
                         Some(pos) if pos + 1 < name_lower.len() => {
                             map.entry(name_lower[pos + 1..].to_string())

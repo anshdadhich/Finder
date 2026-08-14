@@ -193,6 +193,9 @@ function cacheFiles(query, page) {
 // Instant, no-IPC render from the pools. Safe to call per keystroke.
 function paintFromPools(query) {
   const q = query.trim();
+  // Path queries resolve against the live filesystem, not the pools —
+  // painting stale app/file rows under them would just flicker.
+  if (isPathQuery(q)) return false;
   const canPaint = (appPoolLoaded && appPool.length > 0) || fileCache.size > 0;
   if (!canPaint) return false;
   // Math queries paint instantly — no backend round-trip needed.
@@ -231,6 +234,23 @@ async function runSearch() {
   if (!invoke) return;
   const query = input.value.trim();
   const seq = ++searchSeq;
+
+  // Path queries bypass the index entirely — the backend walks the live
+  // filesystem (Exact hit → one row; partial path → bounded subtree walk).
+  if (isPathQuery(query)) {
+    try {
+      const pl = await invoke("search_path", { query });
+      if (seq !== searchSeq) return;
+      items = pl || [];
+      selected = 0;
+      fileTotal = items.length;
+      render();
+      return;
+    } catch (error) {
+      console.error("path search failed:", error);
+      // Fall through to the normal search rather than blanking the row.
+    }
+  }
 
   const appList = appPoolLoaded
     ? clientApps(query)
@@ -283,6 +303,7 @@ async function loadMoreFiles() {
   if (loadingMore) return;
   const query = input.value.trim();
   if (query.length < MIN_FILE_QUERY_LEN) return;
+  if (isPathQuery(query)) return; // path walks are served in one bounded shot
   const seq = searchSeq; // drop the page if the query moved on mid-flight
   const seen = items.filter((it) => it.kind === "file");
   if (seen.length >= MAX_TOTAL_FILES) {
@@ -1162,6 +1183,22 @@ applyCompact();
 /* ── Math (Spotlight-style calculator) ─────────────────────────────────── */
 // Pure arithmetic queries (digits + operators, no letters) evaluate locally:
 // typing "2*8" shows "2*8 = 16" as the top result. ^ is exponentiation.
+// Path-queries resolve against the live filesystem instead of the index:
+// drive/UNC paths, %ENV% vars, ~ and bare aliases all work, so pruned trees
+// (AppData, Program Files, node_modules, ...) stay reachable. Anything else
+// is a normal index query. Bare aliases/drive letters also engage.
+const PATH_QUERY_RE = /^(?:[a-zA-Z]:[\\/]|\\\\|~[\\/]|appdata[\\/]|localappdata[\\/]|temp[\\/]|userprofile[\\/]|programfilesx86[\\/]|programfiles[\\/]|program files[\\/]|program files \(x86\)[\\/]|windows[\\/]|system32[\\/]|%[^%\\/]+%[\\/])/i;
+const PATH_BARE_RE = /^(?:[a-zA-Z]:|~|%[^%\\/]+%)$/i;
+function isPathQuery(s) {
+  // Explorer copies paths wrapped in quotes — strip them for detection; the
+  // backend strips them again before resolving.
+  const t = s.replace(/^"+|"+$/g, "");
+  // Any backslash is path intent: filenames can't contain one, so nothing a
+  // real index query means gets hijacked. Covers "ansh\Downloads\folder"
+  // (profile-relative) and every quoted paste form too.
+  return PATH_QUERY_RE.test(t) || PATH_BARE_RE.test(t) || t.includes("\\");
+}
+
 const MATH_RE = /^[0-9+\-*/().%\s^]+$/;
 function tryMath(query) {
   const s = query.trim();

@@ -752,6 +752,32 @@ mod tests {
     }
 
     #[test]
+    fn dot_directories_join_extension_buckets() {
+        // `.config` typed → the dot-DIRECTORY must surface with the config
+        // files (rank 1, exact name), while dot-FILES (.gitignore) still get
+        // no bucket of their own.
+        let items = [
+            (40, "Users", 0, FileKind::Directory),
+            (1, ".config", 40, FileKind::Directory),
+            (2, "web.config", 40, FileKind::File),
+            (3, ".gitignore", 40, FileKind::File),
+            (4, ".ssh", 40, FileKind::Directory),
+        ];
+        let mut s = store(&items);
+        s.rebuild_ext_index();
+
+        let page = search_paged(&s, ".config", 10, 0, false, &[]);
+        assert_eq!(page.total, 2); // .config dir + web.config file
+        assert_eq!(page.results[0].name, ".config"); // exact-name dir first
+
+        // A dotfile FILE still has no extension bucket — it falls back to
+        // generic search, which finds it by name containment.
+        let gi = search_paged(&s, ".gitignore", 10, 0, false, &[]);
+        assert!(gi.total >= 1);
+        assert_eq!(gi.results[0].name, ".gitignore");
+    }
+
+    #[test]
     fn ext_index_covers_all_files_but_skips_junk() {
         let items = [
             (40, "Users", 0, FileKind::Directory),

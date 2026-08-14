@@ -219,6 +219,257 @@ async fn search_files(
     .map_err(|e| e.to_string())
 }
 
+/// Path-mode search: interpret the query as a REAL filesystem path instead
+/// of an index query. The index prunes junk subtrees (AppData, Program
+/// Files, node_modules, ...) on purpose, but reaching INTO them must stay
+/// possible — paste `%localappdata%\Google\Chrome\User Data\Default\...`
+/// and the walk resolves it against the live disk, files and folders alike.
+/// Pure filesystem read: no index, no state, nothing executed.
+#[tauri::command]
+async fn search_path(query: String) -> Vec<UiResult> {
+    let q = query.trim();
+    let Some(expanded) = expand_path_query(q) else {
+        return Vec::new();
+    };
+    tauri::async_runtime::spawn_blocking(move || path_results(&expanded))
+        .await
+        .unwrap_or_default()
+}
+
+/// Resolve a path-like query to a real path: `~`, `%ENV%` tokens anywhere,
+/// bare aliases (`appdata`, `localappdata`, `temp`, `userprofile`,
+/// `programfiles`, `windows`, `system32`), drive letters and UNC roots.
+/// Returns None when the query is not a resolvable path — the caller then
+/// falls back to normal index search.
+fn expand_path_query(raw: &str) -> Option<String> {
+    // Explorer copies paths as "C:\...\folder" — strip the wrapping quotes
+    // (Windows never produces interior quotes) before anything else.
+    let mut raw = raw.trim();
+    if raw.starts_with('"') {
+        raw = &raw[1..];
+    }
+    if raw.ends_with('"') {
+        raw = &raw[..raw.len() - 1];
+    }
+    let raw = raw.trim_end_matches(['\\', '/']);
+    if raw.is_empty() {
+        return None;
+    }
+    if raw == "~" {
+        return std::env::var("USERPROFILE").ok();
+    }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        return Some(format!(
+            "{}\\{}",
+            std::env::var("USERPROFILE").ok()?.trim_end_matches('\\'),
+            rest
+        ));
+    }
+    // %NAME% tokens, expanded left to right; an unresolvable token rejects
+    // the whole query (mid-keystroke `%` just falls back to index search).
+    if raw.contains('%') {
+        let mut out = String::with_capacity(raw.len() + 64);
+        for (k, seg) in raw.split('%').enumerate() {
+            if k % 2 == 1 {
+                out.push_str(&std::env::var(seg).ok()?);
+            } else {
+                out.push_str(seg);
+            }
+        }
+        return Some(out);
+    }
+    // Drive letter (with or without slash/rest) and UNC roots pass through.
+    let b = raw.as_bytes();
+    if raw.len() >= 2 && b[1] == b':' {
+        return Some(raw.to_string());
+    }
+    if raw.starts_with("\\\\") {
+        return Some(raw.to_string());
+    }
+    // Root-relative (\Windows\System32): resolve against the SystemRoot
+    // drive — the classic Windows convention.
+    if raw.starts_with('\\') {
+        let drive = std::env::var("SystemRoot")
+            .ok()?
+            .chars()
+            .take(2)
+            .collect::<String>();
+        return Some(format!("{}{}", drive, raw));
+    }
+    // Bare alias as the first segment; only known names resolve (a two-word
+    // "temp xyz" file query must never be hijacked by path mode). Unknown
+    // first segments fall through to the profile-relative resolution below.
+    if let Some((first, rest)) = raw.split_once(['\\', '/']) {
+        let base: Option<String> = match first.to_ascii_lowercase().as_str() {
+            "appdata" => std::env::var("APPDATA").ok(),
+            "localappdata" => std::env::var("LOCALAPPDATA").ok(),
+            "temp" => std::env::var("TEMP").ok(),
+            "userprofile" => std::env::var("USERPROFILE").ok(),
+            "programfiles" | "program files" => std::env::var("ProgramFiles").ok(),
+            "programfilesx86" | "program files (x86)" => std::env::var("ProgramFiles(x86)").ok(),
+            "windows" => std::env::var("SystemRoot").ok(),
+            "system32" => std::env::var("SystemRoot")
+                .ok()
+                .map(|r| format!("{}\\System32", r.trim_end_matches('\\'))),
+            _ => None,
+        };
+        if let Some(base) = base {
+            return Some(format!("{}\\{}", base.trim_end_matches('\\'), rest));
+        }
+    }
+    // Profile-relative forms. `ansh\Downloads\x` matches what Explorer's
+    // address bar shows once it omits "C:\Users" — resolve against C:\Users
+    // when the first segment is the OS username; any other relative path
+    // (`Downloads\x`) is relative to the profile itself. Separator required:
+    // bare words never engage path mode.
+    if raw.contains(['\\', '/']) {
+        let profile = std::env::var("USERPROFILE").ok()?;
+        let users_root = std::path::Path::new(&profile)
+            .parent()?
+            .to_string_lossy()
+            .into_owned();
+        let first = raw.split(['\\', '/']).next().unwrap_or("");
+        let base = if first.eq_ignore_ascii_case(&std::env::var("USERNAME").unwrap_or_default()) {
+            users_root
+        } else {
+            profile.trim_end_matches('\\').to_string()
+        };
+        return Some(format!("{}\\{}", base, raw));
+    }
+    None
+}
+
+/// Walk the deepest existing prefix of `expanded` and match the typed
+/// remainder against live names. Exact hits return a single row; everything
+/// is bounded (entries visited, entries per dir, output rows, depth) so a
+/// walk of AppData or System32 stays a few tens of ms.
+fn path_results(expanded: &str) -> Vec<UiResult> {
+    use std::path::Path;
+
+    fn meta(p: &Path) -> Option<std::fs::Metadata> {
+        std::fs::symlink_metadata(p).ok()
+    }
+
+    // Exact existing path → exactly one row (file or folder; Enter opens).
+    if let Some(m) = meta(Path::new(expanded)) {
+        let is_dir = m.is_dir();
+        let name = Path::new(expanded)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| expanded.to_string());
+        return vec![UiResult {
+            name,
+            path: expanded.to_string(),
+            is_dir,
+            kind: if is_dir { "dir" } else { "file" },
+            rank: 1,
+        }];
+    }
+
+    // Not exact: chop trailing segments until an existing prefix remains.
+    // Each chopped segment becomes part of the fuzzy remainder; the walk
+    // then ONLY ever matches the final segment (everything before it was
+    // already resolved by the chop), so `%appdata%\Default\Prefer` cannot
+    // return every "Default" folder on the drive.
+    let mut prefix = Path::new(expanded).to_path_buf();
+    let mut rest: Vec<String> = Vec::new();
+    loop {
+        match meta(&prefix) {
+            Some(m) if m.is_dir() => break,
+            Some(_) => return Vec::new(), // intermediate segment is a FILE
+            None => match prefix.file_name() {
+                Some(n) => rest.push(n.to_string_lossy().into_owned()),
+                None => return Vec::new(), // nothing exists at all
+            },
+        }
+        prefix.pop();
+    }
+
+    let mut out: Vec<(u8, bool, String, String)> = Vec::new(); // rank, is_dir, name, path
+    let filter = rest.join("\\").to_lowercase();
+    if filter.is_empty() {
+        // The typed path resolved to an existing DIRECTORY (its segments
+        // were consumed by the chop) — offer the directory itself.
+        let name = prefix
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| prefix.to_string_lossy().into_owned());
+        return vec![UiResult {
+            name,
+            path: prefix.to_string_lossy().into_owned(),
+            is_dir: true,
+            kind: "dir",
+            rank: 1,
+        }];
+    }
+
+    const MAX_VISITED: usize = 25_000;
+    const MAX_DIR_ENTRIES: usize = 5_000;
+    const MAX_OUT: usize = 200;
+    const MAX_DEPTH: usize = 3;
+    let mut visited = 0usize;
+
+    fn walk(
+        dir: &Path,
+        depth: usize,
+        filter: &str,
+        out: &mut Vec<(u8, bool, String, String)>, // rank, is_dir, name, full path
+        visited: &mut usize,
+    ) {
+        if *visited >= MAX_VISITED || out.len() >= MAX_OUT || depth > MAX_DEPTH {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for (i, ent) in rd.enumerate() {
+            if *visited >= MAX_VISITED || out.len() >= MAX_OUT || i >= MAX_DIR_ENTRIES {
+                return;
+            }
+            let Ok(ent) = ent else { continue };
+            *visited += 1;
+            let Ok(ft) = ent.file_type() else { continue };
+            // Never follow reparse points (junctions/symlinks can loop the
+            // walk — e.g. `AppData\Local\Application Data`).
+            if ft.is_symlink() {
+                continue;
+            }
+            let name = ent.file_name().to_string_lossy().into_owned();
+            let nl = name.to_lowercase();
+            if nl.contains(filter) {
+                let rank = if nl == filter {
+                    1
+                } else if nl.starts_with(filter) {
+                    2
+                } else {
+                    3
+                };
+                out.push((rank, ft.is_dir(), name, ent.path().to_string_lossy().into_owned()));
+            }
+            if ft.is_dir() && depth < MAX_DEPTH {
+                walk(&ent.path(), depth + 1, filter, out, visited);
+            }
+        }
+    }
+
+    let filter_owned = filter;
+    walk(&prefix, 0, &filter_owned, &mut out, &mut visited);
+
+    out.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.1.cmp(&a.1)) // folders before files on equal rank
+            .then_with(|| a.2.to_lowercase().cmp(&b.2.to_lowercase()))
+    });
+    out.into_iter()
+        .take(MAX_OUT)
+        .map(|(rank, is_dir, name, path)| UiResult {
+            name,
+            path,
+            is_dir,
+            kind: if is_dir { "dir" } else { "file" },
+            rank,
+        })
+        .collect()
+}
+
 #[tauri::command]
 fn search_apps(query: String, state: tauri::State<AppState>) -> Vec<UiResult> {
     let q = query.trim().to_lowercase();
@@ -1713,6 +1964,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_index_status,
             search_files,
+            search_path,
             search_apps,
             get_all_apps,
             get_icons,
