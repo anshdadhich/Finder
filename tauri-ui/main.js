@@ -246,7 +246,7 @@ let loadingMore = false;
 // notice owns the results column only while the query is empty; typing
 // brings back normal app/file search over the partial index immediately.
 let indexReady = false;
-let firstScanActive = false;
+let firstScanActive = true;
 let scanNoticeShown = false;
 function syncScanNotice() {
   if (!scanNoticeEl) return;
@@ -330,6 +330,7 @@ async function runSearch() {
     if (all.length >= MAX_ITEMS) break;
     all.push(f);
   }
+  lastWebQuery = "";
   items = all;
   render();
 }
@@ -343,6 +344,51 @@ async function runSearchSafe() {
     progressFill.style.display = "none";
     statusText.textContent = `Search failed: ${error}`;
   }
+}
+
+// ── Inline web results (DuckDuckGo Instant Answer — free, no key) ────────
+// Triggered by a leading "@" and by queries the index answers with nothing
+// (>= 3 chars). Results arrive as a handful of tiny rows in the existing
+// "Web" group — no caching, nothing retained after the query moves on.
+// A JS-side timeout keeps a dead network from hanging the list forever.
+let webSeq = 0;
+let webTimer = null;
+let lastWebQuery = "";
+const WEB_DEBOUNCE_MS = 300;
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
+function scheduleWebSearch(query) {
+  clearTimeout(webTimer);
+  const seq = ++webSeq;
+  webTimer = setTimeout(async () => {
+    let results = [];
+    try {
+      results = await invoke("web_search", { query });
+    } catch {
+      // Offline/API down — the fallback row (or the "No results" hint)
+      // stays; Enter still opens the browser.
+    }
+    if (seq !== webSeq) return;
+    if (input.value.trim() !== query) return;
+    if (!Array.isArray(results) || !results.length) return;
+    items = results.map((r) => ({
+      kind: "web",
+      name: r.title,
+      path: r.url,
+      domain: hostOf(r.url),
+      snippet: r.snippet || "",
+    }));
+    lastWebQuery = query;
+    selected = 0;
+    render();
+  }, WEB_DEBOUNCE_MS);
 }
 
 async function loadMoreFiles() {
@@ -761,19 +807,33 @@ function renderNow() {
         }
         el._name = item.name;
         el._q = query;
-        const initial = item.kind === "math" ? "=" : (item.name || item.path || "?")[0].toUpperCase();
-        el._chip.textContent = initial;
-        let h = item.kind === "math" ? 210 : 7;
-        if (item.kind !== "math") {
-          const seed = item.name || item.path || "";
-          for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+        const isWeb = item.kind === "web";
+        if (isWeb !== !!el._chipGlobe) {
+          el._chipGlobe = isWeb;
+          el._chip.innerHTML = isWeb
+            ? "<svg viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z\"/></svg>"
+            : "";
         }
-        el._chip.style.setProperty("--chip-hue", String(h % 360));
+        el._chip.classList.toggle("chip-globe", isWeb);
+        if (isWeb) {
+          el._chip.style.removeProperty("--chip-hue");
+        } else {
+          el._chip.textContent = (item.name || item.path || "?")[0].toUpperCase();
+          const seed = item.name || item.path || "";
+          let h = 7;
+          for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+          el._chip.style.setProperty("--chip-hue", String(h % 360));
+        }
       }
       // No paths in result rows — apps, files and folders show name only
       // (the full path lives in the preview pane). Only the synthesized
-      // "more" row keeps its count label.
-      const pathText = item.kind === "more" ? item.remainingLabel : "";
+      // "more" row keeps its count label; web rows show the domain.
+      const pathText =
+        item.kind === "more"
+          ? item.remainingLabel
+          : item.kind === "web"
+            ? item.domain || ""
+            : "";
       if (el._path !== pathText) {
         el._pathEl.textContent = pathText;
         el._pathEl.style.display = pathText ? "" : "none";
@@ -1500,6 +1560,9 @@ function renderPreview() {
             : "File";
   pane.classList.toggle("pv-app", item.kind === "app");
   pane.classList.toggle("pv-plain", !!item.is_dir);
+  pane.classList.toggle("pv-web", item.kind === "web");
+  const snippetEl = document.getElementById("pvSnippet");
+  if (snippetEl) snippetEl.textContent = item.kind === "web" ? item.snippet || "" : "";
   path.textContent = truncatePath(item.path || "");
   path.title = item.path || "";
 
@@ -1669,6 +1732,19 @@ if (uninstallBtn) {
     if (cur) runAppAction("uninstall_app", { name: cur.item.name, path: cur.item.path });
   });
 }
+const pvOpenWebBtn = document.getElementById("pvOpenWeb");
+if (pvOpenWebBtn) {
+  pvOpenWebBtn.addEventListener("click", async () => {
+    const cur = currentSelection;
+    if (!cur || cur.item.kind !== "web") return;
+    try {
+      await invoke("open_web_search", { query: cur.item.path });
+      await invoke("hide_window");
+    } catch (error) {
+      showActionError(cur.item.name || cur.item.path, error);
+    }
+  });
+}
 
 // The displayed row order (grouped: Applications → Folders → Files) is NOT
 // the backend order, so actions always run against the item attached to the
@@ -1735,6 +1811,9 @@ input.addEventListener("input", () => {
   paintFromPools(input.value); // instant, zero IPC
   scheduleSearch(); // authoritative backfill
   syncScanNotice(); // hide the first-run notice once the user types
+  if (input.value.trim().startsWith("@") && input.value.trim().length > 1) {
+    scheduleWebSearch(input.value.trim()); // inline results for @queries
+  }
 });
 
 // The launcher never blocks on the index: while the cache loads or a
@@ -2157,7 +2236,16 @@ function setupUpdater() {
 
 setupUpdater();
 
-setInterval(refreshStatus, 1500);
-refreshStatus();
+// Status polling is adaptive: while the index is being built the bar moves
+// in small steps every 250 ms (with a width transition that tapers them into
+// a continuous glide); otherwise a slow 1.5 s heartbeat is plenty.
+function scheduleStatusPoll() {
+  const fast = firstScanActive && !indexReady;
+  setTimeout(async () => {
+    await refreshStatus();
+    scheduleStatusPoll();
+  }, fast ? 250 : 1500);
+}
+scheduleStatusPoll();
 loadApps();
 input.focus();

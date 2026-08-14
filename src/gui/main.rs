@@ -1748,6 +1748,262 @@ fn open_web_search(query: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Inline web-search results, served to the launcher's "Web" group.
+/// Primary source: Bing's RSS endpoint (real web results, no key).
+/// Fallback: DuckDuckGo's Instant Answer API (definitions/instant answers).
+/// Both are one GET of a few KB, fetched with WinINet from this crate's
+/// `windows` feature — no new dependency, no process spawns. Runs on the
+/// async runtime so a slow request never blocks the IPC handler.
+#[derive(serde::Serialize)]
+struct WebResult {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+#[tauri::command]
+async fn web_search(query: String) -> Result<Vec<WebResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || fetch_web_results(&query))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+fn http_get(url: &str) -> Result<String, String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Networking::WinInet::{
+        InternetCloseHandle, InternetOpenUrlW, InternetOpenW, InternetReadFile,
+        INTERNET_FLAG_NO_CACHE_WRITE, INTERNET_FLAG_NO_UI, INTERNET_FLAG_RELOAD,
+        INTERNET_FLAG_SECURE,
+    };
+
+    let agent: Vec<u16> = "Finder/1.0".encode_utf16().chain(Some(0)).collect();
+    let url_wide: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+    let flags =
+        INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_UI;
+
+    // Raw-wininet FFI: handles are *mut c_void, flags are plain u32.
+    let session =
+        unsafe { InternetOpenW(PCWSTR(agent.as_ptr()), 0, PCWSTR::null(), PCWSTR::null(), 0) };
+    if session.is_null() {
+        return Err("web search: could not open a connection".into());
+    }
+    let req = unsafe { InternetOpenUrlW(session, PCWSTR(url_wide.as_ptr()), None, flags, None) };
+    if req.is_null() {
+        unsafe { let _ = InternetCloseHandle(session); }
+        return Err("web search: request failed".into());
+    }
+
+    let mut body = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let mut read: u32 = 0;
+        let ok = unsafe { InternetReadFile(req, buf.as_mut_ptr() as *mut _, buf.len() as u32, &mut read) };
+        if ok.is_err() {
+            break;
+        }
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&buf[..read as usize]);
+        if body.len() > 2_000_000 {
+            break; // sanity cap
+        }
+    }
+    unsafe {
+        let _ = InternetCloseHandle(req);
+        let _ = InternetCloseHandle(session);
+    }
+
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+fn fetch_web_results(query: &str) -> Result<Vec<WebResult>, String> {
+    let bing_url = format!(
+        "https://www.bing.com/search?q={}&format=rss",
+        urlencode(query)
+    );
+    let mut out = parse_bing_rss(&http_get(&bing_url)?);
+    if out.is_empty() {
+        // No web hits from Bing (or the endpoint refused): DuckDuckGo's
+        // instant-answer JSON still covers definitions/quick facts.
+        let ddg_url = format!(
+            "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
+            urlencode(query)
+        );
+        out = parse_ddg(&http_get(&ddg_url)?)?;
+    }
+    Ok(out)
+}
+
+/// Unescape the handful of XML entities RSS uses (plus a numeric &#..; passthrough).
+fn unescape_xml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            let end = s[i + 1..].find(';').map(|p| i + 1 + p);
+            if let Some(end) = end {
+                let ent = &s[i..=end];
+                let rep = match ent {
+                    "&amp;" => "&",
+                    "&lt;" => "<",
+                    "&gt;" => ">",
+                    "&quot;" => "\"",
+                    "&apos;" => "'",
+                    _ => "",
+                };
+                if !rep.is_empty() || ent.len() > 2 {
+                    if !rep.is_empty() {
+                        out.push_str(rep);
+                    } else {
+                        out.push_str(ent); // keep unknown entities verbatim
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn parse_bing_rss(body: &str) -> Vec<WebResult> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("<item>") {
+        let after = &rest[start + 6..];
+        let end = after.find("</item>").unwrap_or(after.len());
+        let item = &after[..end];
+        rest = &after[end..];
+
+        let field = |tag: &str| -> Option<String> {
+            item.find(&format!("<{}>", tag)).and_then(|p| {
+                let t = &item[p + tag.len() + 2..];
+                t.find(&format!("</{}>", tag))
+                    .map(|e| unescape_xml(&t[..e]))
+            })
+        };
+        let title = field("title").unwrap_or_default();
+        let link = field("link").unwrap_or_default();
+        if title.trim().is_empty() || link.trim().is_empty() {
+            continue;
+        }
+        let snippet = strip_html(&field("description").unwrap_or_default());
+        out.push(WebResult {
+            title: title.trim().to_string(),
+            url: link.trim().to_string(),
+            snippet,
+        });
+        if out.len() >= 5 {
+            break;
+        }
+    }
+    out
+}
+
+/// RSS/HTML description → plain text: drop tags, collapse whitespace,
+/// truncate. Bing wraps its snippet in CDATA/escaped markup sometimes.
+fn strip_html(s: &str) -> String {
+    let mut raw = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                raw.push(' ');
+            }
+            _ if !in_tag => raw.push(ch),
+            _ => {}
+        }
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut prev = ' ';
+    for ch in raw.chars() {
+        if ch == ' ' && prev == ' ' {
+            continue;
+        }
+        prev = ch;
+        out.push(ch);
+    }
+    if out.len() > 200 {
+        out.truncate(200);
+        out.push('…');
+    }
+    out.trim().to_string()
+}
+
+fn parse_ddg(body: &str) -> Result<Vec<WebResult>, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+
+    let push = |out: &mut Vec<WebResult>, text: &str, url: &str| {
+        let mut title = text.trim().to_string();
+        if title.is_empty() || url.trim().is_empty() {
+            return;
+        }
+        if title.len() > 110 {
+            title.truncate(110);
+            title.push('…');
+        }
+        out.push(WebResult {
+            title,
+            url: url.trim().to_string(),
+            snippet: String::new(),
+        });
+    };
+
+    if let (Some(t), Some(u)) = (
+        v.get("AbstractText").and_then(|t| t.as_str()),
+        v.get("AbstractURL").and_then(|u| u.as_str()),
+    ) {
+        push(&mut out, t, u);
+    }
+
+    if let Some(topics) = v.get("RelatedTopics").and_then(|t| t.as_array()) {
+        for topic in topics {
+            if out.len() >= 8 {
+                break;
+            }
+            if let Some(nested) = topic.get("Topics").and_then(|t| t.as_array()) {
+                for sub in nested {
+                    if let (Some(t), Some(u)) = (
+                        sub.get("Text").and_then(|t| t.as_str()),
+                        sub.get("FirstURL").and_then(|u| u.as_str()),
+                    ) {
+                        push(&mut out, t, u);
+                        if out.len() >= 8 {
+                            break;
+                        }
+                    }
+                }
+            } else if let (Some(t), Some(u)) = (
+                topic.get("Text").and_then(|t| t.as_str()),
+                topic.get("FirstURL").and_then(|u| u.as_str()),
+            ) {
+                push(&mut out, t, u);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 fn looks_like_url(value: &str) -> bool {
     let lower = value.to_lowercase();
     lower.starts_with("http://")
@@ -1902,6 +2158,16 @@ fn main() {
             *setup_close_window.lock() = Some(window.clone());
             strip_system_menu(&window);
             position_spotlight(&window);
+            // First launch: the shell almost never grants foreground to a
+            // freshly elevated process, so a Focused(false) right after the
+            // show+set_focus below would hide the window before it is ever
+            // seen. The backend only sets first_scan asynchronously (after
+            // its thread starts), which is too late for that event — so set
+            // it here, synchronously, whenever the first-run marker is
+            // absent. The backend clears it once the initial scan finishes.
+            if !first_run_marker().exists() {
+                first_scan.store(true, Ordering::Relaxed);
+            }
             if let Some(grab) = capture_backdrop(&window) {
                 // Harmless if the page hasn't registered listeners yet (the
                 // initial load's refreshBackdrop() covers that first show).
@@ -2007,6 +2273,7 @@ fn main() {
             open_path,
             open_parent,
             open_web_search,
+            web_search,
             rebuild_index,
             copy_path,
             quit_app,

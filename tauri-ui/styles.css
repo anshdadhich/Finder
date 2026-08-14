@@ -441,6 +441,23 @@ input#search::placeholder {
   display: none;
 }
 
+/* Web-result rows (Bing RSS hits): globe chip instead of a letter, and
+   the domain as the secondary line — the Raycast/Flow convention that
+   makes web hits read differently from apps/files at a glance. */
+.chip.chip-globe {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--accent-blue) 45%, transparent);
+  color: var(--accent-blue);
+}
+
+.chip.chip-globe svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+}
+
 .result .text {
   flex: 1;
   min-width: 0;
@@ -1021,6 +1038,28 @@ body.math-open #results {
 /* Publisher/Version rows exist only for apps. */
 .preview-pane:not(.pv-app) .meta-app {
   display: none;
+}
+
+/* Web results get a dedicated preview: About snippet row + the primary
+   "Open in browser" action; both exist only while a web row is selected. */
+.preview-pane:not(.pv-web) .meta-web,
+.preview-pane:not(.pv-web) #pvOpenWeb {
+  display: none;
+}
+
+.meta-web .meta-value {
+  max-width: 100%;
+  white-space: normal;
+  text-align: left;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  font-family: var(--font-ui, inherit);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  font-weight: 400;
 }
 
 /* Item action buttons: flat rows inside the preview pane, same language
