@@ -271,7 +271,7 @@ Files, node_modules) stay reachable:
   can't match (names contain no `\`), so `%appdata%\Default\Prefer` never drowns
   in every "Default" folder.
 - Rows are ordinary `file`/`dir` `UiResult`s — icons, preview, copy, open_parent,
-  properties all work on real paths. New command `search_path` (`gui/main.rs:222`,
+  properties all work on real paths. New command `search_path` (`gui/main.rs:229`,
   registered in the handler); walk caps make it ~tens of ms.
 
 ### 6.1 Query classification

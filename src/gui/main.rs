@@ -276,6 +276,11 @@ fn expand_path_query(raw: &str) -> Option<String> {
                 out.push_str(seg);
             }
         }
+        // `%` / `%%` alone or a var that expands to nothing must not become
+        // a (empty) resolved path — reject like any other unresolved query.
+        if out.is_empty() {
+            return None;
+        }
         return Some(out);
     }
     // Drive letter (with or without slash/rest) and UNC roots pass through.
