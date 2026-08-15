@@ -537,24 +537,79 @@ fn apps_refresh_loop(apps: Arc<RwLock<Vec<AppEntry>>>, rev: Arc<AtomicU64>) {
         if fresh.is_empty() {
             continue;
         }
-        let same = {
-            let cur = apps.read();
-            if cur.len() != fresh.len() {
-                false
-            } else {
-                let cur_keys: std::collections::HashSet<String> =
-                    cur.iter().map(|a| a.path.to_lowercase()).collect();
-                let new_keys: std::collections::HashSet<String> =
-                    fresh.iter().map(|a| a.path.to_lowercase()).collect();
-                cur_keys == new_keys
-            }
-        };
-        if !same {
+        if !pool_equivalent(&apps.read(), &fresh) {
             *apps.write() = fresh;
             rev.fetch_add(1, Ordering::Relaxed);
             log_line("apps: pool refreshed — install/uninstall picked up");
         }
     }
+}
+
+/// True when both pools expose the same set of app paths (order-agnostic).
+/// Icons are ignored deliberately: they are lazy-loaded per row.
+fn pool_equivalent(a: &[AppEntry], b: &[AppEntry]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let keys_a: std::collections::HashSet<String> =
+        a.iter().map(|x| x.path.to_lowercase()).collect();
+    let keys_b: std::collections::HashSet<String> =
+        b.iter().map(|x| x.path.to_lowercase()).collect();
+    keys_a == keys_b
+}
+
+/// Persisted app pool (name + path only — icons live in their own disk
+/// cache), so the browse list paints instantly on the next launch while
+/// the fresh enumeration runs in the background.
+fn pool_cache_path() -> std::path::PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Finder")
+        .join("apppool.json")
+}
+
+fn save_pool_cache(pool: &[AppEntry]) {
+    #[derive(serde::Serialize)]
+    struct PoolEntry {
+        name: String,
+        path: String,
+    }
+    let entries: Vec<PoolEntry> = pool
+        .iter()
+        .map(|a| PoolEntry {
+            name: a.name.clone(),
+            path: a.path.clone(),
+        })
+        .collect();
+    if let Ok(text) = serde_json::to_string(&entries) {
+        let _ = std::fs::create_dir_all(
+            pool_cache_path().parent().unwrap_or(std::path::Path::new(".")),
+        );
+        let _ = std::fs::write(pool_cache_path(), text);
+    }
+}
+
+fn load_pool_cache() -> Vec<AppEntry> {
+    #[derive(serde::Deserialize)]
+    struct PoolEntry {
+        name: String,
+        path: String,
+    }
+    let Ok(text) = std::fs::read_to_string(pool_cache_path()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<PoolEntry>>(&text) else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .map(|e| AppEntry {
+            name: e.name,
+            path: e.path,
+            icon: None,
+        })
+        .collect()
 }
 
 fn app_rank(name_lower: &str, q: &str) -> Option<u8> {
@@ -1427,7 +1482,10 @@ fn apps_from_shell() -> Vec<AppEntry> {
                     parsing = pw.to_string().unwrap_or_default();
                     CoTaskMemFree(Some(pw.0 as *const c_void));
                 }
-                icon = pidl_icon_data_uri(full);
+                // Icons are NOT extracted here anymore: per-app COM icon
+                // work was ~3-10s of startup. Rows fetch icons lazily via
+                // the disk-cached icon pipeline instead (icon_disk_path /
+                // icons_for), which is equally instant once warm.
                 let _ = ILFree(Some(full));
             }
             let _ = ILFree(Some(pidl));
@@ -2235,22 +2293,33 @@ fn main() {
         let rev_boot = Arc::clone(&app_rev);
         let cache_boot = Arc::clone(&icon_cache);
         std::thread::spawn(move || {
+            // 1) Paint instantly from the persisted pool, if any.
+            let cached = load_pool_cache();
+            if !cached.is_empty() {
+                *apps_boot.write() = cached;
+                rev_boot.fetch_add(1, Ordering::Relaxed);
+                log_line("apps: pool restored from cache");
+            }
+            // 2) Fresh enumeration (fast — icons are lazy) swaps in only
+            //    when something actually changed.
             let fresh = discover_apps();
             if fresh.is_empty() {
                 log_line("apps: initial discovery returned nothing");
                 return;
             }
-            log_app_pool(&fresh);
-            {
-                let mut cache = cache_boot.lock();
-                for app in &fresh {
-                    if let Some(ic) = &app.icon {
-                        cache.insert(app.path.to_lowercase(), ic.clone());
+            if !pool_equivalent(&apps_boot.read(), &fresh) {
+                {
+                    let mut cache = cache_boot.lock();
+                    for app in &fresh {
+                        if let Some(ic) = &app.icon {
+                            cache.insert(app.path.to_lowercase(), ic.clone());
+                        }
                     }
                 }
+                save_pool_cache(&fresh);
                 *apps_boot.write() = fresh;
+                rev_boot.fetch_add(1, Ordering::Relaxed);
             }
-            rev_boot.fetch_add(1, Ordering::Relaxed);
             log_line("apps: initial pool ready");
         });
     }
