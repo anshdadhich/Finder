@@ -40,9 +40,18 @@ jobs:
       - name: Build + sign installer + write latest.json
         shell: pwsh
         run: scripts/publish-update.ps1
+      - name: Package portable ZIP
+        shell: pwsh
+        run: |
+          $conf = Get-Content tauri.conf.json -Raw | ConvertFrom-Json
+          $ver = $conf.package.version
+          $zipName = "Finder_${ver}_x64-portable.zip"
+          Compress-Archive -Path target/release/Finder.exe -DestinationPath $zipName -Force
+          Write-Host "packaged $zipName"
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             target/release/bundle/nsis/*_x64-setup.exe
             latest.json
+            Finder_*_x64-portable.zip
