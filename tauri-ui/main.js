@@ -197,6 +197,23 @@ function paintFromPools(query) {
   // Path queries resolve against the live filesystem, not the pools —
   // painting stale app/file rows under them would just flicker.
   if (isPathQuery(q)) return false;
+  // A leading "@" is a web search: one row, always rendered (even before
+  // the pools load on a first run). Enter opens the query in the browser
+  // and the backend may replace this row with real results shortly after.
+  if (q.startsWith("@")) {
+    const web = q.slice(1).trim();
+    if (web) {
+      const bareDomain = /^[\w-]+(\.[\w-]+)+$/.test(web);
+      items = [{
+        kind: "web",
+        name: bareDomain ? `Open ${web} in browser` : `Search the web for “${web}”`,
+        path: web,
+      }];
+      selected = 0;
+      render();
+      return true;
+    }
+  }
   const canPaint = (appPoolLoaded && appPool.length > 0) || fileCache.size > 0;
   if (!canPaint) return false;
   // Math queries paint instantly — no backend round-trip needed.
@@ -206,17 +223,6 @@ function paintFromPools(query) {
     selected = 0;
     render();
     return true;
-  }
-  // A leading "@" is a web search: one row, Enter opens the browser.
-  // (Schedule side skips the index search for these.)
-  if (q.startsWith("@")) {
-    const web = q.slice(1);
-    if (web) {
-      items = [{ kind: "web", name: `Search the web for “${web}”`, path: web }];
-      selected = 0;
-      render();
-      return true;
-    }
   }
   const parts = [];
   if (appPoolLoaded && appPool.length) {
@@ -364,10 +370,12 @@ function hostOf(url) {
   }
 }
 
-function scheduleWebSearch(query) {
+function scheduleWebSearch(raw) {
   clearTimeout(webTimer);
   const seq = ++webSeq;
   webTimer = setTimeout(async () => {
+    const query = raw.replace(/^@\s*/, "").trim();
+    if (!query) return;
     let results = [];
     try {
       results = await invoke("web_search", { query });
@@ -376,7 +384,7 @@ function scheduleWebSearch(query) {
       // stays; Enter still opens the browser.
     }
     if (seq !== webSeq) return;
-    if (input.value.trim() !== query) return;
+    if (input.value.trim().replace(/^@\s*/, "").trim() !== query) return;
     if (!Array.isArray(results) || !results.length) return;
     items = results.map((r) => ({
       kind: "web",

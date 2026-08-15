@@ -12,7 +12,7 @@ name = "finder"
 path = "src/main.rs"
 
 [[bin]]
-name = "finder-gui"
+name = "Finder"
 path = "src/gui/main.rs"
 
 [dependencies]

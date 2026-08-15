@@ -12,7 +12,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
-        run: cargo build --release --bin finder-gui --features embed-resources
+        run: cargo build --release --bin Finder --features embed-resources
       - uses: actions/upload-artifact@v4
         with:
           name: finder-gui

@@ -1763,6 +1763,7 @@ struct WebResult {
 
 #[tauri::command]
 async fn web_search(query: String) -> Result<Vec<WebResult>, String> {
+    let query = query.trim().trim_start_matches('@').trim().to_string();
     tauri::async_runtime::spawn_blocking(move || fetch_web_results(&query))
         .await
         .map_err(|e| e.to_string())?
