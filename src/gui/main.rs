@@ -2223,17 +2223,36 @@ fn main() {
     let status = Arc::new(RwLock::new(String::from("Starting...")));
     let first_scan = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(AtomicU32::new(u32::MAX));
-    let apps = Arc::new(RwLock::new(discover_apps()));
-    log_app_pool(&apps.read());
+    // The app pool starts empty and is discovered on a worker thread: the
+    // per-app icon extraction takes ~10s on a full system, and the window,
+    // hotkey and index must not wait for it. The pool swaps in and bumps
+    // the revision when ready (same path the 60s refresh loop uses).
+    let apps = Arc::new(RwLock::new(Vec::new()));
     let app_rev = Arc::new(AtomicU64::new(0));
     let icon_cache = Arc::new(Mutex::new(HashMap::new()));
     {
-        let mut cache = icon_cache.lock();
-        for app in apps.read().iter() {
-            if let Some(ic) = &app.icon {
-                cache.insert(app.path.to_lowercase(), ic.clone());
+        let apps_boot = Arc::clone(&apps);
+        let rev_boot = Arc::clone(&app_rev);
+        let cache_boot = Arc::clone(&icon_cache);
+        std::thread::spawn(move || {
+            let fresh = discover_apps();
+            if fresh.is_empty() {
+                log_line("apps: initial discovery returned nothing");
+                return;
             }
-        }
+            log_app_pool(&fresh);
+            {
+                let mut cache = cache_boot.lock();
+                for app in &fresh {
+                    if let Some(ic) = &app.icon {
+                        cache.insert(app.path.to_lowercase(), ic.clone());
+                    }
+                }
+                *apps_boot.write() = fresh;
+            }
+            rev_boot.fetch_add(1, Ordering::Relaxed);
+            log_line("apps: initial pool ready");
+        });
     }
 
     let state = AppState {
