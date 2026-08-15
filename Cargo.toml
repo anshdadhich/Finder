@@ -64,6 +64,8 @@ base64 = "0.21"
 tauri-build = { version = "1", features = [] }
 
 [features]
+# Required by cargo tauri build (the CLI always passes --features custom-protocol)
+custom-protocol = ["tauri/custom-protocol"]
 # Builds requiring an elevated manifest (the shipped exe) opt in explicitly:
 #   cargo build --release --features embed-resources
 embed-resources = []

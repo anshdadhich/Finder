@@ -1,10 +1,10 @@
-{
+﻿{
     "version":  "0.1.0",
     "notes":  "",
-    "pub_date":  "2026-08-09T07:49:07.142Z",
+    "pub_date":  "2026-08-15T10:26:09.782Z",
     "platforms":  {
                       "windows-x86_64":  {
-                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUZGs1SkZSOG5Jak5rcmlyTzEzQmlDNlJxbFcvSEVCY2xZRjU3M0FSdzYzZ3FxQmtReEoxMkYyNVE0dFhFQTltWkpTN2NyZlFtOG9oRUZoVWh6RFk0eFZob0ZwNFJGaGcwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2MjYxNzQ3CWZpbGU6RmFzdFNlZWtfMC4xLjBfeDY0LXNldHVwLmV4ZQpEeVNYY1ZKMkp4azRSVm5LcGJPNUZWajhBNjJscXZZT01rdG1CUmhvRzZMd0VaV2ZnMmQxNDlNb2h4YWt0YjJ6cWg5UUlrT0R2bGRFcE1LK2ZnL2tBUT09Cg==",
+                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUZGs1SkZSOG5JakE2QXVjREd6aW0vR21SdjVpZmZOMXFtaWFvUUtBNUk2NGdTVG15WUtrNTRQNmxUbEFpNnZLQVRGZzUydDhJcmxQbnovMVFpRFJRMk0yVUZSaVNJM1FnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2Nzg5NTYxCWZpbGU6RmluZGVyXzAuMS4wX3g2NC1zZXR1cC5leGUKZTRjQXFhU0Zya2F4R0liRWlzeXBaRTdKTjNMNUt5VC9PaTI4ZkZVSitmWWdOR3BhS3Y4anhXT1BOT0x1ZXArT256Zlc1K3JKQkFUWnl0NVJTdng1QUE9PQo=",
                                              "url":  "https://github.com/anshdadhich/Finder/releases/download/v0.1.0/Finder_0.1.0_x64-setup.exe"
                                          }
                   }
