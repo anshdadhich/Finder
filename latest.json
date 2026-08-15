@@ -1,11 +1,11 @@
-﻿{
-    "version":  "0.1.0",
-    "notes":  "",
-    "pub_date":  "2026-08-15T10:26:09.782Z",
+{
+    "version":  "0.2.1",
+    "notes":  "Finder v0.2.1\n\nFixed: \"Start with Windows\" enabled but the app never launched at boot.\n\nRoot cause: the logon task was created with Task Scheduler\u0027s default power\ngates (DisallowStartIfOnBatteries / StopIfGoingOnBatteries). On a laptop\nlogging in on battery  -  Finder\u0027s autostart silently never fired, while Task\nManager showed it \"enabled\".\n\nFix: Finder now clears both gates when creating the logon task, and repairs\nexisting gated tasks on the next launch (logged as \"autostart: repaired\nbattery-gated logon task\").\n\nAlso: second launches now log \"main: woke existing instance, exiting\"\ninstead of exiting silently, so the single-instance wake is visible in\nlog.txt.",
+    "pub_date":  "2026-08-15T16:48:04.314Z",
     "platforms":  {
                       "windows-x86_64":  {
-                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUZGs1SkZSOG5JakE2QXVjREd6aW0vR21SdjVpZmZOMXFtaWFvUUtBNUk2NGdTVG15WUtrNTRQNmxUbEFpNnZLQVRGZzUydDhJcmxQbnovMVFpRFJRMk0yVUZSaVNJM1FnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2Nzg5NTYxCWZpbGU6RmluZGVyXzAuMS4wX3g2NC1zZXR1cC5leGUKZTRjQXFhU0Zya2F4R0liRWlzeXBaRTdKTjNMNUt5VC9PaTI4ZkZVSitmWWdOR3BhS3Y4anhXT1BOT0x1ZXArT256Zlc1K3JKQkFUWnl0NVJTdng1QUE9PQo=",
-                                             "url":  "https://github.com/anshdadhich/Finder/releases/download/v0.1.0/Finder_0.1.0_x64-setup.exe"
+                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUZGs1SkZSOG5Jak1yTmpIU2c3N3FFL1pQM2FHbWliSmovMjdxa1VRNWNTZkxUVURTZFIxdzdOTWc4bXRiYTBJZ0hrTlJTd2daM2dDMCswVkZ6Y25qakoyd0J5djZEa3c0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2ODEyNDg0CWZpbGU6RmluZGVyXzAuMi4xX3g2NC1zZXR1cC5leGUKdHB0bkdsUXVWZ21TK1FRVjV4Z3BveXhIb3BHSE14d3RHRkRHK3FidWNPVmJNWXVHVGlIVWU4VGpHcndSTUIrL1dEdmFOUmFkKzYvK2RBUHhQZzdiREE9PQo=",
+                                             "url":  "https://github.com/anshdadhich/Finder/releases/download/v0.2.1/Finder_0.2.1_x64-setup.exe"
                                          }
                   }
 }
