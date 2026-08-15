@@ -1,1 +1,16 @@
-Fixed: "Start with Windows" now actually starts at login — the old Startup-folder shortcut can't auto-elevate the admin app, so it's replaced with a Task Scheduler logon task. Existing installs migrate automatically.
+Finder v0.2.1
+
+Fixed: "Start with Windows" enabled but the app never launched at boot.
+
+Root cause: the logon task was created with Task Scheduler's default power
+gates (DisallowStartIfOnBatteries / StopIfGoingOnBatteries). On a laptop
+logging in on battery — Finder's autostart silently never fired, while Task
+Manager showed it "enabled".
+
+Fix: Finder now clears both gates when creating the logon task, and repairs
+existing gated tasks on the next launch (logged as "autostart: repaired
+battery-gated logon task").
+
+Also: second launches now log "main: woke existing instance, exiting"
+instead of exiting silently, so the single-instance wake is visible in
+log.txt.

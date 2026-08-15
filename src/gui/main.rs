@@ -769,6 +769,59 @@ fn schtasks_status() -> bool {
         .unwrap_or(false)
 }
 
+/// schtasks /Create cannot express the battery options, and its defaults
+/// gate ONLOGON tasks on laptops: when the laptop is on battery the task
+/// shows as enabled yet silently never fires. Dump the task XML, flip the
+/// two power gates, and recreate the task from the patched XML.
+///
+/// Returns Ok(true) when the task was patched, Ok(false) when it was
+/// already un-gated, Err when the repair could not be completed.
+fn fix_task_power_gates() -> Result<bool, String> {
+    let xml = std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", "Finder", "/XML"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !xml.status.success() {
+        return Err("schtasks /Query /XML failed".into());
+    }
+    let mut text = String::from_utf8_lossy(&xml.stdout).into_owned();
+    let ungated = text
+        .replace(
+            "<DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries>",
+            "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+        )
+        .replace(
+            "<StopIfGoingOnBatteries>true</StopIfGoingOnBatteries>",
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+        );
+    if text == ungated {
+        return Ok(false);
+    }
+    text = ungated;
+    let xml_path = std::env::temp_dir().join("finder_task.xml");
+    std::fs::write(&xml_path, &text).map_err(|e| e.to_string())?;
+    let patched = std::process::Command::new("schtasks")
+        .args([
+            "/Create",
+            "/TN",
+            "Finder",
+            "/XML",
+            xml_path.to_str().ok_or("temp path")?,
+            "/F",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&xml_path);
+    if patched {
+        Ok(true)
+    } else {
+        Err("schtasks /Create /XML failed".into())
+    }
+}
+
 #[tauri::command]
 fn autostart_enabled() -> bool {
     schtasks_status() || autostart_lnk().exists()
@@ -810,6 +863,13 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
         // The task is the working mechanism — drop any legacy shortcut so it
         // neither double-launches nor leaves a misleading Task Manager entry.
         let _ = std::fs::remove_file(&lnk);
+        // Clear the default power gates (laptop logons on battery would
+        // otherwise silently never fire).
+        match fix_task_power_gates() {
+            Ok(true) => log_line("autostart: battery gates cleared on logon task"),
+            Ok(false) => {}
+            Err(e) => log_line(&format!("autostart: power-gate repair FAILED: {e}")),
+        }
         return Ok(());
     }
     // Fallback: plain Startup shortcut (only works for unelevated builds).
@@ -2133,6 +2193,7 @@ fn main() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
             let _ = SetForegroundWindow(hwnd);
         }
+        log_line("main: woke existing instance, exiting");
         std::process::exit(0);
     }
     log_line("main: single-instance owner");
@@ -3550,6 +3611,16 @@ fn start_backend(
             match set_autostart(true) {
                 Ok(()) => log_line("autostart: migrated Startup shortcut to logon task"),
                 Err(e) => log_line(&format!("autostart: migration FAILED: {e}")),
+            }
+        }
+        // v0.2.0 registered the logon task with Task Scheduler's default
+        // power gates, which silently suppress the trigger on battery
+        // power — repair those tasks on their next launch.
+        else if schtasks_status() {
+            match fix_task_power_gates() {
+                Ok(true) => log_line("autostart: repaired battery-gated logon task"),
+                Ok(false) => {}
+                Err(e) => log_line(&format!("autostart: power-gate repair FAILED: {e}")),
             }
         }
 
