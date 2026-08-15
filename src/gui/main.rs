@@ -2314,6 +2314,21 @@ fn main() {
     let status = Arc::new(RwLock::new(String::from("Starting...")));
     let first_scan = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(AtomicU32::new(u32::MAX));
+
+    // Sync mirror of the old setup-time check: the backend now spawns BEFORE
+    // the window exists (so the cache load overlaps webview creation), and it
+    // writes the first-run marker during its run — this store keeps the
+    // first-launch "scanning" overlay deterministic.
+    if !first_run_marker().exists() {
+        first_scan.store(true, Ordering::Relaxed);
+    }
+    start_backend(
+        Arc::clone(&index),
+        Arc::clone(&ready),
+        Arc::clone(&status),
+        Arc::clone(&progress),
+        Arc::clone(&first_scan),
+    );
     // The app pool starts empty and is discovered on a worker thread: the
     // per-app icon extraction takes ~10s on a full system, and the window,
     // hotkey and index must not wait for it. The pool swaps in and bumps
@@ -2379,10 +2394,6 @@ fn main() {
         let rev_loop = Arc::clone(&app_rev);
         std::thread::spawn(move || apps_refresh_loop(apps_loop, rev_loop));
     }
-    let setup_index = Arc::clone(&index);
-    let setup_ready = Arc::clone(&ready);
-    let setup_status = Arc::clone(&status);
-    let setup_progress = Arc::clone(&progress);
     let close_index = Arc::clone(&index);
     let close_window: Arc<Mutex<Option<tauri::Window>>> = Arc::new(Mutex::new(None));
     let setup_close_window = Arc::clone(&close_window);
@@ -2401,16 +2412,9 @@ fn main() {
             *setup_close_window.lock() = Some(window.clone());
             strip_system_menu(&window);
             position_spotlight(&window);
-            // First launch: the shell almost never grants foreground to a
-            // freshly elevated process, so a Focused(false) right after the
-            // show+set_focus below would hide the window before it is ever
-            // seen. The backend only sets first_scan asynchronously (after
-            // its thread starts), which is too late for that event — so set
-            // it here, synchronously, whenever the first-run marker is
-            // absent. The backend clears it once the initial scan finishes.
-            if !first_run_marker().exists() {
-                first_scan.store(true, Ordering::Relaxed);
-            }
+            // first_scan was decided synchronously in main() before the
+            // backend spawned (the backend writes the first-run marker during
+            // its own run); the backend clears it once the scan finishes.
             if let Some(grab) = capture_backdrop(&window) {
                 // Harmless if the page hasn't registered listeners yet (the
                 // initial load's refreshBackdrop() covers that first show).
@@ -2426,14 +2430,6 @@ fn main() {
             let hotkey = hotkey_name();
             log_line(&format!("hotkey configured: {}", hotkey));
             register_shortcut(&app.handle(), &hotkey, window.clone());
-
-            start_backend(
-                Arc::clone(&setup_index),
-                Arc::clone(&setup_ready),
-                Arc::clone(&setup_status),
-                Arc::clone(&setup_progress),
-                Arc::clone(&first_scan),
-            );
             Ok(())
         })
         .on_window_event({
@@ -3898,10 +3894,12 @@ fn load_cache_and_catch_up(
     // v3 cache layout: lz4 frame stream, deserialized straight off disk —
     // no full-blob decompress allocation. Old prepended-size caches fail the
     // frame header check and are rejected below (one fresh rescan).
+    let t0 = std::time::Instant::now();
     let cache = std::fs::File::open(cache_path).ok().and_then(|file| {
         let mut dec = lz4_flex::frame::FrameDecoder::new(std::io::BufReader::new(file));
         bincode::deserialize_from::<_, finder::index::store::CacheData>(&mut dec).ok()
     });
+    let t1 = std::time::Instant::now();
     match cache {
         Some(cache) => {
             if cache.entries.is_empty() {
@@ -3918,9 +3916,15 @@ fn load_cache_and_catch_up(
                 *index.write() = IndexStore::new();
                 return false;
             };
+            let t2 = std::time::Instant::now();
             *index.write() = store;
 
             if checkpoints.is_empty() {
+                log_line(&format!(
+                    "cache: read {:.0}ms | build {:.0}ms | no checkpoints",
+                    t1.duration_since(t0).as_millis(),
+                    t2.duration_since(t1).as_millis()
+                ));
                 return true;
             }
 
@@ -3944,11 +3948,20 @@ fn load_cache_and_catch_up(
                 store.checkpoints.retain(|c| c.drive_letter != drive.letter);
                 store.checkpoints.push(new_cp);
             }
+            let t3 = std::time::Instant::now();
 
             drop(delta_tx);
             let mut store = index.write();
             let events: Vec<IndexEvent> = delta_rx.try_iter().collect();
+            let event_count = events.len();
             store.apply_events(events);
+            log_line(&format!(
+                "cache: read {:.0}ms | build {:.0}ms | catchup {:.0}ms | {} events",
+                t1.duration_since(t0).as_millis(),
+                t2.duration_since(t1).as_millis(),
+                t3.duration_since(t2).as_millis(),
+                event_count
+            ));
             true
         }
         None => {
