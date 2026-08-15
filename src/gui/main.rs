@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     ffi::c_void,
-    io::{self, Write},
+    io::{self, Read, Seek, Write},
     mem::size_of,
     path::{Path, PathBuf},
     sync::{
@@ -1040,6 +1040,47 @@ fn icon_cache_dir() -> std::path::PathBuf {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     base.join("Finder").join("icons")
+}
+
+/// Pre-extract icons for the first screenful of app rows at startup, so the
+/// first open after boot shows real icons immediately instead of letter chips
+/// while the lazy per-row extraction crawls through. Runs on its own thread,
+/// reuses the same STA worker pool, and skips anything already cached.
+fn warm_icon_cache(state: &AppState) {
+    let pool: Vec<AppEntry> = state.apps.read().clone();
+    let icon_tx = Arc::clone(&state.icon_tx);
+    let icon_cache = Arc::clone(&state.icon_cache);
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let mut warmed = 0usize;
+        for app in pool.iter().take(60) {
+            if app.path.starts_with("ms-settings:") {
+                continue;
+            }
+            let key = app.path.to_lowercase();
+            if icon_cache.lock().contains_key(&key) || icon_disk_path(&key).exists() {
+                continue;
+            }
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Option<String>>();
+            let job = IconJob { path: app.path.clone(), reply: reply_tx };
+            if icon_tx.send(job).is_err() {
+                break;
+            }
+            if let Ok(Some(uri)) = reply_rx.recv_timeout(Duration::from_secs(3)) {
+                icon_cache.lock().insert(key.clone(), uri.clone());
+                if let Some(png) = uri_png_bytes(&uri) {
+                    let _ = std::fs::create_dir_all(icon_cache_dir());
+                    let _ = std::fs::write(icon_disk_path(&key), png);
+                }
+                warmed += 1;
+            }
+        }
+        log_line(&format!(
+            "icons: warmed {} app icons in {:.0}ms",
+            warmed,
+            started.elapsed().as_millis()
+        ));
+    });
 }
 
 /// One-time migration: the string-form AppsFolder extraction briefly persisted
@@ -2385,6 +2426,7 @@ fn main() {
         first_scan: Arc::clone(&first_scan),
     };
     purge_legacy_generic_icons();
+    warm_icon_cache(&state);
 
     // Live app pool: re-scan Start Menu / AppsFolder / Uninstall registry
     // every minute; swap + bump the rev only when the list actually changed
@@ -3887,31 +3929,82 @@ fn load_cache_and_catch_up(
     drives: &[finder::mft::types::NtfsDrive],
     cache_path: &Path,
 ) -> bool {
+    // Sweep orphaned temp files from a crash/kill mid-save. The live cache is
+    // never at risk here — saves publish atomically, so a half-written tmp is
+    // always discardable.
+    if let Some(parent) = cache_path.parent() {
+        if let Ok(rd) = std::fs::read_dir(parent) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with("finder_cache.tmp.") {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
     if !cache_path.exists() {
         return false;
     }
 
-    // v3 cache layout: lz4 frame stream, deserialized straight off disk —
-    // no full-blob decompress allocation. Old prepended-size caches fail the
-    // frame header check and are rejected below (one fresh rescan).
+    // v4 cache: zstd frame (much better ratio on repetitive path arenas —
+    // smaller file, less disk time at boot). v3 lz4 frames still decode via
+    // a magic-byte sniff so an older cache is never invalidated by an
+    // upgrade; it just converts on the next save. Anything else fails the
+    // magic check and is rejected below (one fresh rescan).
     let t0 = std::time::Instant::now();
     let cache = std::fs::File::open(cache_path).ok().and_then(|file| {
-        let mut dec = lz4_flex::frame::FrameDecoder::new(std::io::BufReader::new(file));
-        bincode::deserialize_from::<_, finder::index::store::CacheData>(&mut dec).ok()
+        let mut r = std::io::BufReader::new(file);
+        let mut magic = [0u8; 4];
+        if r.read_exact(&mut magic).is_err() {
+            return None;
+        }
+        if magic == [0x28, 0xB5, 0x2F, 0xFD] {
+            // v4: zstd frame. The 4 magic bytes were consumed above — rewind
+            // so the decoder starts at the frame boundary (it validates the
+            // magic itself; starting 4 bytes in reads "Unknown frame descriptor").
+            if r.seek(io::SeekFrom::Start(0)).is_err() {
+                return None;
+            }
+            let mut dec = zstd::stream::read::Decoder::new(r).ok()?;
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut dec, &mut buf).ok()?;
+            bincode::deserialize::<finder::index::store::CacheData>(&buf).ok()
+        } else if magic == [0x04, 0x22, 0x4D, 0x18] {
+            // v3: legacy lz4 frame.
+            if r.seek(io::SeekFrom::Start(0)).is_err() {
+                return None;
+            }
+            let mut dec = lz4_flex::frame::FrameDecoder::new(r);
+            bincode::deserialize_from::<_, finder::index::store::CacheData>(&mut dec).ok()
+        } else {
+            None
+        }
     });
     let t1 = std::time::Instant::now();
     match cache {
         Some(cache) => {
             if cache.entries.is_empty() {
+                log_line("cache: rejected (empty entries) - full rescan");
                 let _ = std::fs::remove_file(cache_path);
                 *index.write() = IndexStore::new();
                 return false;
             }
 
             let checkpoints = cache.checkpoints.clone();
+            log_line(&format!(
+                "cache: decoded {} entries, {} roots, {} checkpoint(s): [{}]",
+                cache.entries.len(),
+                cache.drive_roots.len(),
+                checkpoints.len(),
+                checkpoints
+                    .iter()
+                    .map(|c| format!("'{}'", c.drive_letter))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
             let Some(store) = IndexStore::from_cache(cache) else {
                 // Old cache format (pre-v2) or structurally corrupt — a
                 // format bump intentionally invalidates previous caches.
+                log_line("cache: rejected (from_cache corrupt) - full rescan");
                 let _ = std::fs::remove_file(cache_path);
                 *index.write() = IndexStore::new();
                 return false;
@@ -3931,15 +4024,28 @@ fn load_cache_and_catch_up(
             let (delta_tx, delta_rx) = unbounded::<IndexEvent>();
             for drive in drives {
                 let Some(cp) = checkpoints.iter().find(|c| c.drive_letter == drive.letter) else {
-                    let _ = std::fs::remove_file(cache_path);
-                    *index.write() = IndexStore::new();
-                    return false;
+                    // No checkpoint for this drive. Never nuke a valid index
+                    // over this — skip the USN replay and let the live watcher
+                    // start from the current journal position (identical to
+                    // the no-checkpoint behavior).
+                    log_line(&format!(
+                        "cache: no checkpoint for drive '{}' (have [{}]) - skipping catchup",
+                        drive.letter,
+                        checkpoints
+                            .iter()
+                            .map(|c| format!("'{}'", c.drive_letter))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                    return true;
                 };
 
                 let Ok(mut watcher) = UsnWatcher::new_from(drive, delta_tx.clone(), Some(cp)) else {
-                    let _ = std::fs::remove_file(cache_path);
-                    *index.write() = IndexStore::new();
-                    return false;
+                    log_line(&format!(
+                        "cache: watcher start failed for drive '{}' - skipping catchup",
+                        drive.letter
+                    ));
+                    return true;
                 };
 
                 watcher.drain();
@@ -3965,6 +4071,10 @@ fn load_cache_and_catch_up(
             true
         }
         None => {
+            // Decode/open failure (missing file, bad frame magic, or a
+            // corrupt stream). Log it so a healthy-cache rejection is never
+            // silent — then discard and rescan.
+            log_line("cache: rejected (no decodable stream on disk) - full rescan");
             let _ = std::fs::remove_file(cache_path);
             *index.write() = IndexStore::new();
             false
@@ -4103,7 +4213,7 @@ fn build_full_index(
     let _ = writeln!(io::stderr(), "Finder index ready in {:.2}s", total_secs);
 }
 
-/// Serialize the cache straight into an lz4 frame on disk — one pass, no
+/// Serialize the cache straight into a zstd frame on disk — one pass, no
 /// full-size intermediates. The snapshot clone is kept so the read lock is
 /// released before serialization runs (searches never block on a save).
 fn save_cache(index: &Arc<RwLock<IndexStore>>, cache_path: &Path) {
@@ -4116,10 +4226,10 @@ fn save_cache(index: &Arc<RwLock<IndexStore>>, cache_path: &Path) {
     };
     let _ = write_atomic_with(cache_path, |tmp| {
         let file = std::fs::File::create(tmp)?;
-        let mut enc = lz4_flex::frame::FrameEncoder::new(std::io::BufWriter::new(file));
+        let mut enc = zstd::stream::write::Encoder::new(std::io::BufWriter::new(file), 3)?;
         bincode::serialize_into(&mut enc, &cache)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, Box::new(e)))?;
-        enc.finish().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        enc.finish()?;
         Ok(())
     });
 }
@@ -4510,11 +4620,24 @@ fn write_atomic_with(
     let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
     write(&tmp)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            let _ = std::fs::remove_file(path);
-            std::fs::rename(&tmp, path)
-        }
+    // Atomic replace via MoveFileExW(REPLACE_EXISTING). std::fs::rename fails
+    // when the destination already exists on Windows, and a delete-then-rename
+    // fallback leaves a window where a crash/kill loses the live cache — never
+    // delete the destination out from under the reader.
+    replace_file(&tmp, path)?;
+    Ok(())
+}
+
+/// MoveFileExW with MOVEFILE_REPLACE_EXISTING — an atomic replace that never
+/// leaves the destination missing (unlike remove_file + rename).
+fn replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+    let s: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
+    let d: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        MoveFileExW(windows::core::PCWSTR(s.as_ptr()), windows::core::PCWSTR(d.as_ptr()), MOVEFILE_REPLACE_EXISTING)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     }
+    Ok(())
 }
