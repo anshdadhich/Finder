@@ -26,7 +26,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install tauri CLI (v1)
-        run: cargo install tauri-cli --version 1
+        run: cargo install tauri-cli --version ^1
       - name: Restore updater signing key
         shell: pwsh
         run: |
