@@ -1042,6 +1042,30 @@ fn icon_cache_dir() -> std::path::PathBuf {
     base.join("Finder").join("icons")
 }
 
+/// One-time migration: the string-form AppsFolder extraction briefly persisted
+/// the GENERIC fallback icon to disk (all rows looked the same) in a variety
+/// of sizes/clusters. Delete the ENTIRE icon cache so the fixed PIDL-based
+/// extractor repopulates real icons (lazy, one batch per viewport — costs a
+/// second on the first open, then cached forever).
+fn purge_legacy_generic_icons() {
+    let stamp = icon_cache_dir().join(".gen3");
+    if stamp.exists() {
+        return;
+    }
+    let mut removed = 0usize;
+    if let Ok(entries) = std::fs::read_dir(icon_cache_dir()) {
+        for e in entries.flatten() {
+            if e.path().extension().map(|x| x == "png").unwrap_or(false) {
+                if std::fs::remove_file(e.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    let _ = std::fs::write(stamp, b"1");
+    log_line(&format!("icons: purged {} cached icons (one-time cache reset)", removed));
+}
+
 fn icon_disk_path(path: &str) -> std::path::PathBuf {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1065,6 +1089,7 @@ async fn get_icons(
 ) -> Result<HashMap<String, String>, String> {
     let state = app.state::<AppState>().inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        log_line(&format!("[icon] get_icons batch: {}", paths.join(" | ")));
         let mut out = HashMap::with_capacity(paths.len());
         let mut pending: Vec<String> = Vec::new();
 
@@ -1104,18 +1129,22 @@ async fn get_icons(
             let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Option<String>>();
             let job = IconJob { path: path.clone(), reply: reply_tx };
             if state.icon_tx.send(job).is_err() {
+                log_line("[icon] worker pool gone — serving partial set");
                 break; // pool gone (shutdown) — serve what we have
             }
-            let Ok(Some(uri)) = reply_rx.recv_timeout(Duration::from_secs(5)) else {
-                continue;
-            };
-            let key = path.to_lowercase();
-            state.icon_cache.lock().insert(key.clone(), uri.clone());
-            if let Some(png) = uri_png_bytes(&uri) {
-                let _ = std::fs::create_dir_all(icon_cache_dir());
-                let _ = std::fs::write(icon_disk_path(&key), png);
+            match reply_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Some(uri)) => {
+                    let key = path.to_lowercase();
+                    state.icon_cache.lock().insert(key.clone(), uri.clone());
+                    if let Some(png) = uri_png_bytes(&uri) {
+                        let _ = std::fs::create_dir_all(icon_cache_dir());
+                        let _ = std::fs::write(icon_disk_path(&key), png);
+                    }
+                    out.insert(path, uri);
+                }
+                Ok(None) => log_line(&format!("[icon] worker returned none: {}", path)),
+                Err(_) => log_line(&format!("[icon] worker TIMEOUT (5s): {}", path)),
             }
-            out.insert(path, uri);
         }
         out
     })
@@ -1130,16 +1159,23 @@ fn get_icon_data_uri(path: &str) -> Option<String> {
     }
 
     let uri = if let Some(rest) = path.strip_prefix("aumid:") {
-        aumid_icon_data_uri(rest).or_else(generic_icon_data_uri)
+        aumid_icon_data_uri(rest).or_else(|| or_generic_icon(path))
     } else if path.starts_with("ms-") {
-        uri_icon_data_uri(path).or_else(generic_icon_data_uri)
+        uri_icon_data_uri(path).or_else(|| or_generic_icon(path))
     } else {
-        extract_icon_data_uri(path).or_else(generic_icon_data_uri)
+        extract_icon_data_uri(path).or_else(|| or_generic_icon(path))
     };
     if uri.is_none() {
         eprintln!("[icon] no icon for {}", path);
     }
     uri
+}
+
+/// Generic fallback with a log line — a row that stays generic is a
+/// diagnosable extraction miss, not a mysterious blank.
+fn or_generic_icon(path: &str) -> Option<String> {
+    log_line(&format!("[icon] generic fallback: {}", path));
+    generic_icon_data_uri()
 }
 
 /// Map known URI schemes to a real app icon.
@@ -1281,27 +1317,24 @@ fn icon_to_png(icon: HICON) -> Option<Vec<u8>> {
 }
 
 fn aumid_icon_data_uri(aumid: &str) -> Option<String> {
-    // SHGetFileInfoW resolves shell:AppsFolder\<AUMID> to the app's icon.
-    // NOTE: SHGFI_USEFILEATTRIBUTES must NOT be used here — it skips namespace
-    // resolution and returns a generic blank document icon for EVERY entry.
-    let mut wide = "shell:appsFolder\\".encode_utf16().collect::<Vec<u16>>();
-    wide.extend(aumid.encode_utf16());
-    wide.push(0);
+    // The string form of SHGetFileInfoW returns 0 for shell:AppsFolder
+    // entries (verified empirically), so resolve the path to a PIDL first and
+    // run the proven SHGFI_PIDL extraction — the same route the AppsFolder
+    // enumeration always used for real icons.
+    let path = format!("shell:appsFolder\\{}", aumid);
     unsafe {
-        let mut sfi: SHFILEINFOW = std::mem::zeroed();
-        SHGetFileInfoW(
-            PCWSTR(wide.as_ptr()),
-            FILE_ATTRIBUTE_NORMAL,
-            Some(&mut sfi),
-            size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_LARGEICON,
-        );
-        if sfi.hIcon.is_invalid() {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let w = utf16_null(&path);
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        if SHParseDisplayName::<_, Option<&IBindCtx>>(PCWSTR(w.as_ptr()), None, &mut pidl, 0, None)
+            .is_err()
+            || pidl.is_null()
+        {
             return None;
         }
-        let png = icon_to_png(sfi.hIcon)?;
-        let _ = DestroyIcon(sfi.hIcon);
-        Some(format!("data:image/png;base64,{}", B64.encode(&png)))
+        let uri = pidl_icon_data_uri(pidl);
+        let _ = ILFree(Some(pidl));
+        uri
     }
 }
 
@@ -2336,6 +2369,7 @@ fn main() {
         freq: Arc::new(Mutex::new(std::collections::HashMap::new())),
         first_scan: Arc::clone(&first_scan),
     };
+    purge_legacy_generic_icons();
 
     // Live app pool: re-scan Start Menu / AppsFolder / Uninstall registry
     // every minute; swap + bump the rev only when the list actually changed
