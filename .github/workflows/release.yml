@@ -1,0 +1,48 @@
+# Publish an update: installs the signing key, builds the NSIS installer,
+# signs it, writes latest.json, then creates the GitHub release tagged v<ver>
+# with both files. The tauri updater (endpoint in tauri.conf.json) picks up
+# latest.json from that release.
+#
+# Setup (one time, repo Settings -> Secrets and variables -> Actions):
+#   FINDER_KEY          = base64 of ~\.tauri\finder.key
+#     powershell: [Convert]::ToBase64String([IO.File]::ReadAllBytes("$env:USERPROFILE\.tauri\finder.key"))
+#   FINDER_KEY_PASSWORD = contents of ~\.tauri\finder.key.password
+#
+# Usage:
+#   1. Bump "version" in tauri.conf.json  2. commit
+#   3. git tag v0.2.0 && git push origin v0.2.0
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tauri CLI (v1)
+        run: cargo install tauri-cli --version 1
+      - name: Restore updater signing key
+        shell: pwsh
+        run: |
+          $keyDir = Join-Path $env:USERPROFILE '.tauri'
+          New-Item -ItemType Directory -Force -Path $keyDir | Out-Null
+          [IO.File]::WriteAllBytes((Join-Path $keyDir 'finder.key'), [Convert]::FromBase64String($env:FINDER_KEY))
+          Set-Content (Join-Path $keyDir 'finder.key.password') $env:FINDER_KEY_PASSWORD -NoNewline
+        env:
+          FINDER_KEY: ${{ secrets.FINDER_KEY }}
+          FINDER_KEY_PASSWORD: ${{ secrets.FINDER_KEY_PASSWORD }}
+      - name: Build + sign installer + write latest.json
+        shell: pwsh
+        run: scripts/publish-update.ps1
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/bundle/nsis/*_x64-setup.exe
+            latest.json

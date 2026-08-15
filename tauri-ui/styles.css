@@ -1139,7 +1139,8 @@ body.math-open #results {
   align-items: center;
   justify-content: center;
   gap: 5px;
-  padding: 46px 0;
+  height: 100%;
+  padding: 8px;
   text-align: center;
   color: var(--text-secondary);
 }

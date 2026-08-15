@@ -3495,6 +3495,15 @@ fn start_backend(
             fresh
         };
 
+        // Fresh install: "Start with Windows" is ON by default — the launcher
+        // is useless until the hotkey summons it, so it should be running.
+        if first_run && !autostart_enabled() {
+            match set_autostart(true) {
+                Ok(()) => log_line("autostart: startup shortcut created"),
+                Err(e) => log_line(&format!("autostart: FAILED: {e}")),
+            }
+        }
+
         *status.write() = String::from("Loading cached index...");
         let cache_loaded = load_cache_and_catch_up(&index, &drives, &cache_path);
 
