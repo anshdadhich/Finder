@@ -2150,6 +2150,32 @@ async function installUpdateNow() {
   }
 }
 
+const checkUpdateBtn = document.querySelector("#checkUpdateBtn");
+const updateCheckStatus = document.querySelector("#updateCheckStatus");
+
+async function manualUpdateCheck() {
+  if (!updater) return; // dev build without global API: no-op
+  if (checkUpdateBtn) checkUpdateBtn.disabled = true;
+  if (updateCheckStatus) updateCheckStatus.textContent = "Checking…";
+  try {
+    const result = await updater.checkUpdate();
+    if (updateCheckStatus) {
+      const newer = result && result.shouldUpdate;
+      const ver = newer && result.manifest ? `v${result.manifest.version}` : "Up to date";
+      updateCheckStatus.textContent = newer ? `${ver} — Update now` : ver;
+      setTimeout(() => { updateCheckStatus.textContent = ""; }, 5000);
+    }
+  } catch (error) {
+    console.error("manual update check failed:", error);
+    if (updateCheckStatus) {
+      updateCheckStatus.textContent = "Check failed";
+      setTimeout(() => { updateCheckStatus.textContent = ""; }, 5000);
+    }
+  } finally {
+    if (checkUpdateBtn) checkUpdateBtn.disabled = false;
+  }
+}
+
 function setupUpdater() {
   if (!updater || !updateBanner) return; // dev build without global API: no-op
 
@@ -2157,6 +2183,7 @@ function setupUpdater() {
   // check are already wired up.
   if (updateBtnEl) updateBtnEl.addEventListener("click", installUpdateNow);
   if (updateDismissEl) updateDismissEl.addEventListener("click", hideUpdateBanner);
+  if (checkUpdateBtn) checkUpdateBtn.addEventListener("click", manualUpdateCheck);
 
   updater
     .onUpdaterEvent((event) => {
