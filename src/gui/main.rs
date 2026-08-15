@@ -759,14 +759,26 @@ fn autostart_lnk() -> std::path::PathBuf {
 }
 
 /// True when the "Finder" logon task is registered (schtasks exit code 0).
+/// Spawned with CREATE_NO_WINDOW: the GUI parent must never flash a console.
 fn schtasks_status() -> bool {
     std::process::Command::new("schtasks")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .args(["/Query", "/TN", "Finder"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Marker proving the logon task was verified un-gated, so the (hidden but
+/// still child-process) XML re-check can be skipped on later boots.
+fn gates_fixed_marker() -> std::path::PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Finder")
+        .join("task_gates_fixed")
 }
 
 /// schtasks /Create cannot express the battery options, and its defaults
@@ -778,6 +790,7 @@ fn schtasks_status() -> bool {
 /// already un-gated, Err when the repair could not be completed.
 fn fix_task_power_gates() -> Result<bool, String> {
     let xml = std::process::Command::new("schtasks")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .args(["/Query", "/TN", "Finder", "/XML"])
         .output()
         .map_err(|e| e.to_string())?;
@@ -795,12 +808,15 @@ fn fix_task_power_gates() -> Result<bool, String> {
             "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
         );
     if text == ungated {
+        // Already un-gated — mark it fixed so later boots skip this entirely.
+        let _ = std::fs::write(gates_fixed_marker(), b"1");
         return Ok(false);
     }
     text = ungated;
     let xml_path = std::env::temp_dir().join("finder_task.xml");
     std::fs::write(&xml_path, &text).map_err(|e| e.to_string())?;
     let patched = std::process::Command::new("schtasks")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .args([
             "/Create",
             "/TN",
@@ -816,6 +832,7 @@ fn fix_task_power_gates() -> Result<bool, String> {
         .unwrap_or(false);
     let _ = std::fs::remove_file(&xml_path);
     if patched {
+        let _ = std::fs::write(gates_fixed_marker(), b"1");
         Ok(true)
     } else {
         Err("schtasks /Create /XML failed".into())
@@ -838,11 +855,13 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
     let lnk = autostart_lnk();
     if !enabled {
         let _ = std::process::Command::new("schtasks")
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .args(["/Delete", "/TN", "Finder", "/F"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
         let _ = std::fs::remove_file(&lnk);
+        let _ = std::fs::remove_file(gates_fixed_marker());
         return Ok(());
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -850,6 +869,7 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
     // like the documented  schtasks /Create /TR "\"C:\Program Files\x.exe\""  form.
     let tr = format!("\\\"{}\\\"", exe.to_string_lossy());
     let created = std::process::Command::new("schtasks")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .args([
             "/Create", "/TN", "Finder", "/TR", tr.as_str(),
             "/SC", "ONLOGON", "/RL", "HIGHEST", "/F",
@@ -3615,8 +3635,9 @@ fn start_backend(
         }
         // v0.2.0 registered the logon task with Task Scheduler's default
         // power gates, which silently suppress the trigger on battery
-        // power — repair those tasks on their next launch.
-        else if schtasks_status() {
+        // power — repair those tasks on their next launch. Once repaired,
+        // a marker file stops the re-check from ever running again.
+        else if schtasks_status() && !gates_fixed_marker().exists() {
             match fix_task_power_gates() {
                 Ok(true) => log_line("autostart: repaired battery-gated logon task"),
                 Ok(false) => {}
