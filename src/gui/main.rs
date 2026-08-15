@@ -749,7 +749,8 @@ $c = $u.GetColorValue([Windows.UI.ViewManagement.UIColorType]::Accent)
     }
 }
 
-/// Shell:startup shortcut path — the autostart switch creates/removes it.
+/// Shell:startup shortcut path — legacy fallback when Task Scheduler is
+/// unavailable (a shortcut alone cannot auto-elevate an admin app at logon).
 fn autostart_lnk() -> std::path::PathBuf {
     std::env::var_os("APPDATA")
         .map(std::path::PathBuf::from)
@@ -757,23 +758,61 @@ fn autostart_lnk() -> std::path::PathBuf {
         .unwrap_or_default()
 }
 
-#[tauri::command]
-fn autostart_enabled() -> bool {
-    autostart_lnk().exists()
+/// True when the "Finder" logon task is registered (schtasks exit code 0).
+fn schtasks_status() -> bool {
+    std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", "Finder"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
-/// Turn "start with Windows" on/off (a shortcut in the user's Startup
-/// folder — no admin, no UAC at login, runs unelevated with the session).
+#[tauri::command]
+fn autostart_enabled() -> bool {
+    schtasks_status() || autostart_lnk().exists()
+}
+
+/// Turn "start with Windows" on/off. Finder always runs elevated, and
+/// Windows will not auto-elevate Startup-folder shortcuts at logon — the
+/// entry shows "enabled" in Task Manager yet silently never runs. A Task
+/// Scheduler logon task with highest privileges is what actually starts
+/// the app. The old Startup shortcut path is kept as a fallback for the
+/// unelevated debug build.
 #[tauri::command]
 fn set_autostart(enabled: bool) -> Result<(), String> {
     let lnk = autostart_lnk();
     if !enabled {
+        let _ = std::process::Command::new("schtasks")
+            .args(["/Delete", "/TN", "Finder", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         let _ = std::fs::remove_file(&lnk);
         return Ok(());
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    // IShellLinkW + IPersistFile write the .lnk directly — no PowerShell,
-    // no shell string interpolation anywhere in this path.
+    // /TR needs the path backslash-quote-escaped inside the value, exactly
+    // like the documented  schtasks /Create /TR "\"C:\Program Files\x.exe\""  form.
+    let tr = format!("\\\"{}\\\"", exe.to_string_lossy());
+    let created = std::process::Command::new("schtasks")
+        .args([
+            "/Create", "/TN", "Finder", "/TR", tr.as_str(),
+            "/SC", "ONLOGON", "/RL", "HIGHEST", "/F",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if created {
+        // The task is the working mechanism — drop any legacy shortcut so it
+        // neither double-launches nor leaves a misleading Task Manager entry.
+        let _ = std::fs::remove_file(&lnk);
+        return Ok(());
+    }
+    // Fallback: plain Startup shortcut (only works for unelevated builds).
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, IPersistFile,
@@ -3502,6 +3541,15 @@ fn start_backend(
             match set_autostart(true) {
                 Ok(()) => log_line("autostart: startup shortcut created"),
                 Err(e) => log_line(&format!("autostart: FAILED: {e}")),
+            }
+        }
+        // Older builds registered autostart as a Startup-folder shortcut,
+        // which Windows refuses to auto-elevate at logon — migrate those
+        // installs to the Task Scheduler mechanism on their next launch.
+        else if autostart_lnk().exists() && !schtasks_status() {
+            match set_autostart(true) {
+                Ok(()) => log_line("autostart: migrated Startup shortcut to logon task"),
+                Err(e) => log_line(&format!("autostart: migration FAILED: {e}")),
             }
         }
 

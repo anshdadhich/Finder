@@ -1,0 +1,1 @@
+Fixed: "Start with Windows" now actually starts at login — the old Startup-folder shortcut can't auto-elevate the admin app, so it's replaced with a Task Scheduler logon task. Existing installs migrate automatically.
