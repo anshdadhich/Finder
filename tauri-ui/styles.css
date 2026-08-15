@@ -806,6 +806,10 @@ body.settings-open .preview-pane {
   text-align: right;
 }
 
+.setting-value:empty {
+  display: none;
+}
+
 .setting-btn {
   font-size: 11px;
   font-family: inherit;
