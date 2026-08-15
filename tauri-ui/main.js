@@ -198,15 +198,17 @@ function paintFromPools(query) {
   // painting stale app/file rows under them would just flicker.
   if (isPathQuery(q)) return false;
   // A leading "@" is a web search: one row, always rendered (even before
-  // the pools load on a first run). Enter opens the query in the browser
-  // and the backend may replace this row with real results shortly after.
+  // the pools load on a first run). No fetched suggestions — the row is
+  // exactly what the user typed. Enter opens it in the browser.
   if (q.startsWith("@")) {
     const web = q.slice(1).trim();
     if (web) {
-      const bareDomain = /^[\w-]+(\.[\w-]+)+$/.test(web);
+      const looksLikeUrl =
+        /^[\w-]+(\.[\w-]+)+$/.test(web) || /^https?:\/\/.+/i.test(web);
       items = [{
         kind: "web",
-        name: bareDomain ? `Open ${web} in browser` : `Search the web for “${web}”`,
+        name: looksLikeUrl ? `Open ${web}` : "Open in browser",
+        domain: looksLikeUrl ? hostOf(web) : web,
         path: web,
       }];
       selected = 0;
@@ -336,7 +338,6 @@ async function runSearch() {
     if (all.length >= MAX_ITEMS) break;
     all.push(f);
   }
-  lastWebQuery = "";
   items = all;
   render();
 }
@@ -352,51 +353,15 @@ async function runSearchSafe() {
   }
 }
 
-// ── Inline web results (DuckDuckGo Instant Answer — free, no key) ────────
-// Triggered by a leading "@" and by queries the index answers with nothing
-// (>= 3 chars). Results arrive as a handful of tiny rows in the existing
-// "Web" group — no caching, nothing retained after the query moves on.
-// A JS-side timeout keeps a dead network from hanging the list forever.
-let webSeq = 0;
-let webTimer = null;
-let lastWebQuery = "";
-const WEB_DEBOUNCE_MS = 300;
-
+// ── Inline web search ───────────────────────────────────────────────────
+// Triggered by a leading "@": a single row showing exactly what the user
+// typed (never fetched suggestions). Enter/click opens it in the browser.
 function hostOf(url) {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
   } catch {
     return "";
   }
-}
-
-function scheduleWebSearch(raw) {
-  clearTimeout(webTimer);
-  const seq = ++webSeq;
-  webTimer = setTimeout(async () => {
-    const query = raw.replace(/^@\s*/, "").trim();
-    if (!query) return;
-    let results = [];
-    try {
-      results = await invoke("web_search", { query });
-    } catch {
-      // Offline/API down — the fallback row (or the "No results" hint)
-      // stays; Enter still opens the browser.
-    }
-    if (seq !== webSeq) return;
-    if (input.value.trim().replace(/^@\s*/, "").trim() !== query) return;
-    if (!Array.isArray(results) || !results.length) return;
-    items = results.map((r) => ({
-      kind: "web",
-      name: r.title,
-      path: r.url,
-      domain: hostOf(r.url),
-      snippet: r.snippet || "",
-    }));
-    lastWebQuery = query;
-    selected = 0;
-    render();
-  }, WEB_DEBOUNCE_MS);
 }
 
 async function loadMoreFiles() {
@@ -819,7 +784,7 @@ function renderNow() {
         if (isWeb !== !!el._chipGlobe) {
           el._chipGlobe = isWeb;
           el._chip.innerHTML = isWeb
-            ? "<svg viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"M3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z\"/></svg>"
+            ? "<svg viewBox=\"0 0 24 24\"><circle cx=\"12\" cy=\"12\" r=\"9\"/><ellipse cx=\"12\" cy=\"12\" rx=\"9\" ry=\"3.6\"/><ellipse cx=\"12\" cy=\"12\" rx=\"3.6\" ry=\"9\"/></svg>"
             : "";
         }
         el._chip.classList.toggle("chip-globe", isWeb);
@@ -1819,9 +1784,6 @@ input.addEventListener("input", () => {
   paintFromPools(input.value); // instant, zero IPC
   scheduleSearch(); // authoritative backfill
   syncScanNotice(); // hide the first-run notice once the user types
-  if (input.value.trim().startsWith("@") && input.value.trim().length > 1) {
-    scheduleWebSearch(input.value.trim()); // inline results for @queries
-  }
 });
 
 // The launcher never blocks on the index: while the cache loads or a
