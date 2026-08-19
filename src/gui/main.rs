@@ -15,6 +15,7 @@ use std::{
 };
 
 use crossbeam_channel::unbounded;
+use bincode::Options as BincodeOptions;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tauri::{
@@ -607,12 +608,36 @@ fn load_pool_cache() -> Vec<AppEntry> {
     };
     entries
         .into_iter()
+        // The pool file lives in user-writable LOCALAPPDATA, so a planted
+        // entry must never reach the launcher. Only absolute paths (drive or
+        // UNC — NOT device paths) and namespace prefixes survive; garbage
+        // entries are dropped and the refresh cycle re-enumerates the real
+        // pool within seconds anyway.
+        .filter(|e| is_launchable_path(&e.path))
         .map(|e| AppEntry {
             name: e.name,
             path: e.path,
             icon: None,
         })
         .collect()
+}
+
+/// True for paths the launcher may offer: a Windows absolute path (drive or
+/// UNC), or a virtual namespace prefix. Device paths (`\\.\`, `\\?\`) and
+/// anything relative/empty are rejected.
+fn is_launchable_path(p: &str) -> bool {
+    let path = p.trim();
+    let b = path.as_bytes();
+    (b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/'))
+        || (path.starts_with("\\\\")
+            && !path.starts_with("\\\\.\\")
+            && !path.starts_with("\\\\?\\"))
+        || path.starts_with("aumid:")
+        || path.starts_with("ms-")
+        || path.starts_with("shell:::")
 }
 
 fn app_rank(name_lower: &str, q: &str) -> Option<u8> {
@@ -665,6 +690,16 @@ fn launch_with_verb(path: &str, verb: &str) -> Result<(), String> {
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     use windows::core::PCWSTR;
 
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("empty launch path".into());
+    }
+    // Raw device paths (\\.\C: etc) must never be handed to the shell — they
+    // bypass every file-type check and have no business being "opened".
+    if path.starts_with("\\\\.\\") || path.starts_with("\\\\?\\") {
+        return Err("device paths are not launchable".into());
+    }
+
     // Namespace / virtual paths (UWP, ms-settings, control-panel CLSIDs) can't
     // take elevated or properties verbs — fall back to a plain open.
     if verb != "open"
@@ -678,6 +713,23 @@ fn launch_with_verb(path: &str, verb: &str) -> Result<(), String> {
         let _ = std::process::Command::new("explorer")
             .arg(&target)
             .spawn();
+        return Ok(());
+    }
+
+    // A plain "open" routes through the user's shell (explorer.exe) so the
+    // child runs at MEDIUM integrity with the normal user token — the elevated
+    // Finder must not hand every launched app admin privileges for free. This
+    // closes the app-pool poisoning path: a planted row still executes, but
+    // only with the user's own unelevated rights, and an app that genuinely
+    // requires elevation gets its UAC prompt exactly as it would from
+    // Explorer. (Explicit "runas"/"properties"/"run" verbs still go straight
+    // to ShellExecuteW, which is their purpose.)
+    if verb == "open" {
+        std::process::Command::new("explorer")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed to launch: {}", e))?;
         return Ok(());
     }
 
@@ -4210,16 +4262,28 @@ fn load_cache_and_catch_up(
                 return None;
             }
             let mut dec = zstd::stream::read::Decoder::new(r).ok()?;
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut dec, &mut buf).ok()?;
-            bincode::deserialize::<finder::index::store::CacheData>(&buf).ok()
+            // Stream the frame straight into bincode (no full-index-sized
+            // staging buffer) and cap the decompressed bytes with a Take so a
+            // tampered cache can't force a giant allocation in this elevated
+            // process before from_cache's structural checks even run.
+            bincode::DefaultOptions::new()
+                .with_limit(finder::index::store::MAX_CACHE_DECODED)
+                .deserialize_from::<_, finder::index::store::CacheData>(
+                    std::io::Read::take(&mut dec, finder::index::store::MAX_CACHE_DECODED),
+                )
+                .ok()
         } else if magic == [0x04, 0x22, 0x4D, 0x18] {
             // v3: legacy lz4 frame.
             if r.seek(io::SeekFrom::Start(0)).is_err() {
                 return None;
             }
             let mut dec = lz4_flex::frame::FrameDecoder::new(r);
-            bincode::deserialize_from::<_, finder::index::store::CacheData>(&mut dec).ok()
+            bincode::DefaultOptions::new()
+                .with_limit(finder::index::store::MAX_CACHE_DECODED)
+                .deserialize_from::<_, finder::index::store::CacheData>(
+                    std::io::Read::take(&mut dec, finder::index::store::MAX_CACHE_DECODED),
+                )
+                .ok()
         } else {
             None
         }
