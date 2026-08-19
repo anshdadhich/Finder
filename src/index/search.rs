@@ -415,6 +415,17 @@ fn generic_paged(
     PagedSearch { results, total }
 }
 
+/// Wall-clock budget (ms) for the fuzzy fallback pass. Once the deadline
+/// passes, workers stop scoring and the pass returns whatever top candidates
+/// they already collected — abbreviation queries stay snappy even on
+/// million-entry indexes where a full fuzzy scan used to cost ~100 ms.
+const FUZZY_TIME_BUDGET_MS: u64 = 5;
+
+/// How many entries a worker scores before re-checking the deadline. The
+/// check itself is a `SystemTime::now()` call; smaller = earlier abort,
+/// larger = cheaper per query.
+const FUZZY_DEADLINE_STRIDE: usize = 256;
+
 /// Lay a fuzzy (fzy) ranking over the whole name arena, appending the best
 /// non-duplicate, non-junk, non-excluded candidates as a bottom rank tier.
 fn fuzzy_fill(
@@ -446,6 +457,17 @@ fn fuzzy_fill(
     // `need` entries and pops the worst (lowest score, then largest arena
     // index) on overflow — identical to collecting all, sorting, and
     // truncating, but O(K) memory per worker instead of O(matches).
+    //
+    // X2: a shared wall-clock deadline caps how long this whole-arena scan
+    // may run. Workers re-check it every `FUZZY_DEADLINE_STRIDE` entries and
+    // stop scoring once it passes; the reduce still merges whatever partial
+    // heaps arrived, so under budget the result is byte-for-byte the old one
+    // and over budget it degrades (fewer bottom-filler rows) instead of
+    // stalling the keystroke.
+    let deadline = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64 + FUZZY_TIME_BUDGET_MS)
+        .unwrap_or(u64::MAX);
     let mut best: Vec<(i64, u32)> = {
         let merge = |mut a: std::collections::BinaryHeap<Reverse<(i64, Reverse<u32>)>>,
                      mut b: std::collections::BinaryHeap<Reverse<(i64, Reverse<u32>)>>| {
@@ -466,6 +488,14 @@ fn fuzzy_fill(
             .fold(
                 || std::collections::BinaryHeap::new(),
                 |mut heap, (idx, entry)| {
+                    if idx & (FUZZY_DEADLINE_STRIDE - 1) == 0
+                        && std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64 >= deadline)
+                            .unwrap_or(false)
+                    {
+                        return heap; // budget exhausted — stop this slice
+                    }
                     if !used_refs.contains(&entry.file_ref) {
                         let n = unsafe {
                             std::str::from_utf8_unchecked(
