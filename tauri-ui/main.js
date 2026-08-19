@@ -10,7 +10,7 @@ const invoke =
   __i.invoke ||
   (() => Promise.reject(new Error("no IPC bridge")));
 const listen = (event, handler) =>
-  (window.__TAURI_INTERNALS__?.listen || __i.event?.listen)(event, handler);
+  (__i.event?.listen || window.__TAURI_INTERNALS__?.listen)(event, handler);
 
 // Privileged commands (launch_admin, uninstall_app, image_data,
 // grab_backdrop) require the per-session nonce (S4): fetched once at boot

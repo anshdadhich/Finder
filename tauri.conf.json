@@ -5,7 +5,7 @@
     "beforeDevCommand": "",
     "devPath": "tauri-ui",
     "distDir": "tauri-ui",
-    "withGlobalTauri": false
+    "withGlobalTauri": true
   },
   "package": {
     "productName": "Finder",
