@@ -48,13 +48,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ShowWindow, SW_RESTORE,
 };
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Diagnostics::Debug::{
+    SetUnhandledExceptionFilter, EXCEPTION_POINTERS,
+};
 use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 
 use finder::{
     index::{search, store::IndexStore},
     mft::{
         reader::MftReader,
-        types::IndexEvent,
+        types::{IndexEvent, NtfsDrive},
         watcher::UsnWatcher,
     },
     utils::drives::get_ntfs_drives,
@@ -2299,12 +2302,53 @@ fn chrono_like_now() -> String {
     format!("+{:.3}s", d.as_secs_f64())
 }
 
+/// Windows unhandled-exception filter: appends a CRASH marker to the log so
+/// hard aborts (access violations, stack overflow) that skip Rust's panic
+/// hook are visible instead of silently killing the process. Best-effort I/O
+/// from the filter; returns EXCEPTION_EXECUTE_HANDLER so the process still
+/// terminates through the default machinery.
+unsafe extern "system" fn crash_marker(_info: *const EXCEPTION_POINTERS) -> i32 {
+    best_effort_crash_log("CRASH");
+    1 // EXCEPTION_EXECUTE_HANDLER
+}
+
+fn best_effort_crash_log(reason: &str) {
+    use std::io::Write;
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = base.join("Finder").join("log.txt");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[crash] {}", reason);
+        let _ = f.flush();
+    }
+}
+
 fn main() {
     // Everything hits the log file, panics included — the window has no
     // console and silent exits are impossible to debug otherwise.
     std::panic::set_hook(Box::new(|info| {
-        log_line(&format!("PANIC: {}", info));
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        log_line(&format!("PANIC: {} at {}", msg, loc));
+        eprintln!("PANIC: {} at {}", msg, loc);
     }));
+    // Hard crashes (access violations, stack overflow, illegal instructions)
+    // bypass Rust's panic hook entirely and abort the process with no log.
+    // Install a filter that appends a CRASH marker first, so a silent death
+    // is never silent again. Best-effort I/O from the filter — if the crash
+    // leaves the heap usable it lands in the log, otherwise we lose nothing.
+    unsafe {
+        SetUnhandledExceptionFilter(Some(crash_marker));
+    }
     log_line("main: start");
     if std::env::args().any(|a| a == "--dump-apps") {
         let apps = discover_apps();
@@ -2462,8 +2506,10 @@ fn main() {
                 // initial load's refreshBackdrop() covers that first show).
                 let _ = window.emit("backdrop", grab);
             }
-            let _ = window.show();
-            let _ = window.set_focus();
+            // Hold the first show until the frontend signals it has painted
+            // the frosted-glass backdrop (frontend_loaded); a 4s watchdog
+            // guarantees the window appears even if the page never loads.
+            arm_first_show_timeout(window.clone());
 
             // Primary summon hotkey, configurable in Settings (Ctrl+Space or
             // Alt+Space, persisted in HKCU\Software\Finder\Hotkey). NB:
@@ -2490,17 +2536,18 @@ fn main() {
                         api.prevent_close();
                     }
                     tauri::WindowEvent::Focused(false) => {
-                        // First run: while the index is being built the
-                        // shell often never grants foreground to a freshly
-                        // elevated process (foreground lock), which fires
-                        // Focused(false) right after setup's show+focus —
-                        // the launcher would vanish before it is seen.
-                        // Hold the window up until the first scan ends.
-                        if event
-                            .window()
-                            .state::<AppState>()
-                            .first_scan
-                            .load(Ordering::Relaxed)
+                        // The shell often never grants foreground to a
+                        // freshly launched process (foreground lock), which
+                        // fires Focused(false) right after setup's show+focus
+                        // — the launcher would vanish before it is seen. On
+                        // FIRST run this also fires during the whole scan.
+                        // Hold the window up until the index reaches ready,
+                        // so launching the app (install or any start while it
+                        // is still indexing/catching up) always surfaces the
+                        // launcher once, like pressing the summon hotkey.
+                        let st = event.window().state::<AppState>();
+                        if st.first_scan.load(Ordering::Relaxed)
+                            || !st.ready.load(Ordering::Relaxed)
                         {
                             return;
                         }
@@ -2567,7 +2614,8 @@ fn main() {
             set_autostart,
             get_hotkey,
             set_hotkey,
-            image_data
+            image_data,
+            frontend_loaded
         ])
         .build(tauri::generate_context!())
         .expect("error while building Finder");
@@ -2599,23 +2647,82 @@ fn backdrop_ok() -> bool {
     true
 }
 
-fn position_spotlight(window: &tauri::Window) {
-    if let Some(monitor) = window.current_monitor().ok().flatten() {
-        let size = monitor.size();
-        let scale = monitor.scale_factor();
-        let win = window.inner_size().map(|s| tauri::LogicalSize::new(
-            s.width as f64 / scale,
-            s.height as f64 / scale,
-        )).unwrap_or(tauri::LogicalSize::new(700.0, 460.0));
-        let x = (size.width as f64 - win.width * scale) / 2.0;
-        // Spotlight-style top placement (12% of the screen), clamped so the
-        // window always fits on the display (small screens, low resolutions):
-        // the bottom must stay on-screen with a small margin.
-        let top = size.height as f64 * 0.12;
-        let max_top = (size.height as f64 - win.height * scale - 12.0).max(0.0);
-        let y = top.min(max_top);
-        let _ = window.set_position(tauri::LogicalPosition::new(x / scale, y / scale));
+// First-show handshake: setup no longer shows the window immediately (the
+// webview is still loading — an early show paints the card over raw desktop
+// before the frontend applies the frosted-glass backdrop). The page invokes
+// frontend_loaded once it has painted and grabbed the backdrop; a watchdog
+// shows the window anyway after a timeout so a dead/blank webview can never
+// leave launch looking like nothing happened.
+static FIRST_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[tauri::command]
+fn frontend_loaded(window: tauri::Window) {
+    if !FIRST_SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log_line("window: frontend loaded — first show");
+        show_spotlight(&window);
     }
+}
+
+/// Timeout fallback for the first-show handshake.
+fn arm_first_show_timeout(window: tauri::Window) {
+    thread::spawn(move || {
+        thread::sleep(std::time::Duration::from_secs(4));
+        if !FIRST_SHOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            FIRST_SHOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+            log_line("window: frontend_loaded never arrived — showing after timeout");
+            show_spotlight(&window);
+        }
+    });
+}
+
+fn position_spotlight(window: &tauri::Window) {
+    // current_monitor() can return None while the window is still hidden and
+    // unassigned — fall back to the primary so positioning never silently no-ops.
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten());
+    let Some(monitor) = monitor else {
+        return;
+    };
+
+    let scale = monitor.scale_factor();
+    let size = monitor.size(); // physical px
+    let origin = monitor.position(); // physical px of the monitor's top-left
+    let win = window
+        .inner_size()
+        .map(|s| tauri::LogicalSize::new(s.width as f64 / scale, s.height as f64 / scale))
+        .unwrap_or(tauri::LogicalSize::new(700.0, 460.0));
+
+    // All math in physical px, then converted to logical for set_position.
+    // The monitor ORIGIN is added: on a secondary display (offset from the
+    // primary) ignoring it parks the window on the primary's corner instead
+    // of where the math intended — the classic "small part in the corner".
+    let x_phys = origin.x as f64 + (size.width as f64 - win.width * scale) / 2.0;
+    let top = size.height as f64 * 0.12;
+    let max_top = (size.height as f64 - win.height * scale - 12.0).max(0.0);
+    let y_phys = origin.y as f64 + top.min(max_top);
+
+    // Defensive clamp: keep the whole window on its monitor even if rounding
+    // or a fractional scale would push an edge off-screen.
+    let x_phys = x_phys.clamp(
+        origin.x as f64,
+        origin.x as f64 + (size.width as f64 - win.width * scale).max(0.0),
+    );
+    let y_phys = y_phys.clamp(
+        origin.y as f64,
+        origin.y as f64 + (size.height as f64 - win.height * scale).max(0.0),
+    );
+
+    let _ = window.set_position(tauri::LogicalPosition::new(
+        x_phys / scale,
+        y_phys / scale,
+    ));
+    log_line(&format!(
+        "window: positioned at phys ({:.0},{:.0}) win {}x{} scale {} monitor {}x{} at {:?}",
+        x_phys, y_phys, win.width, win.height, scale, size.width, size.height, origin
+    ));
 }
 
 fn show_spotlight(window: &tauri::Window) {
@@ -3691,6 +3798,178 @@ fn find_exe(dir: &Path, app_name: &str) -> Option<std::path::PathBuf> {
     best
 }
 
+/// Result of loading the persisted cache at startup.
+enum CacheLoad {
+    /// Cache decoded and replayed from saved checkpoints; the in-memory
+    /// index now covers everything the journal recorded while the app was
+    /// not running (the live watcher covers anything newer).
+    Ready,
+    /// Cache decoded but cannot be brought current from the journal — no
+    /// checkpoints, a drive lacks one, or a journal reset/truncation made
+    /// the saved position invalid. The snapshot is served for fast UX and
+    /// a background full scan swaps in a fresh index when done; live
+    /// watchers start only after that swap.
+    Provisional { snapshot_secs: u64 },
+    /// No usable cache on disk (missing/deleted/corrupt) — the caller must
+    /// run a full scan now.
+    Scanning,
+}
+
+/// Compact relative age for status/log text ("3 min ago", "2 d ago", ...).
+/// Used to surface how stale a served snapshot is without needing a chrono
+/// dependency for a date format.
+fn fmt_ago(epoch_secs: u64) -> String {
+    let now = now_millis() / 1000;
+    let diff = now.saturating_sub(epoch_secs);
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        format!("{} min ago", diff / 60)
+    } else if diff < 86_400 {
+        format!("{} h ago", diff / 3600)
+    } else if diff < 2_592_000 {
+        format!("{} d ago", diff / 86_400)
+    } else {
+        format!("{} wk ago", diff / 604_800)
+    }
+}
+
+/// Start one USN watcher per drive. Each watcher resumes from the store's
+/// saved checkpoint for that drive (or the journal's current position when
+/// no checkpoint exists). Resuming from the checkpoint is what makes a drive
+/// that was scanned-but-not-yet-followed catch up — e.g. events that landed
+/// while a full rescan was still reading a different volume — instead of
+/// silently starting "now" and losing them. A failed start (journal reset,
+/// checkpoint truncated) is logged and the heartbeat is zeroed so the
+/// watchdog surfaces the staleness instead of pretending the watcher is fine.
+fn spawn_live_watchers(
+    drives: &[NtfsDrive],
+    tx: crossbeam_channel::Sender<IndexEvent>,
+    index: &Arc<RwLock<IndexStore>>,
+) -> HashMap<char, Arc<AtomicU64>> {
+    let heartbeats: HashMap<char, Arc<AtomicU64>> = drives
+        .iter()
+        .map(|d| (d.letter, Arc::new(AtomicU64::new(now_millis() as u64))))
+        .collect();
+    for drive in drives {
+        let tx_clone = tx.clone();
+        let drive_clone = drive.clone();
+        let idx = Arc::clone(index);
+        let hb = heartbeats.get(&drive.letter).cloned().expect("heartbeat");
+        thread::spawn(move || {
+            let cp = idx
+                .read()
+                .checkpoints
+                .iter()
+                .find(|c| c.drive_letter == drive_clone.letter)
+                .cloned();
+            match UsnWatcher::new_from(&drive_clone, tx_clone, cp.as_ref()) {
+                Ok(mut watcher) => watcher.run_shared(hb),
+                Err(e) => {
+                    log_line(&format!(
+                        "watcher: start failed for drive '{}' - {} - results may be stale",
+                        drive_clone.letter, e
+                    ));
+                    hb.store(0, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    heartbeats
+}
+
+/// Wire up the live side of the index: status transition, USN watchers, the
+/// event applier, the heartbeat watchdog and the periodic cache saver.
+/// Called exactly once per backend lifetime, after the index has reached its
+/// final form (loaded+replayed, first scan, or provisional refresh swap).
+fn finish_backend(
+    index: &Arc<RwLock<IndexStore>>,
+    ready: &Arc<AtomicBool>,
+    status: &Arc<RwLock<String>>,
+    dirty: &Arc<AtomicBool>,
+    cache_path: &Path,
+    drives: &[NtfsDrive],
+    tx: crossbeam_channel::Sender<IndexEvent>,
+    rx: crossbeam_channel::Receiver<IndexEvent>,
+) {
+    let heartbeats = spawn_live_watchers(drives, tx.clone(), index);
+
+    ready.store(true, Ordering::Relaxed);
+    log_line("index ready — watchers starting");
+    *status.write() = format!("{} files indexed", index.read().len());
+
+    // Live event applier: batches data events, and only stores a
+    // Checkpoint in `store.checkpoints` once every prior event on the
+    // ordered channel has been applied. Saving that checkpoint is always a
+    // consistent snapshot, so nothing is lost or duplicated on restart.
+    let applier_index = Arc::clone(index);
+    let applier_dirty = Arc::clone(dirty);
+    thread::spawn(move || {
+        let mut pending: Vec<IndexEvent> = Vec::with_capacity(64);
+        for event in &rx {
+            match event {
+                IndexEvent::Checkpoint(cp) => {
+                    if !pending.is_empty() {
+                        applier_index.write().apply_events(std::mem::take(&mut pending));
+                    }
+                    let mut store = applier_index.write();
+                    store.checkpoints.retain(|c| c.drive_letter != cp.drive_letter);
+                    store.checkpoints.push(cp.clone());
+                    applier_dirty.store(true, Ordering::Relaxed);
+                }
+                other => {
+                    pending.push(other);
+                    if pending.len() >= 64 {
+                        applier_index.write().apply_events(std::mem::take(&mut pending));
+                        applier_dirty.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+
+    // Watchdog: if a drive's watcher heartbeat went dark (>60s), mark the
+    // index stale and surface the scan page with a re-index hint. A
+    // heartbeat of 0 (watcher never started or the journal died) is treated
+    // the same as a stale one — silently serving results over a dead USN
+    // journal is exactly the staleness bug this watches for.
+    let wd_hb = heartbeats.clone();
+    let wd_status = Arc::clone(status);
+    let wd_ready = Arc::clone(ready);
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(15));
+            let now = now_millis();
+            for (letter, hb) in &wd_hb {
+                let last = hb.load(Ordering::Relaxed);
+                if now.saturating_sub(last) > 60_000 {
+                    hb.store(0, Ordering::Relaxed);
+                    wd_ready.store(false, Ordering::Relaxed);
+                    *wd_status.write() = format!(
+                        "File watcher on {} stopped — results may be stale. Use \"Try again\" to re-index.",
+                        letter
+                    );
+                }
+            }
+        }
+    });
+
+    // Periodic cache persistence so a hard kill never loses the USN
+    // checkpoints. Only writes when the index changed since last save.
+    let saver_index = Arc::clone(index);
+    let saver_dirty = Arc::clone(dirty);
+    let saver_path = cache_path.to_path_buf();
+    thread::spawn(move || {
+        let interval = Duration::from_secs(30);
+        loop {
+            thread::sleep(interval);
+            if saver_dirty.swap(false, Ordering::Relaxed) {
+                save_cache(&saver_index, &saver_path);
+            }
+        }
+    });
+}
+
 fn start_backend(
     index: Arc<RwLock<IndexStore>>,
     ready: Arc<AtomicBool>,
@@ -3806,121 +4085,77 @@ fn start_backend(
         }
 
         *status.write() = String::from("Loading cached index...");
-        let cache_loaded = load_cache_and_catch_up(&index, &drives, &cache_path);
-
-        if !cache_loaded {
-            if first_run {
-                first_scan.store(true, Ordering::Relaxed);
-            }
-            build_full_index(&index, &drives, &cache_path, &status, &progress);
-            first_scan.store(false, Ordering::Relaxed);
-        }
-
-        // Never present a working-looking palette over an empty index: if the
-        // MFT couldn't be read (missing admin rights), stay on the scan page
-        // with an actionable message instead of silently searching nothing.
-        if index.read().len() == 0 {
-            *status.write() = String::from(
-                "No files were indexed — Finder needs administrator rights to read the NTFS journal. Relaunch as Administrator and press \"Try again\".",
-            );
-            eprintln!("Error: index has 0 files — running elevated? NTFS readable?");
-            return;
-        }
-
-        ready.store(true, Ordering::Relaxed);
-        log_line("index ready — watchers starting");
-        *status.write() = format!("{} files indexed", index.read().len());
-
-        // Watcher heartbeats: the watchdog below flips the app back to the
-        // scan state if a journal dies mid-session (chkdsk, defrag, USN
-        // journal reset) instead of silently serving stale results forever.
-        let heartbeats: std::collections::HashMap<char, Arc<std::sync::atomic::AtomicU64>> =
-            drives
-                .iter()
-                .map(|d| (d.letter, Arc::new(AtomicU64::new(now_millis() as u64))))
-                .collect();
-
-        for drive in &drives {
-            let tx_clone = tx.clone();
-            let drive_clone = drive.clone();
-            let hb = heartbeats.get(&drive.letter).cloned().expect("heartbeat");
-            thread::spawn(move || {
-                let Ok(mut watcher) = UsnWatcher::new(&drive_clone, tx_clone) else {
-                    hb.store(0, Ordering::Relaxed);
-                    return;
-                };
-                watcher.run_shared(hb);
-            });
-        }
-
-        // Live event applier: batches data events, and only stores a
-        // Checkpoint in `store.checkpoints` once every prior event on the
-        // ordered channel has been applied. Saving that checkpoint is always a
-        // consistent snapshot, so nothing is lost or duplicated on restart.
+        // Shared by every completion path: the live applier saver's dirty
+        // flag. Created before the branch so both the synchronous and the
+        // provisional-async paths can hand it to finish_backend.
         let dirty: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-        let applier_index = Arc::clone(&index);
-        let applier_dirty = Arc::clone(&dirty);
-        thread::spawn(move || {
-            let mut pending: Vec<IndexEvent> = Vec::with_capacity(64);
-            for event in &rx {
-                match event {
-                    IndexEvent::Checkpoint(cp) => {
-                        if !pending.is_empty() {
-                            applier_index.write().apply_events(std::mem::take(&mut pending));
-                        }
-                        let mut store = applier_index.write();
-                        store.checkpoints.retain(|c| c.drive_letter != cp.drive_letter);
-                        store.checkpoints.push(cp.clone());
-                        applier_dirty.store(true, Ordering::Relaxed);
-                    }
-                    other => {
-                        pending.push(other);
-                        if pending.len() >= 64 {
-                            applier_index.write().apply_events(std::mem::take(&mut pending));
-                            applier_dirty.store(true, Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
-        });
 
-        // Watchdog: if a drive's watcher heartbeat went dark (>60s), mark the
-        // index stale and surface the scan page with a re-index hint.
-        let wd_hb = heartbeats.clone();
-        let wd_status = Arc::clone(&status);
-        let wd_ready = Arc::clone(&ready);
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(15));
-                let now = now_millis();
-                for (letter, hb) in &wd_hb {
-                    let last = hb.load(Ordering::Relaxed);
-                    if last != 0 && now.saturating_sub(last) > 60_000 {
-                        hb.store(0, Ordering::Relaxed);
-                        wd_ready.store(false, Ordering::Relaxed);
-                        *wd_status.write() = format!(
-                            "File watcher on {} stopped — results may be stale. Use \"Try again\" to re-index.",
-                            letter
+        match load_cache_and_catch_up(&index, &drives, &cache_path) {
+            CacheLoad::Scanning => {
+                if first_run {
+                    first_scan.store(true, Ordering::Relaxed);
+                }
+                build_full_index(&index, &drives, &cache_path, &status, &progress);
+                first_scan.store(false, Ordering::Relaxed);
+                // Never present a working-looking palette over an empty
+                // index: if the MFT couldn't be read (missing admin rights),
+                // stay on the scan page with an actionable message instead
+                // of silently searching nothing.
+                if index.read().len() == 0 {
+                    *status.write() = String::from(
+                        "No files were indexed — Finder needs administrator rights to read the NTFS journal. Relaunch as Administrator and press \"Try again\".",
+                    );
+                    eprintln!("Error: index has 0 files — running elevated? NTFS readable?");
+                    return;
+                }
+                finish_backend(&index, &ready, &status, &dirty, &cache_path, &drives, tx, rx);
+            }
+            CacheLoad::Provisional { snapshot_secs } => {
+                // Warm start with an index that cannot be delta-caught-up
+                // (no checkpoints / a drive without one / a journal reset
+                // that invalidated the saved position). Serve the snapshot
+                // immediately for fast UX, but run a background full scan
+                // that swaps in a fresh index when done. ready stays false
+                // until the swap, so the status strip shows the snapshot age
+                // instead of hiding the staleness.
+                first_scan.store(false, Ordering::Relaxed);
+                log_line("cache: provisional snapshot (no usable checkpoints) - background rescan scheduled");
+                *status.write() = format!(
+                    "Index loaded from snapshot ({}) — refreshing…",
+                    fmt_ago(snapshot_secs)
+                );
+                let idx = Arc::clone(&index);
+                let drv = drives.clone();
+                let cpath = cache_path.clone();
+                let st = Arc::clone(&status);
+                let pr = Arc::clone(&progress);
+                let rd = Arc::clone(&ready);
+                let fs = Arc::clone(&first_scan);
+                let dirty2 = Arc::clone(&dirty);
+                let tx2 = tx.clone();
+                let rx2 = rx;
+                thread::spawn(move || {
+                    if !build_full_index(&idx, &drv, &cpath, &st, &pr) {
+                        *st.write() = String::from(
+                            "Refresh finished but nothing could be read — Finder needs administrator rights to read the NTFS journal.",
                         );
+                        return; // ready stays false → the UI surfaces the failure
                     }
-                }
+                    fs.store(false, Ordering::Relaxed);
+                    finish_backend(&idx, &rd, &st, &dirty2, &cpath, &drv, tx2, rx2);
+                });
             }
-        });
-
-        // Periodic cache persistence so a hard kill never loses the USN
-        // checkpoints. Only writes when the index changed since last save.
-        let saver_index = Arc::clone(&index);
-        let saver_dirty = Arc::clone(&dirty);
-        let saver_path = cache_path.clone();
-        thread::spawn(move || {
-            let interval = Duration::from_secs(30);
-            loop {
-                thread::sleep(interval);
-                if saver_dirty.swap(false, Ordering::Relaxed) {
-                    save_cache(&saver_index, &saver_path);
+            CacheLoad::Ready => {
+                if index.read().len() == 0 {
+                    *status.write() = String::from(
+                        "No files were indexed — Finder needs administrator rights to read the NTFS journal. Relaunch as Administrator and press \"Try again\".",
+                    );
+                    eprintln!("Error: index has 0 files — running elevated? NTFS readable?");
+                    return;
                 }
+                finish_backend(&index, &ready, &status, &dirty, &cache_path, &drives, tx, rx);
             }
-        });
+        }
     });
 }
 
@@ -3928,7 +4163,7 @@ fn load_cache_and_catch_up(
     index: &Arc<RwLock<IndexStore>>,
     drives: &[finder::mft::types::NtfsDrive],
     cache_path: &Path,
-) -> bool {
+) -> CacheLoad {
     // Sweep orphaned temp files from a crash/kill mid-save. The live cache is
     // never at risk here — saves publish atomically, so a half-written tmp is
     // always discardable.
@@ -3942,8 +4177,18 @@ fn load_cache_and_catch_up(
         }
     }
     if !cache_path.exists() {
-        return false;
+        return CacheLoad::Scanning;
     }
+
+    // When the loaded snapshot is served provisionally (no usable
+    // checkpoints), its mtime is the "index as of" time shown to the user so
+    // a stale serve is visible instead of hidden.
+    let snapshot_secs = std::fs::metadata(cache_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     // v4 cache: zstd frame (much better ratio on repetitive path arenas —
     // smaller file, less disk time at boot). v3 lz4 frames still decode via
@@ -3986,7 +4231,7 @@ fn load_cache_and_catch_up(
                 log_line("cache: rejected (empty entries) - full rescan");
                 let _ = std::fs::remove_file(cache_path);
                 *index.write() = IndexStore::new();
-                return false;
+                return CacheLoad::Scanning;
             }
 
             let checkpoints = cache.checkpoints.clone();
@@ -4007,29 +4252,35 @@ fn load_cache_and_catch_up(
                 log_line("cache: rejected (from_cache corrupt) - full rescan");
                 let _ = std::fs::remove_file(cache_path);
                 *index.write() = IndexStore::new();
-                return false;
+                return CacheLoad::Scanning;
             };
             let t2 = std::time::Instant::now();
             *index.write() = store;
 
             if checkpoints.is_empty() {
-                log_line(&format!(
-                    "cache: read {:.0}ms | build {:.0}ms | no checkpoints",
+                // Nothing to replay from — the classic stale-snapshot trap.
+                // Serve the cache for fast UX, but mark it provisional so the
+                // caller kicks off a background full scan instead of serving
+                // this forever.
+                let elapsed_txt = format!(
+                    "cache: read {:.0}ms | build {:.0}ms | checkpoint-less snapshot",
                     t1.duration_since(t0).as_millis(),
                     t2.duration_since(t1).as_millis()
-                ));
-                return true;
+                );
+                log_line(&format!("{elapsed_txt} - provisional (serve + background rescan)"));
+                return CacheLoad::Provisional { snapshot_secs };
             }
 
             let (delta_tx, delta_rx) = unbounded::<IndexEvent>();
+            let mut all_replayed = true;
             for drive in drives {
                 let Some(cp) = checkpoints.iter().find(|c| c.drive_letter == drive.letter) else {
-                    // No checkpoint for this drive. Never nuke a valid index
-                    // over this — skip the USN replay and let the live watcher
-                    // start from the current journal position (identical to
-                    // the no-checkpoint behavior).
+                    // No checkpoint for this drive. The other drives may still
+                    // replay; once any drive is unreplayable the snapshot as a
+                    // whole is provisional, because that drive's pre-boot
+                    // changes are exactly the ones we cannot recover.
                     log_line(&format!(
-                        "cache: no checkpoint for drive '{}' (have [{}]) - skipping catchup",
+                        "cache: no checkpoint for drive '{}' (have [{}]) - unreplayable, provisional rescan",
                         drive.letter,
                         checkpoints
                             .iter()
@@ -4037,30 +4288,55 @@ fn load_cache_and_catch_up(
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
-                    return true;
+                    all_replayed = false;
+                    continue;
                 };
 
                 let Ok(mut watcher) = UsnWatcher::new_from(drive, delta_tx.clone(), Some(cp)) else {
+                    // Journal was reset or the saved position fell outside the
+                    // journal's current window (chkdsk/defrag/USN wrap). Do NOT
+                    // serve this stale snapshot silently — flag it provisional
+                    // so the caller schedules a fresh full scan.
                     log_line(&format!(
-                        "cache: watcher start failed for drive '{}' - skipping catchup",
+                        "cache: watcher start failed for drive '{}' (journal reset or saved USN outside window) - provisional rescan",
                         drive.letter
                     ));
-                    return true;
+                    all_replayed = false;
+                    continue;
                 };
 
-                watcher.drain();
+                if watcher.drain().is_err() {
+                    // Journal read failed mid-drain: the position is not
+                    // trustworthy, so do not checkpoint this drive as caught
+                    // up. A background full rescan will cover it.
+                    log_line(&format!(
+                        "cache: journal read failed during catch-up for drive '{}' - provisional rescan",
+                        drive.letter
+                    ));
+                    all_replayed = false;
+                    continue;
+                }
                 let new_cp = watcher.checkpoint();
                 let mut store = index.write();
                 store.checkpoints.retain(|c| c.drive_letter != drive.letter);
                 store.checkpoints.push(new_cp);
             }
-            let t3 = std::time::Instant::now();
 
             drop(delta_tx);
-            let mut store = index.write();
-            let events: Vec<IndexEvent> = delta_rx.try_iter().collect();
-            let event_count = events.len();
-            store.apply_events(events);
+            let t3 = std::time::Instant::now();
+            // Apply under a strictly scoped write lock, then RELEASE it: the
+            // persist step below re-acquires the same lock as a reader, and a
+            // parking_lot RwLock writer blocks readers even on the same
+            // thread — holding it across save_cache() self-deadlocks the
+            // whole process (the classic warm-start hang: window appears,
+            // then stops responding).
+            let event_count;
+            {
+                let mut store = index.write();
+                let events: Vec<IndexEvent> = delta_rx.try_iter().collect();
+                event_count = events.len();
+                store.apply_events(events);
+            }
             log_line(&format!(
                 "cache: read {:.0}ms | build {:.0}ms | catchup {:.0}ms | {} events",
                 t1.duration_since(t0).as_millis(),
@@ -4068,7 +4344,36 @@ fn load_cache_and_catch_up(
                 t3.duration_since(t2).as_millis(),
                 event_count
             ));
-            true
+
+            if !all_replayed {
+                log_line("cache: partial catch-up (one or more drives unreplayable) - treating snapshot as provisional");
+                return CacheLoad::Provisional { snapshot_secs };
+            }
+
+            // Persist the advanced checkpoints — but ONLY when the catch-up
+            // actually applied changes. Re-encoding the whole index (~2.5s)
+            // just to restamp an unchanged checkpoint on every warm boot is
+            // what made warm starts feel slow. A zero-event catch-up leaves
+            // the on-disk snapshot exactly as-is (safe: a later replay is
+            // idempotent), and the live applier's dirty-save persists the
+            // advanced positions on the first real change anyway.
+            // With changes present, persist on a background thread so the
+            // palette becomes usable immediately (ready is not gated on the
+            // re-encode); searches proceed concurrently — save_cache takes a
+            // reader lock, and SAVE_LOCK serializes it against the saver.
+            log_line(&format!(
+                "cache: catch-up complete, {} events ({}ms) while closed",
+                event_count,
+                t3.duration_since(t2).as_millis()
+            ));
+            if event_count > 0 {
+                let idx = Arc::clone(index);
+                let cp = cache_path.to_path_buf();
+                thread::spawn(move || save_cache(&idx, &cp));
+            } else {
+                log_line("cache: no changes while closed — checkpoint save skipped (index on disk is current)");
+            }
+            CacheLoad::Ready
         }
         None => {
             // Decode/open failure (missing file, bad frame magic, or a
@@ -4077,7 +4382,7 @@ fn load_cache_and_catch_up(
             log_line("cache: rejected (no decodable stream on disk) - full rescan");
             let _ = std::fs::remove_file(cache_path);
             *index.write() = IndexStore::new();
-            false
+            CacheLoad::Scanning
         }
     }
 }
@@ -4088,16 +4393,25 @@ fn build_full_index(
     cache_path: &Path,
     status: &Arc<RwLock<String>>,
     progress: &Arc<AtomicU32>,
-) {
-    *index.write() = IndexStore::new();
+) -> bool {
+    // Build into a scratch store and swap at the end: while the scan runs,
+    // searches keep serving whatever the previous index held (empty on the
+    // very first run) instead of a deliberately-cleared one. Live watchers
+    // later resume from the scan-start checkpoints recorded below, so events
+    // that land while the scan is still reading a different volume are still
+    // replayed instead of silently skipped. Returns false when nothing was
+    // read, in which case whatever index the caller already has is left in
+    // place and served.
+    let mut store = IndexStore::new();
     log_line(&format!("scan begin: {} drive(s)", drives.len()));
-    {
-        let mut store = index.write();
-        for drive in drives {
-            let (dummy_tx, _) = unbounded::<IndexEvent>();
-            if let Ok(w) = UsnWatcher::new(drive, dummy_tx) {
-                store.checkpoints.push(w.checkpoint());
-            }
+    for drive in drives {
+        let (dummy_tx, _) = unbounded::<IndexEvent>();
+        match UsnWatcher::new(drive, dummy_tx) {
+            Ok(w) => store.checkpoints.push(w.checkpoint()),
+            Err(e) => log_line(&format!(
+                "scan: cannot record scan-start checkpoint for drive '{}' - {}",
+                drive.letter, e
+            )),
         }
     }
 
@@ -4183,7 +4497,7 @@ fn build_full_index(
             ((i + 1) as f64 / total_drives as f64 * 100.0).round() as u32
         );
         let t_index = Instant::now();
-        index.write().populate_from_scan(scan, drive);
+        store.populate_from_scan(scan, drive);
         let index_secs = t_index.elapsed().as_secs_f64();
         log_line(&format!(
             "scan drive {}: {} records via {} (read+parse {:.2}s, index {:.2}s; workers {})",
@@ -4198,9 +4512,21 @@ fn build_full_index(
 
     *status.write() = "Optimizing index (sorting + buckets)...".to_string();
     let t_fin = Instant::now();
-    index.write().finalize();
+    store.finalize();
     let fin_secs = t_fin.elapsed().as_secs_f64();
+
+    if store.entries.is_empty() {
+        // Nothing was read (admin lost mid-scan, MFT unreadable): keep the
+        // existing index so searches still serve whatever the caller had
+        // instead of swapping in an empty one.
+        log_line("scan produced no records - keeping existing index");
+        return false;
+    }
+
     *status.write() = "Saving cache...".to_string();
+    // Swap the fresh store in BEFORE saving so the published cache and every
+    // status/ready read that follows reflect the scan that just finished.
+    *index.write() = store;
     let t_save = Instant::now();
     save_cache(index, cache_path);
     let save_secs = t_save.elapsed().as_secs_f64();
@@ -4211,6 +4537,7 @@ fn build_full_index(
         total_secs, fin_secs, save_secs, total_drives
     ));
     let _ = writeln!(io::stderr(), "Finder index ready in {:.2}s", total_secs);
+    true
 }
 
 /// Serialize the cache straight into a zstd frame on disk — one pass, no
@@ -4320,8 +4647,7 @@ fn rebuild_index_impl(state: &AppState) {
             *status.write() = String::from("No NTFS drives found. Run as Administrator.");
             return;
         }
-        build_full_index(&index, &drives, &cache_path, &status, &progress);
-        if index.read().len() == 0 {
+        if !build_full_index(&index, &drives, &cache_path, &status, &progress) {
             *status.write() = String::from(
                 "Rebuild finished but nothing could be read — run as Administrator and try again.",
             );

@@ -650,16 +650,31 @@ impl IndexStore {
         }
 
         // Idempotency: every record in this batch supersedes any pre-existing
-        // entry with the same (drive, file_ref). This makes re-applying
-        // journal events (e.g. after a stale checkpoint) safe instead of
-        // duplicating entries.
+        // entry with the same (drive, file_ref), and records within the batch
+        // itself are collapsed to the newest one per ref. Creating a folder
+        // then renaming it bursts CREATE + RENAME records for the same file
+        // ref in a single batch; without the intra-batch dedup both would be
+        // inserted and the index would carry duplicate entries.
+        let mut newest: Vec<(u8, FileRecord)> = Vec::with_capacity(pending.len());
+        {
+            let mut seen: std::collections::HashMap<(u8, u64), usize> =
+                std::collections::HashMap::with_capacity(pending.len());
+            for (d, rec) in pending {
+                if let Some(&slot) = seen.get(&(d, rec.file_ref)) {
+                    newest[slot] = (d, rec);
+                } else {
+                    seen.insert((d, rec.file_ref), newest.len());
+                    newest.push((d, rec));
+                }
+            }
+        }
         let pending_refs: std::collections::HashSet<(u8, u64)> =
-            pending.iter().map(|(d, r)| (*d, r.file_ref)).collect();
+            newest.iter().map(|(d, r)| (*d, r.file_ref)).collect();
         self.entries
             .retain(|e| !pending_refs.contains(&(e.drive, e.file_ref)));
 
-        self.entries.reserve(pending.len());
-        for (d, record) in &pending {
+        self.entries.reserve(newest.len());
+        for (d, record) in &newest {
             let entry = self.arena_entry(record, *d);
             self.entries.push(entry);
         }
@@ -786,6 +801,44 @@ mod tests {
     }
 
     #[test]
+    fn apply_events_collapses_create_and_rename_in_one_batch() {
+        let mut store = IndexStore::new();
+        store.populate_from_scan(
+            scan_result(&[(1, 0, "Users", true)]),
+            &ntfs_drive('C'),
+        );
+        store.finalize();
+
+        // One user action (mkdir + rename) bursts CREATE + RENAME records for
+        // the same file ref into a single applier batch. Both must collapse to
+        // the newest record — never duplicate entries.
+        store.apply_events(vec![
+            IndexEvent::Created {
+                drive_letter: 'C',
+                record: FileRecord {
+                    file_ref: 42,
+                    parent_ref: 1,
+                    name: "New Folder".to_string(),
+                    kind: FileKind::Directory,
+                },
+            },
+            IndexEvent::Moved {
+                drive_letter: 'C',
+                file_ref: 42,
+                new_parent_ref: 1,
+                name: "finder-final-name".to_string(),
+                kind: FileKind::Directory,
+            },
+        ]);
+
+        assert_eq!(store.entries.len(), 2); // Users + folder (no duplicate)
+        let hits = store.entries.iter().filter(|e| e.file_ref == 42).count();
+        assert_eq!(hits, 1);
+        let hit = store.entries.iter().find(|e| e.file_ref == 42).unwrap();
+        assert_eq!(store.name(hit), "finder-final-name");
+    }
+
+    #[test]
     fn multi_drive_refs_do_not_collide_and_paths_use_own_root() {
         let mut store = IndexStore::new();
         // Both drives use the same file_refs (1 = root dir, 10 = child) —
@@ -883,6 +936,87 @@ mod tests {
         assert_eq!(new_entries.len(), 1);
         assert_eq!(new_entries[0].drive, 1);
         assert_eq!(store.name(new_entries[0]), "new.txt");
+    }
+
+    #[test]
+    fn cache_roundtrips_checkpoints_with_drive_letters() {
+        let mut store = IndexStore::new();
+        store.populate_from_scan(
+            scan_result(&[(1, 0, "Alpha.TXT", false)]),
+            &ntfs_drive('C'),
+        );
+        store.finalize();
+        store.checkpoints.push(JournalCheckpoint {
+            next_usn: 1_234_567,
+            journal_id: 0xDEAD_BEEF,
+            drive_letter: 'C',
+        });
+        store.checkpoints.push(JournalCheckpoint {
+            next_usn: 99,
+            journal_id: 0xCAFE_F00D,
+            drive_letter: 'D',
+        });
+
+        // Checkpoints must survive the v2 cache round-trip verbatim — the
+        // whole startup catch-up mechanism depends on it.
+        let loaded = IndexStore::from_cache(store.to_cache()).unwrap();
+        assert_eq!(
+            loaded.checkpoints,
+            vec![
+                JournalCheckpoint {
+                    next_usn: 1_234_567,
+                    journal_id: 0xDEAD_BEEF,
+                    drive_letter: 'C',
+                },
+                JournalCheckpoint {
+                    next_usn: 99,
+                    journal_id: 0xCAFE_F00D,
+                    drive_letter: 'D',
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dump_real_cache_checkpoints() {
+        let la = std::env::var("LOCALAPPDATA").unwrap();
+        let path = std::path::Path::new(&la)
+            .join("Finder")
+            .join("index")
+            .join("finder_cache.bin");
+        println!("path: {}", path.display());
+        let mut r = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let mut magic = [0u8; 4];
+        std::io::Read::read_exact(&mut r, &mut magic).unwrap();
+        println!("magic: {:?}", magic);
+        let file = std::fs::File::open(&path).unwrap();
+        let mut dec =
+            zstd::stream::read::Decoder::new(std::io::BufReader::new(file)).unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut dec, &mut buf).unwrap();
+        let cache: super::CacheData = bincode::deserialize(&buf).unwrap();
+        let store = IndexStore::from_cache(cache).expect("from_cache");
+        println!("entries: {}", store.entries.len());
+        println!("checkpoints: {:#?}", store.checkpoints);
+        let needle = std::env::var("FINDER_NEEDLE").unwrap_or_default();
+        if !needle.is_empty() {
+            let mut hits = 0usize;
+            for e in store.entries.iter() {
+                let n = store.name(e);
+                if n.to_lowercase().contains(&needle.to_lowercase()) {
+                    let parent = store
+                        .lookup_idx(e.drive, e.parent_ref)
+                        .map(|i| store.name(&store.entries[i as usize]).to_string())
+                        .unwrap_or_default();
+                    println!(
+                        "HIT: name='{}' file_ref={} parent_ref={} drive={} parentName='{}' ",
+                        n, e.file_ref, e.parent_ref, e.drive, parent
+                    );
+                    hits += 1;
+                }
+            }
+            println!("hits: {}", hits);
+        }
     }
 
     #[test]

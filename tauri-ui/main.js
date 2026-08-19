@@ -254,11 +254,11 @@ let loadingMore = false;
 // notice owns the results column only while the query is empty; typing
 // brings back normal app/file search over the partial index immediately.
 let indexReady = false;
-let firstScanActive = true;
+let firstScanActive = false; // corrected on the first status poll; false means no notice-flash on warm starts
 let scanNoticeShown = false;
 function syncScanNotice() {
   if (!scanNoticeEl) return;
-  const show = appState === "ready" && !indexReady && !input.value.trim();
+  const show = appState === "ready" && firstScanActive && !indexReady && !input.value.trim();
   if (show === scanNoticeShown) return;
   scanNoticeShown = show;
   if (show) {
@@ -2246,3 +2246,11 @@ function scheduleStatusPoll() {
 scheduleStatusPoll();
 loadApps();
 input.focus();
+
+// First-show handshake: the window is held hidden by Rust until the page has
+// painted and (best-effort) applied the frosted-glass backdrop, so the cold
+// start never flashes the card over raw desktop. The short settle delay lets
+// refreshBackdrop()'s grab complete before we raise the curtain.
+setTimeout(() => {
+  if (invoke) invoke("frontend_loaded").catch(() => {});
+}, 400);

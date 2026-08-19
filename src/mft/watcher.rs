@@ -279,7 +279,11 @@ impl UsnWatcher {
         let handle = unsafe {
             CreateFileW(
                 PCWSTR(path.as_ptr()),
-                0x0,
+                0x80000000u32, // GENERIC_READ — the USN journal ioctls below
+                               // (FSCTL_QUERY/READ_USN_JOURNAL) require a
+                               // readable volume handle. The scanner opens the
+                               // same way (MftReader::open); a 0x0 access
+                               // handle silently rejects all journal ioctls.
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 None,
                 OPEN_EXISTING,
@@ -379,19 +383,25 @@ impl UsnWatcher {
         }
     }
 
-    /// Drain all pending journal entries — used for delta catch-up on startup
-    pub fn drain(&mut self) -> usize {
+    /// Drain all pending journal entries from the watcher's start position
+    /// to the current end of the journal — used for delta catch-up on
+    /// startup. Returns Err when any journal read fails mid-drain, so the
+    /// caller can treat the replay as unreliable instead of checkpointing
+    /// at a position the journal was not fully read to.
+    pub fn drain(&mut self) -> Result<usize, ()> {
         let mut buffer = vec![0u8; BUFFER_SIZE];
         let mut count = 0;
         loop {
             let before = self.next_usn;
-            let _ = self.poll(&mut buffer);
+            if !self.poll(&mut buffer) {
+                return Err(());
+            }
             if self.next_usn == before {
                 break;
             }
             count += 1;
         }
-        count
+        Ok(count)
     }
 
     /// Returns false when the journal read itself failed (not when it is

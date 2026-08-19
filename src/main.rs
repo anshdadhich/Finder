@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::{self, Write};
+use std::path::PathBuf;
 use parking_lot::RwLock;
 use crossbeam_channel::unbounded;
 
@@ -39,100 +40,118 @@ fn main() {
 
     let index: Arc<RwLock<IndexStore>> = Arc::new(RwLock::new(IndexStore::new()));
     let (tx, rx) = unbounded();
-    let cache_path = std::env::temp_dir().join("finder_cache.bin");
+    // The CLI shares the GUI's cache — one source of truth under LOCALAPPDATA.
+    // The old %TEMP%\finder_cache.bin location belonged to a dev-time snapshot
+    // that drifted out of sync and falsely reported "cache corrupt".
+    let cache_path = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Finder")
+        .join("index")
+        .join("finder_cache.bin");
 
     // --- Try loading from cache ---
     let cache_loaded = if cache_path.exists() {
         print!("Loading cached index... ");
         io::stdout().flush().unwrap();
-        match std::fs::File::open(&cache_path) {
-            Ok(file) => {
-                let mut dec = lz4_flex::frame::FrameDecoder::new(std::io::BufReader::new(file));
-                match bincode::deserialize_from::<_, finder::index::store::CacheData>(&mut dec) {
-                            Ok(cache) => {
-                                if cache.entries.is_empty() {
-                                    println!("empty cache, rescanning...");
-                                    let _ = std::fs::remove_file(&cache_path);
-                                    false
-                                } else {
-                                match IndexStore::from_cache(cache) {
-                                    None => {
-                                        // Wrong magic/version (format bumped)
-                                        // or structurally corrupt — the old
-                                        // cache is invalid, rebuild it.
-                                        println!("cache format changed, rescanning...");
-                                        let _ = std::fs::remove_file(&cache_path);
-                                        false
-                                    }
-                                    Some(store) => {
-                                let count = store.len();
-                                let checkpoints = store.checkpoints.clone();
-                                *index.write() = store;
-                                println!("{} files", count);
+        match decode_cache_file(&cache_path) {
+            Some(cache) => {
+                if cache.entries.is_empty() {
+                    println!("empty cache, rescanning...");
+                    false
+                } else {
+                    match IndexStore::from_cache(cache) {
+                        None => {
+                            println!("cache format not decodable, rescanning...");
+                            false
+                        }
+                        Some(store) => {
+                            let count = store.len();
+                            let checkpoints = store.checkpoints.clone();
+                            *index.write() = store;
+                            println!("{} files", count);
 
-                                // --- Delta catch-up ---
-                                if !checkpoints.is_empty() {
-                                    print!("Catching up on changes since last run... ");
-                                    io::stdout().flush().unwrap();
+                            // --- Delta catch-up ---
+                            if !checkpoints.is_empty() {
+                                print!("Catching up on changes since last run... ");
+                                io::stdout().flush().unwrap();
 
-                                    let (delta_tx, delta_rx) = unbounded::<IndexEvent>();
-                                    let mut journal_ok = true;
+                                let (delta_tx, delta_rx) = unbounded::<IndexEvent>();
+                                let mut journal_ok = true;
 
-                                    for drive in &drives {
-                                        let cp = checkpoints.iter()
-                                            .find(|c| c.drive_letter == drive.letter);
+                                for drive in &drives {
+                                    let cp = checkpoints
+                                        .iter()
+                                        .find(|c| c.drive_letter == drive.letter);
 
-                                        if let Some(cp) = cp {
-                                            match UsnWatcher::new_from(drive, delta_tx.clone(), Some(cp)) {
-                                                Ok(mut watcher) => {
-                                                    watcher.drain();
-                                                    let new_cp = watcher.checkpoint();
-                                                    let mut store = index.write();
-                                                    store.checkpoints.retain(|c| c.drive_letter != drive.letter);
-                                                    store.checkpoints.push(new_cp);
-                                                }
-                                                Err(_) => {
-                                                    println!("journal reset, full rescan needed.");
-                                                    let _ = std::fs::remove_file(&cache_path);
+                                    if let Some(cp) = cp {
+                                        match UsnWatcher::new_from(
+                                            drive,
+                                            delta_tx.clone(),
+                                            Some(cp),
+                                        ) {
+                                            Ok(mut watcher) => {
+                                                if watcher.drain().is_err() {
+                                                    println!(
+                                                        "journal read failed, falling back to a full scan."
+                                                    );
                                                     journal_ok = false;
                                                     break;
                                                 }
+                                                let new_cp = watcher.checkpoint();
+                                                let mut store = index.write();
+                                                store
+                                                    .checkpoints
+                                                    .retain(|c| c.drive_letter != drive.letter);
+                                                store.checkpoints.push(new_cp);
                                             }
-                                        } else {
-                                            // No checkpoint for this drive — cache is incomplete
-                                            println!("missing checkpoint for {}:, full rescan needed.", drive.letter);
-                                            let _ = std::fs::remove_file(&cache_path);
-                                            journal_ok = false;
-                                            break;
+                                            Err(_) => {
+                                                println!(
+                                                    "journal reset, falling back to a full scan."
+                                                );
+                                                journal_ok = false;
+                                                break;
+                                            }
                                         }
-                                    }
-
-                                    drop(delta_tx);
-
-                                    if journal_ok {
-                                        let events: Vec<IndexEvent> = delta_rx.into_iter().collect();
-                                        let applied = events.len();
-                                        if !events.is_empty() {
-                                            index.write().apply_events(events);
-                                        }
-                                        println!("{} change(s) applied", applied);
-                                        println!();
-                                        true
                                     } else {
-                                        false
+                                        println!(
+                                            "missing checkpoint for {}:, falling back to a full scan.",
+                                            drive.letter
+                                        );
+                                        journal_ok = false;
+                                        break;
                                     }
-                                } else {
+                                }
+
+                                drop(delta_tx);
+
+                                if journal_ok {
+                                    let events: Vec<IndexEvent> = delta_rx.into_iter().collect();
+                                    let applied = events.len();
+                                    if !events.is_empty() {
+                                        index.write().apply_events(events);
+                                    }
+                                    println!("{} change(s) applied", applied);
                                     println!();
                                     true
+                                } else {
+                                    false
                                 }
-                                }
-                                }
-                                }
+                            } else {
+                                println!();
+                                true
                             }
-                            Err(_) => { println!("cache corrupt, rescanning..."); false }
                         }
+                    }
+                }
             }
-            Err(_) => { println!("cache unreadable, rescanning..."); false }
+            None => {
+                // Unreadable, or a valid-format cache these codecs can't decode.
+                // Report it, but NEVER delete the file — destroying a healthy
+                // cache over a codec misread is the bug we are fixing here.
+                println!("cache unreadable or unrecognized format, rescanning...");
+                false
+            }
         }
     } else {
         false
@@ -562,26 +581,111 @@ fn save_exclusions(path: &std::path::Path, dirs: &[String]) {
     let _ = std::fs::write(path, content);
 }
 
+/// Decode a cache file in any format the project has ever written:
+///  - v4 zstd frame (the GUI's current format)
+///  - legacy lz4 frame (v3)
+///  - earliest CLI block-lz4 (compress_prepend_size, no magic)
+/// Returns None when the file exists but cannot be decoded. Never mutates
+/// or deletes the file — a misread must never destroy a healthy cache.
+fn decode_cache_file(path: &std::path::Path) -> Option<finder::index::store::CacheData> {
+    use std::io::{Read, Seek};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut r = std::io::BufReader::new(file);
+    let mut magic = [0u8; 4];
+    if r.read_exact(&mut magic).is_err() {
+        return None;
+    }
+
+    if magic == [0x28, 0xB5, 0x2F, 0xFD] {
+        // v4: zstd frame.
+        r.seek(std::io::SeekFrom::Start(0)).ok()?;
+        let mut dec = zstd::stream::read::Decoder::new(r).ok()?;
+        let mut buf = Vec::new();
+        Read::read_to_end(&mut dec, &mut buf).ok()?;
+        bincode::deserialize::<finder::index::store::CacheData>(&buf).ok()
+    } else if magic == [0x04, 0x22, 0x4D, 0x18] {
+        // v3: legacy lz4 frame.
+        r.seek(std::io::SeekFrom::Start(0)).ok()?;
+        let mut dec = lz4_flex::frame::FrameDecoder::new(r);
+        bincode::deserialize_from::<_, finder::index::store::CacheData>(&mut dec).ok()
+    } else {
+        // Earliest CLI format: block-lz4 with a size prefix (no magic). Try it
+        // last as a fallback — a real match decodes, an unrelated file does not.
+        r.seek(std::io::SeekFrom::Start(0)).ok()?;
+        let mut raw = Vec::new();
+        Read::read_to_end(&mut r, &mut raw).ok()?;
+        let bytes = lz4_flex::decompress_size_prepended(&raw).ok()?;
+        bincode::deserialize::<finder::index::store::CacheData>(&bytes).ok()
+    }
+}
+
 fn persist_cache(
     cache: &finder::index::store::CacheData,
     cache_path: &std::path::Path,
     verbose: bool,
 ) {
-    match bincode::serialize(cache) {
-        Ok(bytes) => {
-            let compressed = lz4_flex::compress_prepend_size(&bytes);
-            match std::fs::write(cache_path, &compressed) {
-                Ok(_) => {
-                    if verbose {
-                        let raw_mb = bytes.len() as f64 / 1_048_576.0;
-                        let comp_mb = compressed.len() as f64 / 1_048_576.0;
-                        println!("Cache saved — {:.1}MB compressed ({:.1}MB raw)", comp_mb, raw_mb);
-                    }
-                }
-                Err(e) => eprintln!("Could not save cache: {}", e),
-            }
+    use std::io::Write;
+
+    let encoded = match bincode::serialize(cache) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Could not serialize cache: {}", e);
+            return;
         }
-        Err(e) => eprintln!("Could not serialize cache: {}", e),
+    };
+    let mut buf = Vec::new();
+    {
+        let mut enc = match zstd::stream::write::Encoder::new(&mut buf, 3) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("zstd init failed: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = enc.write_all(&encoded) {
+            eprintln!("zstd write failed: {}", e);
+            return;
+        }
+        if let Err(e) = enc.finish() {
+            eprintln!("zstd finish failed: {}", e);
+            return;
+        }
+    }
+
+    if let Some(dir) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = cache_path.with_extension(format!("tmp.{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, &buf) {
+        eprintln!("Could not write cache tmp: {}", e);
+        return;
+    }
+    // Atomic replace (MoveFileExW REPLACE_EXISTING) — never leaves the
+    // destination missing, so a concurrent reader always sees old-or-new.
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+    let s: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+    let d: Vec<u16> = cache_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        MoveFileExW(
+            windows::core::PCWSTR(s.as_ptr()),
+            windows::core::PCWSTR(d.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    };
+    if let Err(e) = result {
+        eprintln!("Could not replace cache: {}", e);
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if verbose {
+        let raw_mb = encoded.len() as f64 / 1_048_576.0;
+        let comp_mb = buf.len() as f64 / 1_048_576.0;
+        println!(
+            "Cache saved — {:.1}MB compressed ({:.1}MB raw)",
+            comp_mb, raw_mb
+        );
     }
 }
 
