@@ -8,6 +8,9 @@ src-tauri/target/
 .vscode/
 .idea/
 
+# Local release artifacts (uploaded to GitHub Releases, not tracked in git)
+*.zip
+
 # OS files
 Thumbs.db
 Desktop.ini
