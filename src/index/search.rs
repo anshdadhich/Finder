@@ -2,11 +2,6 @@ use rayon::prelude::*;
 use crate::index::store::IndexStore;
 use std::collections::BTreeSet;
 
-const USER_PATH_MARKERS: &[&str] = &[
-    "\\users\\", "\\documents\\", "\\downloads\\",
-    "\\desktop\\", "\\pictures\\", "\\videos\\", "\\music\\"
-];
-
 #[derive(Debug, Clone)]
 pub struct AppInfo {
     pub name: String,
@@ -162,10 +157,11 @@ fn search_by_ext(
         return (Vec::new(), 0);
     };
 
-    // Rank pass: lean (ResultMeta, idx) rows only. The full path is built
-    // (and dropped) here because `user`/`depth` are sort keys, but names and
-    // PathBufs are only materialized for the ~limit visible rows after the
-    // page is sliced.
+    // Rank pass: lean (ResultMeta, idx) rows only. User-folder and depth are
+    // stored per entry at insert time (X1), so this pass no longer rebuilds a
+    // path for every candidate — the full path is only built when an explicit
+    // exclusion list demands its text. Names and PathBufs are materialized
+    // only for the ~limit visible rows after the page is sliced.
     let mut ranked: Vec<(ResultMeta, u32)> = bucket
         .par_iter()
         .filter_map(|&idx| {
@@ -173,12 +169,15 @@ fn search_by_ext(
             if is_junk_chain(store, entry) {
                 return None;
             }
-            let full_path = build_path(entry, store);
-            let path_lower = full_path.to_string_lossy().to_lowercase();
-            if !excluded_dirs.is_empty()
-                && excluded_dirs.iter().any(|ex| path_lower.starts_with(ex.as_str()))
-            {
-                return None;
+            if !excluded_dirs.is_empty() {
+                let full_path = build_path(entry, store);
+                let path_lower = full_path.to_string_lossy().to_lowercase();
+                if excluded_dirs
+                    .iter()
+                    .any(|ex| path_lower.starts_with(ex.as_str()))
+                {
+                    return None;
+                }
             }
 
             let name_lower = store.name_lower(entry);
@@ -190,16 +189,14 @@ fn search_by_ext(
                 3
             };
             let boundary = base_rank <= 2 || word_prefix_match(name_lower, q);
-            let user = USER_PATH_MARKERS.iter().any(|m| path_lower.contains(m));
-            let depth = path_lower.matches('\\').count().min(15) as u8;
             let name_len = (name_lower.len() as u32).min(255) as u8;
 
             Some((
                 ResultMeta {
                     rank: base_rank,
                     boundary: if boundary { 0 } else { 1 },
-                    user: if user { 0 } else { 1 },
-                    depth,
+                    user: if entry.user_path != 0 { 0 } else { 1 },
+                    depth: entry.depth,
                     name_len,
                     ext_prio: 0, // every row shares the queried extension
                 },
@@ -610,6 +607,8 @@ mod tests {
                 name_len: name.len() as u16,
                 name_lower_len: lower.len() as u16,
                 flags: if *kind == FileKind::Directory { 1 } else { 0 },
+                depth: 0,
+                user_path: 0,
                 drive: 0,
             });
         }
@@ -628,7 +627,50 @@ mod tests {
             .collect();
         pairs.sort_unstable_by_key(|&(r, _)| r);
         s.ref_lookup = vec![pairs];
+        stamp_path_meta(&mut s);
         s
+    }
+
+    /// Walk every entry's parent chain through `s`'s ref lookup and stamp the
+    /// per-entry depth/user-path metadata that production computes at insert
+    /// time (X1), so tests rank on the same stored keys the app does.
+    fn stamp_path_meta(s: &mut IndexStore) {
+        let n = s.entries.len();
+        for i in 0..n {
+            let drive = s.entries[i].drive;
+            let parent_ref = s.entries[i].parent_ref;
+            let mut depth: u8 = 0;
+            let mut user: u8 = 0;
+            let mut current = parent_ref;
+            for _ in 0..32 {
+                let Some(idx) = s.lookup_idx(drive, current) else {
+                    break;
+                };
+                let e = &s.entries[idx as usize];
+                if crate::index::store::USER_DIR_NAMES
+                    .iter()
+                    .any(|m| *m == s.name_lower(e))
+                {
+                    user = 1;
+                }
+                if e.parent_ref == current || e.parent_ref == 0 {
+                    break; // root directory — contributes no separator
+                }
+                depth = depth.saturating_add(1);
+                current = e.parent_ref;
+            }
+            if s.entries[i].is_dir() {
+                let own = s.name_lower(&s.entries[i]);
+                if crate::index::store::USER_DIR_NAMES
+                    .iter()
+                    .any(|m| *m == own)
+                {
+                    user = 1;
+                }
+            }
+            s.entries[i].depth = (depth + 1).min(15);
+            s.entries[i].user_path = user;
+        }
     }
 
     #[test]
@@ -681,6 +723,46 @@ mod tests {
         assert!(names.contains(&"visualstudio.exe"));
         assert!(names[0] == "Visual Studio Code.lnk" || names[0] == "visualstudio.exe");
         assert!(names[1] == "Visual Studio Code.lnk" || names[1] == "visualstudio.exe");
+    }
+
+    #[test]
+    fn ext_search_uses_stored_depth_and_user_path() {
+        // X1: user/depth are stamped once at insert time; the search must rank
+        // purely on those stored keys (no per-candidate build_path) while the
+        // exclusion filter — the only path builder left on the hot path — kept
+        // working.
+        let items: Vec<(u64, &str, u64, FileKind)> = vec![
+            (40, "Users", 0, FileKind::Directory),
+            (50, "Projects", 40, FileKind::Directory),
+            (1, "tree.py", 40, FileKind::File),     // under Users -> depth 1, user
+            (2, "forest.py", 50, FileKind::File),   // Users\Projects -> depth 2, user
+            (3, "stem.py", 40, FileKind::File),     // under Users -> depth 1, user
+            (4, "root.py", 0, FileKind::File),      // at root -> depth 1, not user
+        ];
+        let mut s = store(&items);
+        // Sanity: the producer actually stamped the metadata.
+        let idx1 = s.lookup_idx(0, 1).unwrap() as usize;
+        let idx2 = s.lookup_idx(0, 2).unwrap() as usize;
+        assert_eq!(s.entries[idx1].depth, 1);
+        assert_eq!(s.entries[idx1].user_path, 1);
+        assert_eq!(s.entries[idx2].depth, 2);
+        assert_eq!(s.entries[idx2].user_path, 1);
+
+        s.rebuild_ext_index();
+        let page = search_paged(&s, ".py", 10, 0, false, &[]);
+        let names: Vec<&str> = page.results.iter().map(|r| r.name.as_str()).collect();
+        // User-folder tier first, then shallower depth; depth-1 rows may tie
+        // on identical metadata, so only their grouping is order-locked.
+        let first_two: std::collections::HashSet<&str> =
+            names[0..2].iter().copied().collect();
+        assert!(first_two.contains("tree.py") && first_two.contains("stem.py"));
+        assert_eq!(names[2], "forest.py");
+
+        // Exclusion filter still runs even though the default ranking pass no
+        // longer builds paths; root.py is the only row outside C:\Users.
+        let filtered = search_paged(&s, ".py", 10, 0, false, &["c:\\users\\".to_string()]);
+        let fnames: Vec<&str> = filtered.results.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(fnames, vec!["root.py"]);
     }
 
     #[test]
@@ -847,10 +929,13 @@ mod tests {
                 name_len: name.len() as u16,
                 name_lower_len: lower.len() as u16,
                 flags: 0,
+                depth: 0,
+                user_path: 0,
                 drive: 0,
             });
         }
         s.finalize();
+        stamp_path_meta(&mut s);
 
         let mut total_ms = 0.0f64;
         for q in ["report", "desktop", "chrome", "notes", "asset", "zzzz"] {

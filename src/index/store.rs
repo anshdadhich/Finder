@@ -26,11 +26,18 @@ pub const JUNK_DIR_NAMES: &[&str] = &[
     "microsoft",
 ];
 
+/// Directory names (lowercased) that mark a path as living under the user's
+/// profile ("C:\Users\me\Documents\…"). Stored per entry at insert time so
+/// ranking never has to rebuild a path just to sort user-dir results higher.
+pub const USER_DIR_NAMES: &[&str] = &[
+    "users", "documents", "downloads", "desktop", "pictures", "videos", "music",
+];
+
 // ── Cache format (disk) ──────────────────────────────────────────────
 /// Cache format version. Bumped on any on-disk layout change; readers
 /// reject caches whose magic/version differ and fall back to a full scan.
 pub const CACHE_MAGIC: [u8; 4] = *b"FSKC";
-pub const CACHE_FORMAT_VERSION: u32 = 2;
+pub const CACHE_FORMAT_VERSION: u32 = 3;
 
 /// Hard cap on how many bytes a cache may decode to before it is rejected as
 /// tampered/oversized. Real caches scale with file count: a 3 M-file index
@@ -83,6 +90,13 @@ pub struct IndexEntry {
     pub name_len: u16,
     pub name_lower_len: u16,
     pub flags: u8, // bit 0 = is_dir
+    /// Path depth below the volume root (capped at 15) — computed once at
+    /// insert time so ranking never rebuilds the parent chain per candidate.
+    pub depth: u8,
+    /// 1 when the entry lives under a `USER_DIR_NAMES` ancestor (or is itself
+    /// one of those directories) — the stored form of the old per-query
+    /// `path_lower.contains("\\users\\")`-style check.
+    pub user_path: u8,
     /// Volume this entry belongs to; index into `IndexStore.drive_roots`.
     pub drive: u8,
 }
@@ -262,11 +276,45 @@ struct BuiltChunk {
     entries: Vec<IndexEntry>,
 }
 
-fn build_chunk(chunk: &[CompactRecord], name_data: &[u16], drive: u8) -> BuiltChunk {
+/// Scan-time path metadata for one record: walks the ancestor chain through
+/// the lowercased `dirs` map (the same map junk pruning walks) and returns
+/// `(depth, user_path)` — or `None` when any ancestor is a junk directory, in
+/// which case the record must not enter the index. Only real components below
+/// the volume root count toward depth; the root directory itself
+/// (parent == self or parent == 0) contributes no separator.
+fn path_meta_from_dirs(
+    parent_ref: u64,
+    dirs: &std::collections::HashMap<u64, (String, u64)>,
+) -> Option<(u8, u8)> {
+    let mut depth: u8 = 0;
+    let mut user: u8 = 0;
+    let mut current = parent_ref;
+    for _ in 0..32 {
+        match dirs.get(&current) {
+            Some((name, parent)) => {
+                if JUNK_DIR_NAMES.iter().any(|j| *j == name) {
+                    return None;
+                }
+                if USER_DIR_NAMES.iter().any(|m| *m == name) {
+                    user = 1;
+                }
+                if *parent == current || *parent == 0 {
+                    break; // root directory — contributes no separator
+                }
+                depth = depth.saturating_add(1);
+                current = *parent;
+            }
+            None => break,
+        }
+    }
+    Some(((depth + 1).min(15), user))
+}
+
+fn build_chunk(chunk: &[(CompactRecord, u8, u8)], name_data: &[u16], drive: u8) -> BuiltChunk {
     let mut names = Vec::with_capacity(chunk.len() * 24);
     let mut lowers = Vec::with_capacity(chunk.len() * 24);
     let mut entries = Vec::with_capacity(chunk.len());
-    for r in chunk {
+    for (r, depth, user_from_ancestors) in chunk {
         let name_slice =
             &name_data[r.name_off as usize..(r.name_off as usize + r.name_len as usize)];
         let name = String::from_utf16_lossy(name_slice);
@@ -280,6 +328,15 @@ fn build_chunk(chunk: &[CompactRecord], name_data: &[u16], drive: u8) -> BuiltCh
         let nl_len = name_lower.len() as u16;
         lowers.extend_from_slice(name_lower.as_bytes());
 
+        // A directory whose own lowercased name is a user marker counts as a
+        // user path too ("C:\foo\desktop\"), matching the old contains-check
+        // semantics where the trailing slash of a directory name matched.
+        let user = if r.is_dir && USER_DIR_NAMES.iter().any(|m| *m == name_lower) {
+            (*user_from_ancestors) | 1
+        } else {
+            *user_from_ancestors
+        };
+
         entries.push(IndexEntry {
             file_ref: r.file_ref,
             parent_ref: r.parent_ref,
@@ -288,6 +345,8 @@ fn build_chunk(chunk: &[CompactRecord], name_data: &[u16], drive: u8) -> BuiltCh
             name_len: n_len,
             name_lower_len: nl_len,
             flags: if r.is_dir { 1 } else { 0 },
+            depth: *depth,
+            user_path: user,
             drive,
         });
     }
@@ -343,12 +402,13 @@ impl IndexStore {
         let name_data = &scan.name_data;
 
         // Pass 1b (PARALLEL): prune entire junk subtrees in one parallel sweep
-        // across the MFT dump. Only clean records survive to the index.
-        let clean: Vec<CompactRecord> = scan
+        // across the MFT dump, stamping each surviving record's depth and
+        // user-folder metadata in the same walk. Only clean records survive
+        // to the index.
+        let clean: Vec<(CompactRecord, u8, u8)> = scan
             .records
             .par_iter()
-            .filter(|r| !junk_chain(r.parent_ref, &dirs))
-            .copied()
+            .filter_map(|r| path_meta_from_dirs(r.parent_ref, &dirs).map(|(d, u)| (*r, d, u)))
             .collect();
 
         // Remember everything the sweep dropped: live journal events (a file
@@ -491,8 +551,10 @@ impl IndexStore {
 
     // ── Live mutations ───────────────────────────────────────────────
 
-    /// Append a record to the arenas and build its compact entry.
-    fn arena_entry(&mut self, record: &FileRecord, drive: u8) -> IndexEntry {
+    /// Append a record to the arenas and build its compact entry. `depth` /
+    /// `user_path` come from `path_meta`/`path_meta_from_dirs` computed by the
+    /// caller.
+    fn arena_entry(&mut self, record: &FileRecord, drive: u8, depth: u8, user_path: u8) -> IndexEntry {
         let name_lower = record.name.to_lowercase();
 
         let n_off = self.name_arena.len() as u32;
@@ -516,6 +578,8 @@ impl IndexStore {
             name_len: n_len,
             name_lower_len: nl_len,
             flags,
+            depth,
+            user_path,
             drive,
         }
     }
@@ -563,6 +627,35 @@ impl IndexStore {
         false
     }
 
+    /// Path depth + user-folder bit for a record, derived once at insert time
+    /// by walking the parent chain through the store's ref lookup (same rules
+    /// as `path_meta_from_dirs`). The root directory (parent == self or 0)
+    /// contributes no depth; ancestors not yet indexed simply stop the count,
+    /// matching the approximation the old per-query walk produced.
+    pub fn path_meta(&self, drive: u8, parent_ref: u64, own_name_lower: &str, own_is_dir: bool) -> (u8, u8) {
+        let mut depth: u8 = 0;
+        let mut user: u8 = 0;
+        let mut current = parent_ref;
+        for _ in 0..32 {
+            let Some(idx) = self.lookup_idx(drive, current) else {
+                break;
+            };
+            let e = &self.entries[idx as usize];
+            if USER_DIR_NAMES.iter().any(|m| *m == self.name_lower(e)) {
+                user = 1;
+            }
+            if e.parent_ref == current || e.parent_ref == 0 {
+                break; // root directory — contributes no separator
+            }
+            depth = depth.saturating_add(1);
+            current = e.parent_ref;
+        }
+        if own_is_dir && USER_DIR_NAMES.iter().any(|m| *m == own_name_lower) {
+            user = 1;
+        }
+        ((depth + 1).min(15), user)
+    }
+
     pub fn insert(&mut self, drive: u8, record: FileRecord) {
         // Idempotent: a record supersedes any existing entry with the same
         // file_ref on the same drive (journals can re-deliver a create/rename
@@ -578,12 +671,18 @@ impl IndexStore {
         }
 
         let name_lower = record.name.to_lowercase();
+        let (depth, user_path) = self.path_meta(
+            drive,
+            record.parent_ref,
+            &name_lower,
+            matches!(record.kind, FileKind::Directory),
+        );
         let store_ptr = self as *const IndexStore;
         let pos = self.entries.partition_point(|e| {
             let s = unsafe { &*store_ptr };
             s.name_lower(e) < name_lower.as_str()
         });
-        let entry = self.arena_entry(&record, drive);
+        let entry = self.arena_entry(&record, drive, depth, user_path);
         self.entries.insert(pos, entry);
         self.rebuild_ref_lookup();
         self.ext_dirty = true;
@@ -696,9 +795,26 @@ impl IndexStore {
             .retain(|e| !pending_refs.contains(&(e.drive, e.file_ref)));
 
         self.entries.reserve(newest.len());
-        for (d, record) in &newest {
-            let entry = self.arena_entry(record, *d);
-            self.entries.push(entry);
+        let new_start = self.entries.len();
+        // Placeholder metadata; a batch can create a parent dir and its
+        // children in a single drain, so the depth/user walk must run against
+        // the ref lookup once every record of this batch is visible.
+        let new_entries: Vec<IndexEntry> = newest
+            .iter()
+            .map(|(d, record)| self.arena_entry(record, *d, 0, 0))
+            .collect();
+        self.entries.extend(new_entries);
+        self.rebuild_ref_lookup();
+        for (i, (d, record)) in newest.iter().enumerate() {
+            let lower = record.name.to_lowercase();
+            let (depth, user_path) = self.path_meta(
+                *d,
+                record.parent_ref,
+                &lower,
+                matches!(record.kind, FileKind::Directory),
+            );
+            self.entries[new_start + i].depth = depth;
+            self.entries[new_start + i].user_path = user_path;
         }
         let store_ptr = self as *const IndexStore;
         self.entries.sort_unstable_by(|a, b| {
@@ -838,6 +954,38 @@ mod tests {
         assert!(store.junk_refs[0].contains(&14)); // lodash.js under node_modules
         assert!(store.junk_refs[0].contains(&16)); // cache.tmp under Temp
         assert!(!store.junk_refs[0].contains(&13)); // node_modules itself kept
+    }
+
+    #[test]
+    fn populate_stamps_depth_and_user_path() {
+        // X1 producer: the scan sweep stamps depth + user-folder metadata in
+        // the same ancestor walk that prunes junk, using a root directory
+        // record like the real MFT (parent == self), so counts equal the old
+        // `full_path.matches('\\')` semantics.
+        let mut store = IndexStore::new();
+        store.populate_from_scan(
+            scan_result(&[
+                (5, 5, "", true),                 // C:\ root
+                (1, 5, "Users", true),
+                (10, 1, "Alice", true),
+                (11, 10, "report.txt", false),
+                (20, 5, "dev", true),
+                (21, 20, "deep", true),
+                (22, 21, "root_like.py", false),
+                (30, 50, "orphan.txt", false),    // parent absent from the scan
+            ]),
+            &ntfs_drive('C'),
+        );
+        store.finalize();
+
+        fn meta(s: &IndexStore, name: &str) -> (u8, u8) {
+            let e = s.entries.iter().find(|e| s.name(e) == name).unwrap();
+            (e.depth, e.user_path)
+        }
+        assert_eq!(meta(&store, "report.txt"), (3, 1));   // Users\Alice
+        assert_eq!(meta(&store, "Users"), (1, 1));         // own dir == user marker
+        assert_eq!(meta(&store, "root_like.py"), (3, 0)); // dev\deep, no marker
+        assert_eq!(meta(&store, "orphan.txt"), (1, 0));   // unresolved parent
     }
 
     #[test]
@@ -1055,15 +1203,25 @@ mod tests {
             .join("index")
             .join("finder_cache.bin");
         println!("path: {}", path.display());
-        let mut r = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
-        let mut magic = [0u8; 4];
-        std::io::Read::read_exact(&mut r, &mut magic).unwrap();
-        println!("magic: {:?}", magic);
         let file = std::fs::File::open(&path).unwrap();
         let mut dec =
             zstd::stream::read::Decoder::new(std::io::BufReader::new(file)).unwrap();
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut dec, &mut buf).unwrap();
+        println!("decoded: {} bytes", buf.len());
+        // Cache files are fixint-encoded (bincode 1.3 free functions):
+        // magic(4) then version u32 as 4 LE bytes, value <= 255 at byte[4]. A
+        // deliberate format bump (v2 -> v3) makes old files structurally
+        // unreadable, so bail gracefully instead of panicking — the app will
+        // discard the stale file and rescan on next boot.
+        if buf.len() < 5 || buf[4] as u32 != super::CACHE_FORMAT_VERSION {
+            println!(
+                "on-disk cache is an older format (byte[4]={}, current v{}); running the GUI once rebuilds it",
+                buf.get(4).copied().unwrap_or(0),
+                super::CACHE_FORMAT_VERSION
+            );
+            return;
+        }
         let cache: super::CacheData = bincode::deserialize(&buf).unwrap();
         let store = IndexStore::from_cache(cache).expect("from_cache");
         println!("entries: {}", store.entries.len());
