@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use bincode::Options as BincodeOptions;
 use parking_lot::RwLock;
 use crossbeam_channel::unbounded;
 
@@ -317,6 +317,7 @@ fn main() {
     // Save updated cache on exit; `store.to_cache()` carries the latest
     // checkpoints maintained by the live applier above.
     let index_for_save = Arc::clone(&index);
+    let cache_path_for_save = cache_path.clone();
     ctrlc::set_handler(move || {
         let cache = {
             let store = index_for_save.write();
@@ -325,7 +326,7 @@ fn main() {
             }
             store.to_cache()
         };
-        persist_cache(&cache, &std::env::temp_dir().join("finder_cache.bin"), false);
+        persist_cache(&cache, &cache_path_for_save, false);
         std::process::exit(0);
     }).ok();
 
@@ -343,10 +344,10 @@ fn main() {
         }
     }
 
-    search_loop(index);
+    search_loop(index, &cache_path);
 }
 
-fn search_loop(index: Arc<RwLock<IndexStore>>) {
+fn search_loop(index: Arc<RwLock<IndexStore>>, cache_path: &std::path::Path) {
     let config_path = config_dir().join("config.txt");
     let mut case_sensitive = false;
     let mut excluded_dirs: Vec<String> = load_exclusions(&config_path);
@@ -391,8 +392,10 @@ fn search_loop(index: Arc<RwLock<IndexStore>>) {
             }
 
             "rescan" => {
-                let cache_path = std::env::temp_dir().join("finder_cache.bin");
-                let _ = std::fs::remove_file(&cache_path);
+                // Delete the REAL cache (LOCALAPPDATA), not the old dev-time
+                // %TEMP% snapshot that drifted out of sync and caused the
+                // false "cache corrupt" reports.
+                let _ = std::fs::remove_file(cache_path);
                 println!("Cache cleared. Restart Finder to rescan.\n");
             }
 
@@ -598,25 +601,57 @@ fn decode_cache_file(path: &std::path::Path) -> Option<finder::index::store::Cac
     }
 
     if magic == [0x28, 0xB5, 0x2F, 0xFD] {
-        // v4: zstd frame.
+        // v4: zstd frame. Stream straight into bincode (no full-index staging
+        // buffer) and cap the decompressed bytes — the cache sits in the
+        // user's LOCALAPPDATA, so it must be treated as untrusted input.
         r.seek(std::io::SeekFrom::Start(0)).ok()?;
         let mut dec = zstd::stream::read::Decoder::new(r).ok()?;
-        let mut buf = Vec::new();
-        Read::read_to_end(&mut dec, &mut buf).ok()?;
-        bincode::deserialize::<finder::index::store::CacheData>(&buf).ok()
+        bincode::DefaultOptions::new()
+            .with_limit(finder::index::store::MAX_CACHE_DECODED)
+            .deserialize_from::<_, finder::index::store::CacheData>(
+                std::io::Read::take(&mut dec, finder::index::store::MAX_CACHE_DECODED),
+            )
+            .ok()
     } else if magic == [0x04, 0x22, 0x4D, 0x18] {
         // v3: legacy lz4 frame.
         r.seek(std::io::SeekFrom::Start(0)).ok()?;
         let mut dec = lz4_flex::frame::FrameDecoder::new(r);
-        bincode::deserialize_from::<_, finder::index::store::CacheData>(&mut dec).ok()
+        bincode::DefaultOptions::new()
+            .with_limit(finder::index::store::MAX_CACHE_DECODED)
+            .deserialize_from::<_, finder::index::store::CacheData>(
+                std::io::Read::take(&mut dec, finder::index::store::MAX_CACHE_DECODED),
+            )
+            .ok()
     } else {
         // Earliest CLI format: block-lz4 with a size prefix (no magic). Try it
         // last as a fallback — a real match decodes, an unrelated file does not.
         r.seek(std::io::SeekFrom::Start(0)).ok()?;
+        // Bound the raw slurp too (compressed bytes can exceed the decompressed
+        // size on incompressible data, so allow 2x the cap + the 4-byte prefix).
+        let max_raw = finder::index::store::MAX_CACHE_DECODED
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(4))
+            .unwrap_or(finder::index::store::MAX_CACHE_DECODED);
         let mut raw = Vec::new();
-        Read::read_to_end(&mut r, &mut raw).ok()?;
+        std::io::Read::read_to_end(
+            &mut std::io::Read::take(&mut r, max_raw),
+            &mut raw,
+        )
+        .ok()?;
+        // The size prefix is attacker-supplied: refuse to let lz4_flex allocate
+        // a buffer larger than the decode cap before we ever call it.
+        if raw.len() < 4 {
+            return None;
+        }
+        let declared = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        if declared == 0 || declared as u64 > finder::index::store::MAX_CACHE_DECODED {
+            return None;
+        }
         let bytes = lz4_flex::decompress_size_prepended(&raw).ok()?;
-        bincode::deserialize::<finder::index::store::CacheData>(&bytes).ok()
+        bincode::DefaultOptions::new()
+            .with_limit(finder::index::store::MAX_CACHE_DECODED)
+            .deserialize::<finder::index::store::CacheData>(&bytes)
+            .ok()
     }
 }
 

@@ -31,6 +31,13 @@ pub const JUNK_DIR_NAMES: &[&str] = &[
 pub const CACHE_MAGIC: [u8; 4] = *b"FSKC";
 pub const CACHE_FORMAT_VERSION: u32 = 2;
 
+/// Hard cap on how many bytes a cache may decode to before it is rejected as
+/// tampered/oversized. Real caches are tens of MB; this is ~6x headroom.
+/// Applied as a `Take` on every decode path (GUI + CLI, zstd/lz4/block) so a
+/// hostile `finder_cache.bin` can never make the always-elevated process
+/// allocate unbounded memory and abort before the structural checks run.
+pub const MAX_CACHE_DECODED: u64 = 512 * 1024 * 1024;
+
 /// A volume's root path, as indexed. Entries carry a `drive` index into
 /// this list, so file_refs (per-volume MFT record numbers) never collide
 /// and paths are always built against the right volume root.
@@ -444,6 +451,14 @@ impl IndexStore {
                     <= cache.name_lower_arena.len()
         });
         if !valid {
+            return None;
+        }
+        // The arena bytes must be valid UTF-8: `name()`/`name_lower()` slice
+        // them with `from_utf8_unchecked` (deliberately zero-copy), so a
+        // tampered cache must never reach those unsafes with bad bytes.
+        if std::str::from_utf8(&cache.name_arena).is_err()
+            || std::str::from_utf8(&cache.name_lower_arena).is_err()
+        {
             return None;
         }
 
