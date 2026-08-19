@@ -1090,6 +1090,21 @@ fn image_data(path: String) -> Result<Option<String>, String> {
     )))
 }
 
+/// Insert into the in-memory icon cache under a hard cap: a long session
+/// browsing many unique folders must not accumulate unbounded base64
+/// strings. The persistent disk cache makes eviction free (~100 µs re-read).
+fn icon_cache_insert(
+    cache: &Arc<Mutex<HashMap<String, String>>>,
+    key: String,
+    uri: String,
+) {
+    let mut m = cache.lock();
+    if m.len() >= 600 {
+        m.clear();
+    }
+    m.insert(key, uri);
+}
+
 fn icon_cache_dir() -> std::path::PathBuf {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
@@ -1122,7 +1137,7 @@ fn warm_icon_cache(state: &AppState) {
                 break;
             }
             if let Ok(Some(uri)) = reply_rx.recv_timeout(Duration::from_secs(3)) {
-                icon_cache.lock().insert(key.clone(), uri.clone());
+                icon_cache_insert(&icon_cache, key.clone(), uri.clone());
                 if let Some(png) = uri_png_bytes(&uri) {
                     let _ = std::fs::create_dir_all(icon_cache_dir());
                     let _ = std::fs::write(icon_disk_path(&key), png);
@@ -1217,6 +1232,9 @@ async fn get_icons(
                     to_extract.push(path);
                 }
             }
+            if cache.len() >= 600 {
+                cache.clear(); // bounded memory: the disk cache backfills on demand
+            }
         }
 
         // 3) Real extraction on the STA worker pool, one job per path with an
@@ -1231,7 +1249,7 @@ async fn get_icons(
             match reply_rx.recv_timeout(Duration::from_secs(5)) {
                 Ok(Some(uri)) => {
                     let key = path.to_lowercase();
-                    state.icon_cache.lock().insert(key.clone(), uri.clone());
+                    icon_cache_insert(&state.icon_cache, key.clone(), uri.clone());
                     if let Some(png) = uri_png_bytes(&uri) {
                         let _ = std::fs::create_dir_all(icon_cache_dir());
                         let _ = std::fs::write(icon_disk_path(&key), png);
@@ -3930,6 +3948,13 @@ fn spawn_live_watchers(
     heartbeats
 }
 
+/// A full-cache re-encode (a ~100-300 MB zstd blob) triggers only when at
+/// least this many live events accumulated since the last 30 s save. Fewer
+/// events than this ride on the next save or the unconditional exit save —
+/// one rename must not force a whole-index rewrite. Safe because the USN
+/// journal replay reconstructs every skipped delta after a crash.
+const SAVE_EVENT_WATERMARK: u64 = 500;
+
 /// Wire up the live side of the index: status transition, USN watchers, the
 /// event applier, the heartbeat watchdog and the periodic cache saver.
 /// Called exactly once per backend lifetime, after the index has reached its
@@ -3938,7 +3963,7 @@ fn finish_backend(
     index: &Arc<RwLock<IndexStore>>,
     ready: &Arc<AtomicBool>,
     status: &Arc<RwLock<String>>,
-    dirty: &Arc<AtomicBool>,
+    pending_events: &Arc<AtomicU64>,
     cache_path: &Path,
     drives: &[NtfsDrive],
     tx: crossbeam_channel::Sender<IndexEvent>,
@@ -3955,7 +3980,7 @@ fn finish_backend(
     // ordered channel has been applied. Saving that checkpoint is always a
     // consistent snapshot, so nothing is lost or duplicated on restart.
     let applier_index = Arc::clone(index);
-    let applier_dirty = Arc::clone(dirty);
+    let applier_pending = Arc::clone(pending_events);
     thread::spawn(move || {
         let mut pending: Vec<IndexEvent> = Vec::with_capacity(64);
         for event in &rx {
@@ -3967,13 +3992,14 @@ fn finish_backend(
                     let mut store = applier_index.write();
                     store.checkpoints.retain(|c| c.drive_letter != cp.drive_letter);
                     store.checkpoints.push(cp.clone());
-                    applier_dirty.store(true, Ordering::Relaxed);
+                    applier_pending.fetch_add(1, Ordering::Relaxed);
                 }
                 other => {
                     pending.push(other);
                     if pending.len() >= 64 {
+                        let n = pending.len() as u64;
                         applier_index.write().apply_events(std::mem::take(&mut pending));
-                        applier_dirty.store(true, Ordering::Relaxed);
+                        applier_pending.fetch_add(n, Ordering::Relaxed);
                     }
                 }
             }
@@ -4007,15 +4033,17 @@ fn finish_backend(
     });
 
     // Periodic cache persistence so a hard kill never loses the USN
-    // checkpoints. Only writes when the index changed since last save.
+    // checkpoints. Only full re-encodes when a meaningful amount of churn
+    // accumulated since the last save (SAVE_EVENT_WATERMARK).
     let saver_index = Arc::clone(index);
-    let saver_dirty = Arc::clone(dirty);
+    let saver_pending = Arc::clone(pending_events);
     let saver_path = cache_path.to_path_buf();
     thread::spawn(move || {
         let interval = Duration::from_secs(30);
         loop {
             thread::sleep(interval);
-            if saver_dirty.swap(false, Ordering::Relaxed) {
+            let seen = saver_pending.swap(0, Ordering::Relaxed);
+            if seen >= SAVE_EVENT_WATERMARK {
                 save_cache(&saver_index, &saver_path);
             }
         }
@@ -4137,10 +4165,11 @@ fn start_backend(
         }
 
         *status.write() = String::from("Loading cached index...");
-        // Shared by every completion path: the live applier saver's dirty
-        // flag. Created before the branch so both the synchronous and the
+        // Shared by every completion path: counts the live events the applier
+        // has applied, so the periodic saver can skip re-encoding for tiny
+        // churn. Created before the branch so both the synchronous and the
         // provisional-async paths can hand it to finish_backend.
-        let dirty: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let pending_events: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
         match load_cache_and_catch_up(&index, &drives, &cache_path) {
             CacheLoad::Scanning => {
@@ -4160,7 +4189,7 @@ fn start_backend(
                     eprintln!("Error: index has 0 files — running elevated? NTFS readable?");
                     return;
                 }
-                finish_backend(&index, &ready, &status, &dirty, &cache_path, &drives, tx, rx);
+                finish_backend(&index, &ready, &status, &pending_events, &cache_path, &drives, tx, rx);
             }
             CacheLoad::Provisional { snapshot_secs } => {
                 // Warm start with an index that cannot be delta-caught-up
@@ -4183,7 +4212,7 @@ fn start_backend(
                 let pr = Arc::clone(&progress);
                 let rd = Arc::clone(&ready);
                 let fs = Arc::clone(&first_scan);
-                let dirty2 = Arc::clone(&dirty);
+                let pending_events2 = Arc::clone(&pending_events);
                 let tx2 = tx.clone();
                 let rx2 = rx;
                 thread::spawn(move || {
@@ -4194,7 +4223,7 @@ fn start_backend(
                         return; // ready stays false → the UI surfaces the failure
                     }
                     fs.store(false, Ordering::Relaxed);
-                    finish_backend(&idx, &rd, &st, &dirty2, &cpath, &drv, tx2, rx2);
+                    finish_backend(&idx, &rd, &st, &pending_events2, &cpath, &drv, tx2, rx2);
                 });
             }
             CacheLoad::Ready => {
@@ -4205,7 +4234,7 @@ fn start_backend(
                     eprintln!("Error: index has 0 files — running elevated? NTFS readable?");
                     return;
                 }
-                finish_backend(&index, &ready, &status, &dirty, &cache_path, &drives, tx, rx);
+                finish_backend(&index, &ready, &status, &pending_events, &cache_path, &drives, tx, rx);
             }
         }
     });

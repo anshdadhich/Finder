@@ -567,12 +567,13 @@ function setState(state) {
     scanStateEl.classList.add("visible");
     cardEl.style.display = "none";
     if (!scanStartAt) scanStartAt = Date.now();
-    tickScanClock();
+    armScanClock();
     if (scanRetryBtn) {
       scanRetryBtn.disabled = false;
       scanRetryBtn.textContent = "Try again";
     }
   } else {
+    disarmScanClock();
     scanStateEl.classList.remove("visible");
     cardEl.style.display = "";
     scanStartAt = 0;
@@ -591,7 +592,19 @@ function tickScanClock() {
   const ss = String(s % 60).padStart(2, "0");
   scanElapsed.textContent = `${mm}:${ss}`;
 }
-setInterval(tickScanClock, 1000);
+
+// The scan clock only ticks while the scan page is visible: arm it on
+// entering "scan", clear it when leaving, so a session parked on the ready
+// state doesn't keep a 1 Hz timer alive for the whole process lifetime.
+let scanClockTimer = null;
+function armScanClock() {
+  if (scanClockTimer) return;
+  scanClockTimer = setInterval(tickScanClock, 1000);
+  tickScanClock();
+}
+function disarmScanClock() {
+  if (scanClockTimer) { clearInterval(scanClockTimer); scanClockTimer = null; }
+}
 
 // Row pool: rows keyed by path survive between renders. replaceChildren only
 // re-parents existing nodes on the common path, so steady-state typing never

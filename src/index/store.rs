@@ -478,7 +478,10 @@ impl IndexStore {
             ext_dirty: true,
         };
         store.rebuild_ref_lookup();
-        store.rebuild_ext_index();
+        // ext_index is derived and lazily repaired under `ext_dirty` on the
+        // first search command — skip the eager O(N) build so cache load
+        // stays lean (the CLI's ext filter does its own suffix pass and
+        // never touches ext_index).
         Some(store)
     }
 

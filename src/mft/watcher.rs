@@ -244,7 +244,10 @@ use windows::{
 };
 use crate::mft::types::{FileKind, FileRecord, IndexEvent, JournalCheckpoint, NtfsDrive};
 
-const BUFFER_SIZE: usize = 64 * 1024;
+/// Live-poll and catch-up buffer. Records are ~100-200 B, so 4 MB reads
+/// ~20-40k records per ioctl — a warm-start long gap drains in a handful of
+/// calls instead of thousands of 64 KB round-trips.
+const BUFFER_SIZE: usize = 4 * 1024 * 1024;
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -348,7 +351,7 @@ impl UsnWatcher {
         let mut buffer = vec![0u8; BUFFER_SIZE];
         loop {
             std::thread::sleep(Duration::from_millis(500));
-            let _ = self.poll(&mut buffer);
+            let _ = self.poll(&mut buffer, true);
         }
     }
 
@@ -358,7 +361,7 @@ impl UsnWatcher {
         let mut consecutive_fails = 0u32;
         loop {
             std::thread::sleep(Duration::from_millis(500));
-            let ok = self.poll(&mut buffer);
+            let ok = self.poll(&mut buffer, true);
             if ok {
                 consecutive_fails = 0;
                 heartbeat.store(now_millis(), Ordering::Relaxed);
@@ -393,7 +396,7 @@ impl UsnWatcher {
         let mut count = 0;
         loop {
             let before = self.next_usn;
-            if !self.poll(&mut buffer) {
+            if !self.poll(&mut buffer, false) {
                 return Err(());
             }
             if self.next_usn == before {
@@ -406,7 +409,13 @@ impl UsnWatcher {
 
     /// Returns false when the journal read itself failed (not when it is
     /// merely idle — an idle read returning no records is a success).
-    fn poll(&mut self, buffer: &mut Vec<u8>) -> bool {
+    ///
+    /// `blocking` selects the live strategy: with `blocking = true` a
+    /// non-zero `BytesToWaitFor` + `Timeout` makes the kernel hold the caller
+    /// until records exist (or the 1s timeout elapses), so an idle drive
+    /// isn't busy-polled at 2 Hz. Catch-up (`drain`) passes `false` to keep
+    /// non-blocking reads that return as much of the journal as fits.
+    fn poll(&mut self, buffer: &mut Vec<u8>, blocking: bool) -> bool {
         let read_data = READ_USN_JOURNAL_DATA_V0 {
             StartUsn: self.next_usn,
             ReasonMask: USN_REASON_FILE_CREATE
@@ -414,8 +423,8 @@ impl UsnWatcher {
                 | USN_REASON_RENAME_NEW_NAME
                 | USN_REASON_RENAME_OLD_NAME,
             ReturnOnlyOnClose: 0,
-            Timeout: 0,
-            BytesToWaitFor: 0,
+            Timeout: if blocking { 1 } else { 0 },
+            BytesToWaitFor: if blocking { 1 } else { 0 },
             UsnJournalID: self.journal_id,
         };
 
@@ -445,8 +454,14 @@ impl UsnWatcher {
         let returned = bytes_returned as usize;
         let mut offset = 8usize;
         while offset + mem::size_of::<USN_RECORD_V2>() <= returned {
+            // Copy the header out by value: the journal buffer is only
+            // 8-byte aligned, and casting `&*(ptr as *const _)` against an
+            // unaligned address is formally undefined behaviour even though
+            // the kernel happens to pad records to 8-byte multiples.
             let record = unsafe {
-                &*(buffer.as_ptr().add(offset) as *const USN_RECORD_V2)
+                std::ptr::read_unaligned(
+                    buffer.as_ptr().add(offset) as *const USN_RECORD_V2,
+                )
             };
             let rec_len = record.RecordLength as usize;
             // Malformed/partial tail: never walk past the returned buffer and
@@ -454,7 +469,7 @@ impl UsnWatcher {
             if rec_len < mem::size_of::<USN_RECORD_V2>() || offset + rec_len > returned {
                 break;
             }
-            self.process_record(record, buffer, offset, rec_len);
+            self.process_record(&record, buffer, offset, rec_len);
             offset += rec_len;
         }
 
