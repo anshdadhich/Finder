@@ -76,7 +76,6 @@ fn main() {
 /// it back through the exact production load path. Failure here proves the
 /// writer/reader bytes disagree independent of the real index data.
 fn roundtrip_test() {
-    use std::io::Write;
     let blob: Vec<u8> = (0..8_000_000u32).map(|i| (i % 251) as u8).collect();
     let path = std::env::temp_dir().join("finder_rt_test.bin");
     {

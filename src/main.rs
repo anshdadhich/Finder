@@ -591,68 +591,39 @@ fn save_exclusions(path: &std::path::Path, dirs: &[String]) {
 /// Returns None when the file exists but cannot be decoded. Never mutates
 /// or deletes the file — a misread must never destroy a healthy cache.
 fn decode_cache_file(path: &std::path::Path) -> Option<finder::index::store::CacheData> {
-    use std::io::{Read, Seek};
+    // v4 zstd / v3 lz4 frames share the GUI's tested loader. The only format
+    // it does not know is the earliest CLI block-lz4 (no magic), tried as a
+    // fallback below — a real match decodes, an unrelated file does not.
+    if let Some(cache) = finder::index::store::load_cache_file(path) {
+        return Some(cache);
+    }
 
     let file = std::fs::File::open(path).ok()?;
     let mut r = std::io::BufReader::new(file);
-    let mut magic = [0u8; 4];
-    if r.read_exact(&mut magic).is_err() {
+    // Earliest CLI format: block-lz4 with a size prefix (no magic). Bound the
+    // raw slurp too (compressed bytes can exceed the decompressed size on
+    // incompressible data, so allow 2x the cap + the 4-byte prefix).
+    let max_raw = finder::index::store::MAX_CACHE_DECODED
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(4))
+        .unwrap_or(finder::index::store::MAX_CACHE_DECODED);
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(&mut r, max_raw), &mut raw).ok()?;
+    // The size prefix is attacker-supplied: refuse to let lz4_flex allocate a
+    // buffer larger than the decode cap before we ever call it.
+    if raw.len() < 4 {
         return None;
     }
-
-    if magic == [0x28, 0xB5, 0x2F, 0xFD] {
-        // v4: zstd frame. Stream straight into bincode (no full-index staging
-        // buffer) and cap the decompressed bytes — the cache sits in the
-        // user's LOCALAPPDATA, so it must be treated as untrusted input.
-        r.seek(std::io::SeekFrom::Start(0)).ok()?;
-        let mut dec = zstd::stream::read::Decoder::new(r).ok()?;
-        bincode::DefaultOptions::new()
-            .with_limit(finder::index::store::MAX_CACHE_DECODED)
-            .deserialize_from::<_, finder::index::store::CacheData>(
-                std::io::Read::take(&mut dec, finder::index::store::MAX_CACHE_DECODED),
-            )
-            .ok()
-    } else if magic == [0x04, 0x22, 0x4D, 0x18] {
-        // v3: legacy lz4 frame.
-        r.seek(std::io::SeekFrom::Start(0)).ok()?;
-        let mut dec = lz4_flex::frame::FrameDecoder::new(r);
-        bincode::DefaultOptions::new()
-            .with_limit(finder::index::store::MAX_CACHE_DECODED)
-            .deserialize_from::<_, finder::index::store::CacheData>(
-                std::io::Read::take(&mut dec, finder::index::store::MAX_CACHE_DECODED),
-            )
-            .ok()
-    } else {
-        // Earliest CLI format: block-lz4 with a size prefix (no magic). Try it
-        // last as a fallback — a real match decodes, an unrelated file does not.
-        r.seek(std::io::SeekFrom::Start(0)).ok()?;
-        // Bound the raw slurp too (compressed bytes can exceed the decompressed
-        // size on incompressible data, so allow 2x the cap + the 4-byte prefix).
-        let max_raw = finder::index::store::MAX_CACHE_DECODED
-            .checked_mul(2)
-            .and_then(|v| v.checked_add(4))
-            .unwrap_or(finder::index::store::MAX_CACHE_DECODED);
-        let mut raw = Vec::new();
-        std::io::Read::read_to_end(
-            &mut std::io::Read::take(&mut r, max_raw),
-            &mut raw,
-        )
-        .ok()?;
-        // The size prefix is attacker-supplied: refuse to let lz4_flex allocate
-        // a buffer larger than the decode cap before we ever call it.
-        if raw.len() < 4 {
-            return None;
-        }
-        let declared = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-        if declared == 0 || declared as u64 > finder::index::store::MAX_CACHE_DECODED {
-            return None;
-        }
-        let bytes = lz4_flex::decompress_size_prepended(&raw).ok()?;
-        bincode::DefaultOptions::new()
-            .with_limit(finder::index::store::MAX_CACHE_DECODED)
-            .deserialize::<finder::index::store::CacheData>(&bytes)
-            .ok()
+    let declared = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+    if declared == 0 || declared as u64 > finder::index::store::MAX_CACHE_DECODED {
+        return None;
     }
+    let bytes = lz4_flex::decompress_size_prepended(&raw).ok()?;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(finder::index::store::MAX_CACHE_DECODED)
+        .deserialize::<finder::index::store::CacheData>(&bytes)
+        .ok()
 }
 
 fn persist_cache(

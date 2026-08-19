@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     ffi::c_void,
-    io::{self, Read, Seek, Write},
+    io::{self, Write},
     mem::size_of,
     path::{Path, PathBuf},
     sync::{
@@ -15,7 +15,6 @@ use std::{
 };
 
 use crossbeam_channel::unbounded;
-use bincode::Options as BincodeOptions;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tauri::{
@@ -1619,7 +1618,7 @@ fn apps_from_shell() -> Vec<AppEntry> {
             let full = ILCombine(Some(abs_pidl), Some(pidl));
             let mut name = String::new();
             let mut parsing = String::new();
-            let mut icon = None;
+            let icon = None;
             if !full.is_null() {
                 if let Ok(pw) = SHGetNameFromIDList(full, SIGDN_NORMALDISPLAY) {
                     name = pw.to_string().unwrap_or_default();
@@ -1758,7 +1757,7 @@ fn hamming_bits(a: &[u32], b: &[u32]) -> u32 {
 /// Downscale the desktop behind the window rect into a tiny thumbnail and
 /// return its dHash as u32 words (63×36 = 2268 bits). None on any failure —
 /// callers then fall back to a full capture.
-fn thumb_dhash(window: &tauri::Window, rect: Option<(i32, i32, i32, i32)>) -> Option<Vec<u32>> {
+fn thumb_dhash(_window: &tauri::Window, rect: Option<(i32, i32, i32, i32)>) -> Option<Vec<u32>> {
     let (left, top, right, bottom) = rect?;
     let w = (right - left).max(1);
     let h = (bottom - top).max(1);
@@ -3578,21 +3577,6 @@ fn is_shortcut_target_junk(target: &str) -> bool {
         || stem.contains("uninstall")
 }
 
-/// One-time debug dump of the discovered pool — name | path | resolved target
-/// | dedupe score — so duplicate pairs can be diagnosed straight from log.txt
-/// instead of guessing. Removed once the remaining dupes are resolved.
-fn log_app_pool(apps: &[AppEntry]) {
-    log_line(&format!("app pool: {} entries", apps.len()));
-    for a in apps {
-        log_line(&format!(
-            "app-pool | {} | {} | target={} | score={}",
-            a.name,
-            a.path,
-            app_target_exe(a).unwrap_or_default(),
-            app_name_score(a)
-        ));
-    }
-}
 /// (strip a trailing ",icon-index" and expand env vars; only .exe/.lnk count —
 /// for .ico/.dll icons we hunt for an .exe in the same folder instead), else
 /// InstallLocation.
@@ -4277,46 +4261,9 @@ fn load_cache_and_catch_up(
     // upgrade; it just converts on the next save. Anything else fails the
     // magic check and is rejected below (one fresh rescan).
     let t0 = std::time::Instant::now();
-    let cache = std::fs::File::open(cache_path).ok().and_then(|file| {
-        let mut r = std::io::BufReader::new(file);
-        let mut magic = [0u8; 4];
-        if r.read_exact(&mut magic).is_err() {
-            return None;
-        }
-        if magic == [0x28, 0xB5, 0x2F, 0xFD] {
-            // v4: zstd frame. The 4 magic bytes were consumed above — rewind
-            // so the decoder starts at the frame boundary (it validates the
-            // magic itself; starting 4 bytes in reads "Unknown frame descriptor").
-            if r.seek(io::SeekFrom::Start(0)).is_err() {
-                return None;
-            }
-            let mut dec = zstd::stream::read::Decoder::new(r).ok()?;
-            // Stream the frame straight into bincode (no full-index-sized
-            // staging buffer) and cap the decompressed bytes with a Take so a
-            // tampered cache can't force a giant allocation in this elevated
-            // process before from_cache's structural checks even run.
-            bincode::DefaultOptions::new()
-                .with_limit(finder::index::store::MAX_CACHE_DECODED)
-                .deserialize_from::<_, finder::index::store::CacheData>(
-                    std::io::Read::take(&mut dec, finder::index::store::MAX_CACHE_DECODED),
-                )
-                .ok()
-        } else if magic == [0x04, 0x22, 0x4D, 0x18] {
-            // v3: legacy lz4 frame.
-            if r.seek(io::SeekFrom::Start(0)).is_err() {
-                return None;
-            }
-            let mut dec = lz4_flex::frame::FrameDecoder::new(r);
-            bincode::DefaultOptions::new()
-                .with_limit(finder::index::store::MAX_CACHE_DECODED)
-                .deserialize_from::<_, finder::index::store::CacheData>(
-                    std::io::Read::take(&mut dec, finder::index::store::MAX_CACHE_DECODED),
-                )
-                .ok()
-        } else {
-            None
-        }
-    });
+    // Shared decoder for both framings (v4 zstd / v3 lz4) lives in the
+    // library so CLI and GUI use one code path and tests can exercise it.
+    let cache = finder::index::store::load_cache_file(cache_path);
     let t1 = std::time::Instant::now();
     match cache {
         Some(cache) => {
@@ -4699,11 +4646,13 @@ fn ensure_single_instance() -> Option<HWND> {
     let name_ptr = PCWSTR(name.as_mut_ptr());
     // requireAdministrator grants SeCreateGlobalPrivilege, so the Global\
     // namespace is safe here and holds even across sessions.
-    let Ok(mutex) = (unsafe { CreateMutexW(None, true.into(), name_ptr) }) else {
+    let Ok(_mutex) = (unsafe { CreateMutexW(None, true.into(), name_ptr) }) else {
         return None; // could not even create the mutex; proceed anyway
     };
     let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-    std::mem::forget(mutex); // leak the handle so the mutex lives for the process
+    // HANDLE is a raw pointer with no Drop, so nothing closes it when the
+    // variable goes out of scope — the named mutex stays held for the life of
+    // the process without needing mem::forget (which is a no-op on Copy).
     if already_running {
         return existing;
     }

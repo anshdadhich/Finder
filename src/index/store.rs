@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
+use bincode::Options as BincodeOptions;
 use crate::mft::types::{FileKind, FileRecord, IndexEvent, JournalCheckpoint, NtfsDrive};
 use crate::mft::reader::{CompactRecord, ScanResult};
 
@@ -32,11 +33,14 @@ pub const CACHE_MAGIC: [u8; 4] = *b"FSKC";
 pub const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Hard cap on how many bytes a cache may decode to before it is rejected as
-/// tampered/oversized. Real caches are tens of MB; this is ~6x headroom.
-/// Applied as a `Take` on every decode path (GUI + CLI, zstd/lz4/block) so a
-/// hostile `finder_cache.bin` can never make the always-elevated process
-/// allocate unbounded memory and abort before the structural checks run.
-pub const MAX_CACHE_DECODED: u64 = 512 * 1024 * 1024;
+/// tampered/oversized. Real caches scale with file count: a 3 M-file index
+/// decodes to ~240 MB (20 MB zstd on disk). 1.5 GB keeps several-fold
+/// headroom for very large disks without reopening unbounded-allocation risk.
+/// Applied as a `Take` on every decode path (GUI + CLI, zstd/lz4/block) plus
+/// bincode's own `with_limit`, so a hostile `finder_cache.bin` can never make
+/// the always-elevated process allocate unbounded memory and abort before the
+/// structural checks run.
+pub const MAX_CACHE_DECODED: u64 = 1536 * 1024 * 1024;
 
 /// A volume's root path, as indexed. Entries carry a `drive` index into
 /// this list, so file_refs (per-volume MFT record numbers) never collide
@@ -710,6 +714,54 @@ impl IndexStore {
     }
 }
 
+/// Decode a cache file previously written by `save_cache` (v4 zstd frame) or
+/// a legacy v3 lz4 frame back into its raw serialized form. `None` means the
+/// file is missing, carries an unknown magic, or the frame failed to decode —
+/// callers treat that as "discard and rescan" (a format bump intentionally
+/// invalidates old files, causing exactly one fresh scan).
+///
+/// Both framings stream through `bincode::DefaultOptions` with a decode cap
+/// (`MAX_CACHE_DECODED`) applied twice: once on the decompressed bytes pulled
+/// from the decoder (a `Take`) and once inside bincode itself, so a hostile or
+/// corrupt cache can never force an unbounded allocation in the always-elevated
+/// host process before the structural checks in `from_cache` run.
+pub fn load_cache_file(path: &std::path::Path) -> Option<CacheData> {
+    use std::io::{BufReader, Read, Seek};
+    let file = std::fs::File::open(path).ok()?;
+    let mut r = BufReader::new(file);
+    let mut magic = [0u8; 4];
+    if r.read_exact(&mut magic).is_err() {
+        return None;
+    }
+    if magic == [0x28, 0xB5, 0x2F, 0xFD] {
+        // v4: zstd frame. The 4 magic bytes were consumed above — rewind so
+        // the decoder starts at the frame boundary (it validates the magic
+        // itself; starting 4 bytes in reads "Unknown frame descriptor").
+        if r.seek(std::io::SeekFrom::Start(0)).is_err() {
+            return None;
+        }
+        let mut dec = zstd::stream::read::Decoder::new(r).ok()?;
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_CACHE_DECODED)
+            .deserialize_from::<_, CacheData>(Read::take(&mut dec, MAX_CACHE_DECODED))
+            .ok()
+    } else if magic == [0x04, 0x22, 0x4D, 0x18] {
+        // v3: legacy lz4 frame.
+        if r.seek(std::io::SeekFrom::Start(0)).is_err() {
+            return None;
+        }
+        let mut dec = lz4_flex::frame::FrameDecoder::new(r);
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_CACHE_DECODED)
+            .deserialize_from::<_, CacheData>(Read::take(&mut dec, MAX_CACHE_DECODED))
+            .ok()
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1053,5 +1105,91 @@ mod tests {
         let mut cache = store.to_cache();
         cache.magic = *b"OLDC";
         assert!(IndexStore::from_cache(cache).is_none());
+    }
+
+    #[test]
+    fn cache_file_v4_zstd_roundtrip_matches_gui_save_and_load() {
+        let mut store = IndexStore::new();
+        store.populate_from_scan(
+            scan_result(&[
+                (1, 0, "Users", true),
+                (10, 1, "doc.txt", false),
+                (11, 1, "photo.png", false),
+            ]),
+            &ntfs_drive('C'),
+        );
+        store.finalize();
+        let cache = store.to_cache();
+
+        let path = std::env::temp_dir().join(format!(
+            "finder_test_v4_{}.bin",
+            std::process::id()
+        ));
+        {
+            // Exact `save_cache` shape: zstd level-3 frame + plain
+            // `bincode::serialize_into` of the CacheData.
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc =
+                zstd::stream::write::Encoder::new(std::io::BufWriter::new(file), 3).unwrap();
+            bincode::serialize_into(&mut enc, &cache).unwrap();
+            let _ = enc.finish().unwrap();
+        }
+
+        let loaded = super::load_cache_file(&path).expect("v4 zstd cache must decode");
+        let loaded_store = IndexStore::from_cache(loaded).unwrap();
+        assert_eq!(
+            names(&loaded_store),
+            vec!["Users", "doc.txt", "photo.png"]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cache_file_v3_lz4_roundtrip_is_still_readable() {
+        let mut store = IndexStore::new();
+        store.populate_from_scan(
+            scan_result(&[(1, 0, "Legacy", true), (2, 1, "old.bin", false)]),
+            &ntfs_drive('D'),
+        );
+        store.finalize();
+        let cache = store.to_cache();
+
+        let path = std::env::temp_dir().join(format!(
+            "finder_test_v3_{}.bin",
+            std::process::id()
+        ));
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = lz4_flex::frame::FrameEncoder::new(std::io::BufWriter::new(file));
+            bincode::serialize_into(&mut enc, &cache).unwrap();
+            let _ = enc.finish().unwrap();
+        }
+
+        let loaded = super::load_cache_file(&path).expect("v3 lz4 cache must decode");
+        let loaded_store = IndexStore::from_cache(loaded).unwrap();
+        assert_eq!(names(&loaded_store), vec!["Legacy", "old.bin"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Opt-in diagnostic: set `FINDER_CACHE_PROBE=<path>` to run the exact
+    /// production loader against a real saved cache file (warm-start path).
+    /// Skipped entirely when the variable is absent, so normal test runs and
+    /// CI are unaffected.
+    #[test]
+    fn probe_real_saved_cache() {
+        let Ok(path) = std::env::var("FINDER_CACHE_PROBE") else {
+            return;
+        };
+        let cache = super::load_cache_file(std::path::Path::new(&path))
+            .expect("real cache file must decode (warm-start path)");
+        eprintln!(
+            "PROBE: decoded {} entries / {} drives from {}",
+            cache.entries.len(),
+            cache.drive_roots.len(),
+            path
+        );
+        let store = IndexStore::from_cache(cache)
+            .expect("real cache must pass from_cache structural checks");
+        assert!(store.len() > 0);
     }
 }
