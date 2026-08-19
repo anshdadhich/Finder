@@ -670,8 +670,45 @@ fn launch_app(path: String, state: tauri::State<AppState>) -> Result<(), String>
     launch_with_verb(&path, "open")
 }
 
+// ── Privileged-command nonce (S4) ─────────────────────────────────────
+// `withGlobalTauri: false` removes the page-wide `window.__TAURI__`
+// namespace from the webview. As defense-in-depth, the four highest-value
+// commands (launch_admin, uninstall_app, image_data, grab_backdrop)
+// additionally require a random per-session nonce that the frontend fetches
+// at boot and submits with every privileged call: a page whose static IPC
+// surface was tampered with cannot drive them without a live round-trip.
+static PRIVILEGE_NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn privilege_nonce() -> &'static str {
+    PRIVILEGE_NONCE.get_or_init(|| {
+        use windows::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG;
+        use windows::Win32::Security::Cryptography::BCryptGenRandom;
+        let mut buf = [0u8; 16];
+        // Best-effort CSPRNG — the nonce guards against static-content
+        // tampering, not against a compromised OS RNG.
+        unsafe {
+            let _ = BCryptGenRandom(None, &mut buf, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        }
+        buf.iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
+
+fn check_nonce(nonce: &str) -> Result<(), String> {
+    if nonce == privilege_nonce() {
+        Ok(())
+    } else {
+        Err("privileged command rejected: missing or stale nonce".into())
+    }
+}
+
 #[tauri::command]
-fn launch_admin(path: String, state: tauri::State<AppState>) -> Result<(), String> {
+fn get_nonce() -> String {
+    privilege_nonce().to_string()
+}
+
+#[tauri::command]
+fn launch_admin(path: String, nonce: String, state: tauri::State<AppState>) -> Result<(), String> {
+    check_nonce(&nonce)?;
     let mut freq = state.freq.lock();
     let entry = freq.entry(path.to_lowercase()).or_insert(0);
     *entry = entry.saturating_add(1);
@@ -1073,11 +1110,15 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Base64 data URI for an image file so the preview pane can show the
-/// actual picture. Capped at 16 MB — anything bigger just falls back to
-/// the regular icon row.
+/// Data URI for an image file so the preview pane can show the actual
+/// picture. R2: decodes and downscales in-process (png/jpeg/bmp/ico) so the
+/// IPC payload is a few KB instead of a whole-file base64. Undecodable
+/// files, animated/webp formats and oversized images fall back to the raw
+/// whole-file data URI (capped at 16 MB), preserving the old behavior
+/// exactly for everything the thumbnail pass can't serve.
 #[tauri::command]
-fn image_data(path: String) -> Result<Option<String>, String> {
+fn image_data(path: String, nonce: String) -> Result<Option<String>, String> {
+    check_nonce(&nonce)?;
     use std::io::Read;
     // Extension gate BEFORE anything is opened.
     let ext = path
@@ -1106,6 +1147,10 @@ fn image_data(path: String) -> Result<Option<String>, String> {
     if !meta.file_type().is_file() {
         return Ok(None);
     }
+    // Thumbnail pass first; the raw path below stays as the fallback.
+    if let Some(uri) = thumbnail_data_uri(&path, &mime) {
+        return Ok(Some(uri));
+    }
     let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
     // Hard cap at read time too — no TOCTOU between a metadata check and
     // the read (a growing file cannot blow past 16 MB anymore).
@@ -1121,6 +1166,41 @@ fn image_data(path: String) -> Result<Option<String>, String> {
         mime,
         base64::engine::general_purpose::STANDARD.encode(&bytes)
     )))
+}
+
+/// 512 px-box thumbnail data URI for static image formats. `None` when the
+/// file is undecodable or beyond the bounded dimensions — callers fall back
+/// to the whole-file data URI. JPEG sources re-encode as JPEG, everything
+/// else as PNG (keeps alpha for icons and screenshots).
+fn thumbnail_data_uri(path: &str, mime: &str) -> Option<String> {
+    // Bounded decode: a photo past 4096 px would allocate hundreds of MB
+    // just to scale down — send it down the raw path (16 MB cap) instead.
+    let (w, h) = image::image_dimensions(path).ok()?;
+    if w.max(h) > 4096 {
+        return None;
+    }
+    let img = image::open(path).ok()?;
+    // object-fit preserves aspect; a 512 box is crisp up to 2x DPI in the
+    // ~690 px-tall preview pane while keeping the payload tiny.
+    let thumb = image::imageops::thumbnail(&img, 512, 512);
+    let mut out = Vec::new();
+    if mime == "image/jpeg" {
+        image::DynamicImage::ImageRgb8(image::DynamicImage::ImageRgba8(thumb).to_rgb8())
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Jpeg)
+            .ok()?;
+        Some(format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(out)
+        ))
+    } else {
+        image::DynamicImage::ImageRgba8(thumb)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .ok()?;
+        Some(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(out)
+        ))
+    }
 }
 
 /// Insert into the in-memory icon cache under a hard cap: a long session
@@ -2039,8 +2119,9 @@ fn capture_backdrop(window: &tauri::Window) -> Option<(BackdropGrab, bool)> {
 }
 
 #[tauri::command]
-fn grab_backdrop() -> Option<BackdropGrab> {
-    BACKDROP.lock().clone()
+fn grab_backdrop(nonce: String) -> Result<Option<BackdropGrab>, String> {
+    check_nonce(&nonce)?;
+    Ok(BACKDROP.lock().clone())
 }
 
 #[tauri::command]
@@ -2718,6 +2799,7 @@ fn main() {
             get_hotkey,
             set_hotkey,
             image_data,
+            get_nonce,
             frontend_loaded
         ])
         .build(tauri::generate_context!())
@@ -4816,7 +4898,8 @@ fn app_info(name: String, path: String) -> AppInfo {
 /// Apps & features settings page when no registry entry exists. UWP apps have
 /// no uninstaller string — open their settings page instead.
 #[tauri::command]
-fn uninstall_app(name: String, path: String) -> Result<(), String> {
+fn uninstall_app(name: String, path: String, nonce: String) -> Result<(), String> {
+    check_nonce(&nonce)?;
     let mut target = None;
     if !path.starts_with("aumid:") && path.to_lowercase().ends_with(".lnk") {
         target = resolve_lnk_target(&path);

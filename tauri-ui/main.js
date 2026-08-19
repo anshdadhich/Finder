@@ -1,4 +1,26 @@
-const invoke = window.__TAURI__?.tauri?.invoke || window.__TAURI__?.invoke;
+// IPC surface. `withGlobalTauri: false` (S4) removes the page-wide
+// `window.__TAURI__` namespace from the webview; the runtime still exposes
+// the minimal internal bridge the official @tauri-apps/api package sits on,
+// which we re-plumb here — one `invoke`, two event `listen`s, and the
+// updater. The __TAURI__ fallback keeps the page working if the flag is
+// ever re-enabled for local development.
+const __i = window.__TAURI__ || window.__TAURI_INTERNALS__ || {};
+const invoke =
+  __i.tauri?.invoke ||
+  __i.invoke ||
+  (() => Promise.reject(new Error("no IPC bridge")));
+const listen = (event, handler) =>
+  (window.__TAURI_INTERNALS__?.listen || __i.event?.listen)(event, handler);
+
+// Privileged commands (launch_admin, uninstall_app, image_data,
+// grab_backdrop) require the per-session nonce (S4): fetched once at boot
+// and attached to every privileged call. A page whose static resources were
+// tampered with cannot drive them without a live nonce round-trip.
+const nonceP = invoke("get_nonce").catch(() => "");
+async function privileged(cmd, payload) {
+  const nonce = await nonceP;
+  return invoke(cmd, { ...(payload || {}), nonce });
+}
 
 // Theme: follows the OS by default ("system"); a manual dark/light choice
 // made in Settings (fs-theme) overrides it.
@@ -1146,12 +1168,12 @@ function clearBackdrop() {
 
 function refreshBackdrop() {
   if (!invoke || !glassLayerEl) return;
-  invoke("grab_backdrop").then(applyBackdrop).catch(() => {});
+  privileged("grab_backdrop").then(applyBackdrop).catch(() => {});
 }
 refreshBackdrop();
 // Rust pushes each fresh capture before the window shows, so the JPEG
 // decode overlaps the hidden period — no stale background ever flashes in.
-window.__TAURI__?.event?.listen("backdrop", (e) => applyBackdrop(e.payload));
+listen("backdrop", (e) => applyBackdrop(e.payload));
 
 // Rust emits this BEFORE hiding (webview still visible → JS runs at full
 // speed), so the query/selection reset is done before the window ever
@@ -1160,7 +1182,7 @@ window.__TAURI__?.event?.listen("backdrop", (e) => applyBackdrop(e.payload));
 // scrollTop is explicitly reset too — replaceChildren alone leaves a
 // residual scroll when the new list is about as tall as the old one,
 // which pushes the first group label ("Applications") out of view.
-window.__TAURI__?.event?.listen("spotlight-hide", async () => {
+listen("spotlight-hide", async () => {
   // The next show must be a fresh launcher: close Settings too, or the
   // panel would still be open on the next summon.
   if (document.body.classList.contains("settings-open")) {
@@ -1610,7 +1632,7 @@ function renderPreview() {
       pvImgEl.removeAttribute("src");
       pvImgEl.alt = "Loading…";
       const selPath = item.path;
-      invoke("image_data", { path: item.path })
+      privileged("image_data", { path: item.path })
         .then((uri) => {
           if (!uri || !currentSelection || currentSelection.item.path !== selPath) return;
           pvImgCache.set(selPath, uri);
@@ -1700,7 +1722,11 @@ async function runAppAction(cmd, payload) {
   const cur = currentSelection;
   if (!cur) return;
   try {
-    await invoke(cmd, payload);
+    if (cmd === "launch_admin" || cmd === "uninstall_app") {
+      await privileged(cmd, payload);
+    } else {
+      await invoke(cmd, payload);
+    }
     await invoke("hide_window");
   } catch (error) {
     showActionError(cur.item.name, error);
@@ -1792,7 +1818,11 @@ async function openSelected(mode) {
             ? "launch_app"
             : "open_path";
   try {
-    await invoke(cmd, { path: item.path });
+    if (cmd === "launch_admin") {
+      await privileged(cmd, { path: item.path });
+    } else {
+      await invoke(cmd, { path: item.path });
+    }
     await invoke("hide_window");
   } catch (error) {
     // Keep the palette open and say why instead of silently doing nothing.
@@ -2137,7 +2167,15 @@ if (scanQuitBtn) {
 // The backend push side is publish-update.ps1 + latest.json (signed NSIS
 // installer). This client listens for update events, checks the feed at most
 // once per 7 days (timestamp kept in localStorage), and lets the user install.
-const updater = window.__TAURI__?.updater;
+const updater =
+  window.__TAURI__?.updater || {
+    checkUpdate: () =>
+      window.__TAURI_INTERNALS__?.invoke("plugin:updater|check") ||
+      Promise.reject(new Error("no updater")),
+    installUpdate: () =>
+      window.__TAURI_INTERNALS__?.invoke("plugin:updater|install") ||
+      Promise.reject(new Error("no updater")),
+  };
 const updateBanner = document.querySelector("#updateBanner");
 const updateVersionEl = document.querySelector("#updateVersion");
 const updateBtnEl = document.querySelector("#updateBtn");
