@@ -711,50 +711,70 @@ impl IndexStore {
     /// all mutations run first, then sorted-name order and ref_lookup are
     /// restored once (instead of once per event). Every data event carries
     /// its drive letter; all removes/inserts stay in that drive's space.
+    ///
+    /// W4 splicing: the batch's winning records are materialized into the
+    /// arenas, name-sorted (small), and merged into the name-sorted
+    /// `entries` with ONE linear pass — no whole-index re-sort. ref_lookup
+    /// is delta-merged instead of rebuilt: stale refs drop per bucket,
+    /// surviving indices shift by the count of spliced entries that landed
+    /// at or before them, and new (ref, final index) pairs are inserted in
+    /// ref order. A churn burst therefore costs ~O(N + k·log k) instead of
+    /// O(N log N) per flush (k = batch size, N = index size).
     pub fn apply_events(&mut self, events: Vec<IndexEvent>) {
         if events.is_empty() {
             return;
         }
 
-        let mut pending: Vec<(u8, FileRecord)> = Vec::with_capacity(events.len());
-        let mut removed = false;
+        // Pass 1: classify every event. `removes` collects every ref that
+        // must vanish from the index (deletes, rename sources, moved refs);
+        // `newest` keeps the winning record per ref after intra-batch
+        // collapse — CREATE + RENAME for one file ref burst into a single
+        // batch, and without the dedup both would be inserted.
+        let mut removes: std::collections::HashSet<(u8, u64)> =
+            std::collections::HashSet::new();
+        let mut newest: Vec<(u8, FileRecord)> = Vec::with_capacity(events.len());
+        let mut newest_seen: std::collections::HashMap<(u8, u64), usize> =
+            std::collections::HashMap::new();
+        let mut push_newest = |d: u8, record: FileRecord| {
+            if let Some(&slot) = newest_seen.get(&(d, record.file_ref)) {
+                newest[slot] = (d, record);
+            } else {
+                newest_seen.insert((d, record.file_ref), newest.len());
+                newest.push((d, record));
+            }
+        };
 
         for event in events {
             match event {
                 IndexEvent::Created { drive_letter, record } => {
                     let d = self.drive_index(drive_letter);
                     if !self.is_live_junk(record.parent_ref, d) {
-                        pending.push((d, record));
+                        push_newest(d, record);
                     } else {
                         self.junk_refs_for(d).insert(record.file_ref);
                     }
                 }
                 IndexEvent::Deleted { drive_letter, file_ref } => {
                     let d = self.drive_index(drive_letter);
-                    let before = self.entries.len();
-                    self.entries
-                        .retain(|e| !(e.drive == d && e.file_ref == file_ref));
+                    removes.insert((d, file_ref));
                     self.junk_refs_for(d).remove(&file_ref);
-                    removed |= self.entries.len() != before;
                 }
                 IndexEvent::Renamed { drive_letter, old_ref, new_record } => {
                     let d = self.drive_index(drive_letter);
-                    self.entries
-                        .retain(|e| !(e.drive == d && e.file_ref == old_ref));
+                    removes.insert((d, old_ref));
                     self.junk_refs_for(d).remove(&old_ref);
                     if !self.is_live_junk(new_record.parent_ref, d) {
-                        pending.push((d, new_record));
+                        push_newest(d, new_record);
                     } else {
                         self.junk_refs_for(d).insert(new_record.file_ref);
                     }
                 }
                 IndexEvent::Moved { drive_letter, file_ref, new_parent_ref, name, kind } => {
                     let d = self.drive_index(drive_letter);
-                    self.entries
-                        .retain(|e| !(e.drive == d && e.file_ref == file_ref));
+                    removes.insert((d, file_ref));
                     let rec = FileRecord { file_ref, parent_ref: new_parent_ref, name, kind };
                     if !self.is_live_junk(rec.parent_ref, d) {
-                        pending.push((d, rec));
+                        push_newest(d, rec);
                     } else {
                         self.junk_refs_for(d).insert(rec.file_ref);
                     }
@@ -763,49 +783,143 @@ impl IndexStore {
             }
         }
 
-        if pending.is_empty() {
-            if removed {
+        // Pass 2: one retain covers every ref to drop — deletes AND replaced
+        // records (journal replay can re-deliver a create for a ref that
+        // already exists; the old entry must not survive beside the
+        // re-inserted one). Surviving entries keep name-sorted order.
+        if !newest.is_empty() {
+            removes.extend(newest.iter().map(|(d, r)| (*d, r.file_ref)));
+        }
+        let before = self.entries.len();
+        let mut removed_any = false;
+        if !removes.is_empty() {
+            self.entries.retain(|e| !removes.contains(&(e.drive, e.file_ref)));
+            removed_any = self.entries.len() != before;
+        }
+
+        if newest.is_empty() {
+            // Pure deletes / junk drops: order is untouched, only the ref
+            // buckets need refreshing (and only if something vanished). The
+            // extension buckets would dangle past the trimmed entries — mark
+            // ext_index dirty so the next ext search rebuilds it instead of
+            // indexing out of bounds.
+            if removed_any {
                 self.rebuild_ref_lookup();
+                self.ext_dirty = true;
             }
             return;
         }
 
-        // Idempotency: every record in this batch supersedes any pre-existing
-        // entry with the same (drive, file_ref), and records within the batch
-        // itself are collapsed to the newest one per ref. Creating a folder
-        // then renaming it bursts CREATE + RENAME records for the same file
-        // ref in a single batch; without the intra-batch dedup both would be
-        // inserted and the index would carry duplicate entries.
-        let mut newest: Vec<(u8, FileRecord)> = Vec::with_capacity(pending.len());
-        {
-            let mut seen: std::collections::HashMap<(u8, u64), usize> =
-                std::collections::HashMap::with_capacity(pending.len());
-            for (d, rec) in pending {
-                if let Some(&slot) = seen.get(&(d, rec.file_ref)) {
-                    newest[slot] = (d, rec);
-                } else {
-                    seen.insert((d, rec.file_ref), newest.len());
-                    newest.push((d, rec));
-                }
-            }
-        }
-        let pending_refs: std::collections::HashSet<(u8, u64)> =
-            newest.iter().map(|(d, r)| (*d, r.file_ref)).collect();
-        self.entries
-            .retain(|e| !pending_refs.contains(&(e.drive, e.file_ref)));
-
-        self.entries.reserve(newest.len());
-        let new_start = self.entries.len();
-        // Placeholder metadata; a batch can create a parent dir and its
-        // children in a single drain, so the depth/user walk must run against
-        // the ref lookup once every record of this batch is visible.
-        let new_entries: Vec<IndexEntry> = newest
+        // Pass 3: materialize the new records into the arenas. depth/user
+        // stay placeholders until the whole batch is visible to the ancestor
+        // walk (a batch can create a directory and its children in one
+        // drain). The small set is then name-sorted for the merge.
+        let mut new_entries: Vec<IndexEntry> = newest
             .iter()
             .map(|(d, record)| self.arena_entry(record, *d, 0, 0))
             .collect();
-        self.entries.extend(new_entries);
-        self.rebuild_ref_lookup();
-        for (i, (d, record)) in newest.iter().enumerate() {
+        new_entries.sort_unstable_by(|a, b| self.name_lower(a).cmp(self.name_lower(b)));
+
+        // Pass 4: one linear merge restores name-sorted order (splice, not
+        // re-sort). For every spliced record we keep its insertion slot (the
+        // old-coordinate cursor value when it was emitted — every surviving
+        // entry at/after it shifts by one) and its final merged index.
+        // Ties (duplicate names across directories, e.g. "report.txt") go
+        // old-first, which the slot bookkeeping below matches exactly.
+        let old_len = self.entries.len();
+        let mut merged: Vec<IndexEntry> = Vec::with_capacity(old_len + new_entries.len());
+        let mut spliced: Vec<(u8, u64, usize, usize)> = Vec::with_capacity(new_entries.len());
+        {
+            let mut i = 0;
+            let mut j = 0;
+            while i < old_len && j < new_entries.len() {
+                if self.name_lower(&self.entries[i]) <= self.name_lower(&new_entries[j]) {
+                    merged.push(self.entries[i].clone());
+                    i += 1;
+                } else {
+                    let (slot, at) = (i, merged.len());
+                    spliced.push((new_entries[j].drive, new_entries[j].file_ref, slot, at));
+                    merged.push(new_entries[j].clone());
+                    j += 1;
+                }
+            }
+            while j < new_entries.len() {
+                let (slot, at) = (old_len, merged.len());
+                spliced.push((new_entries[j].drive, new_entries[j].file_ref, slot, at));
+                merged.push(new_entries[j].clone());
+                j += 1;
+            }
+            while i < old_len {
+                merged.push(self.entries[i].clone());
+                i += 1;
+            }
+        }
+        self.entries = merged;
+
+        // Pass 5: delta-merge ref buckets instead of a full rebuild. The
+        // stored index of every surviving entry moves in two steps — each
+        // removed ref compresses the space below it, each spliced record
+        // expands it (at its insertion slot, in post-compression
+        // coordinates) — then the batch's new (ref, final index) pairs are
+        // inserted in ref order. Indices are global (one entries vec), so
+        // every drive's bucket is re-based even when only one drive changed.
+        let slots: Vec<usize> = spliced.iter().map(|&(_, _, s, _)| s).collect();
+        // final index of each spliced record (pass 6 stamps depth/user
+        // there) plus the per-drive (ref, final index) pairs for the
+        // ordered bucket inserts below.
+        let mut final_at: std::collections::HashMap<(u8, u64), usize> =
+            std::collections::HashMap::with_capacity(spliced.len());
+        let mut refs_by_drive: std::collections::HashMap<u8, Vec<(u64, u32)>> =
+            std::collections::HashMap::new();
+        for &(d, r, _, at) in &spliced {
+            final_at.insert((d, r), at);
+            refs_by_drive.entry(d).or_default().push((r, at as u32));
+        }
+        for (_, refs) in &mut refs_by_drive {
+            refs.sort_unstable_by_key(|&(r, _)| r);
+        }
+        // Pre-batch (global) index of every ref this batch removed — the
+        // compression half of the shift. Refs missing from the old buckets
+        // simply never existed.
+        let mut removed_idx: Vec<usize> = Vec::new();
+        for &(d, r) in &removes {
+            if let Some(bucket) = self.ref_lookup.get(d as usize) {
+                if let Ok(p) = bucket.binary_search_by_key(&r, |&(br, _)| br) {
+                    removed_idx.push(bucket[p].1 as usize);
+                }
+            }
+        }
+        removed_idx.sort_unstable();
+        let compress = |i: usize| removed_idx.partition_point(|&ri| ri <= i);
+
+        let mut drives: Vec<u8> = (0..self.ref_lookup.len() as u8).collect();
+        drives.extend(spliced.iter().map(|&(d, _, _, _)| d));
+        drives.extend(removes.iter().map(|&(d, _)| d));
+        drives.sort_unstable();
+        drives.dedup();
+        while self.ref_lookup.len() as u8 <= *drives.last().unwrap_or(&0) {
+            self.ref_lookup.push(Vec::new());
+        }
+        for d in drives {
+            let bucket = &mut self.ref_lookup[d as usize];
+            bucket.retain(|&(r, _)| !removes.contains(&(d, r)));
+            for (_, idx) in bucket.iter_mut() {
+                let i = *idx as usize;
+                let c = compress(i); // surviving entries always keep c <= i
+                *idx = (i - c + slots.partition_point(|&s| s <= i - c)) as u32;
+            }
+            if let Some(refs) = refs_by_drive.get(&d) {
+                for &(r, idx) in refs {
+                    let at = bucket.partition_point(|&(br, _)| br < r);
+                    bucket.insert(at, (r, idx));
+                }
+            }
+        }
+
+        // Pass 6: stamp depth/user for the spliced records. The batch is
+        // fully visible in the ref buckets now, so a parent created in the
+        // same batch is found by the ancestor walk.
+        for (d, record) in &newest {
             let lower = record.name.to_lowercase();
             let (depth, user_path) = self.path_meta(
                 *d,
@@ -813,15 +927,10 @@ impl IndexStore {
                 &lower,
                 matches!(record.kind, FileKind::Directory),
             );
-            self.entries[new_start + i].depth = depth;
-            self.entries[new_start + i].user_path = user_path;
+            let at = final_at[&(*d, record.file_ref)];
+            self.entries[at].depth = depth;
+            self.entries[at].user_path = user_path;
         }
-        let store_ptr = self as *const IndexStore;
-        self.entries.sort_unstable_by(|a, b| {
-            let s = unsafe { &*store_ptr };
-            s.name_lower(a).cmp(s.name_lower(b))
-        });
-        self.rebuild_ref_lookup();
         self.ext_dirty = true;
     }
 
@@ -1054,6 +1163,243 @@ mod tests {
         assert_eq!(hits, 1);
         let hit = store.entries.iter().find(|e| e.file_ref == 42).unwrap();
         assert_eq!(store.name(hit), "finder-final-name");
+    }
+
+    #[test]
+    fn apply_events_splices_sorted_and_delta_merges_ref_lookup() {
+        // W4: one applier drain mixing a directory and a file born inside it
+        // (batch-parent visibility), a rename, a move, and a delete. The
+        // entry order must stay name-sorted and every bucket index must
+        // resolve back to its own (drive, file_ref) — the splice + shift +
+        // ordered-insert bookkeeping in aggregate.
+        let mut store = IndexStore::new();
+        store.populate_from_scan(
+            scan_result(&[
+                (1, 0, "Users", true),
+                (10, 1, "Alice", true),
+                (11, 10, "report.txt", false),
+                (12, 10, "photo.PNG", false),
+                (13, 0, "node_modules", true),
+                (14, 13, "lodash.js", false),
+            ]),
+            &ntfs_drive('C'),
+        );
+        store.finalize();
+        assert_eq!(store.entries.len(), 5); // node_modules kept, lodash.js pruned
+
+        store.apply_events(vec![
+            IndexEvent::Created {
+                drive_letter: 'C',
+                record: FileRecord {
+                    file_ref: 20,
+                    parent_ref: 1,
+                    name: "zeta".to_string(),
+                    kind: FileKind::Directory,
+                },
+            },
+            IndexEvent::Created {
+                drive_letter: 'C',
+                record: FileRecord {
+                    file_ref: 21,
+                    parent_ref: 20,
+                    name: "app.js".to_string(),
+                    kind: FileKind::File,
+                },
+            },
+            IndexEvent::Renamed {
+                drive_letter: 'C',
+                old_ref: 10,
+                new_record: FileRecord {
+                    file_ref: 10,
+                    parent_ref: 1,
+                    name: "Bob".to_string(),
+                    kind: FileKind::Directory,
+                },
+            },
+            IndexEvent::Moved {
+                drive_letter: 'C',
+                file_ref: 11,
+                new_parent_ref: 20,
+                name: "report.txt".to_string(),
+                kind: FileKind::File,
+            },
+            IndexEvent::Deleted { drive_letter: 'C', file_ref: 12 },
+        ]);
+
+        // Post-splice order is exactly the name-sorted one — no late sort.
+        let ordered: Vec<String> = store.entries.iter().map(|e| store.name(e).to_string()).collect();
+        assert_eq!(
+            ordered,
+            vec![
+                "app.js".to_string(),
+                "Bob".to_string(),
+                "node_modules".to_string(),
+                "report.txt".to_string(),
+                "Users".to_string(),
+                "zeta".to_string(),
+            ]
+        );
+        for w in store.entries.windows(2) {
+            assert!(store.name_lower(&w[0]) <= store.name_lower(&w[1]));
+        }
+        // Every bucket entry resolves back to its own record; every record
+        // is reachable through its drive's bucket.
+        for (d, bucket) in store.ref_lookup.iter().enumerate() {
+            for &(r, idx) in bucket {
+                assert!((idx as usize) < store.entries.len());
+                let e = &store.entries[idx as usize];
+                assert_eq!(e.drive, d as u8);
+                assert_eq!(e.file_ref, r);
+            }
+        }
+        for (i, e) in store.entries.iter().enumerate() {
+            assert_eq!(store.lookup_idx(e.drive, e.file_ref), Some(i as u32));
+        }
+        // depth/user were stamped against the completed batch: app.js and
+        // report.txt sit under zeta (created in the same drain) under Users.
+        fn meta(s: &IndexStore, name: &str) -> (u8, u8) {
+            let e = s.entries.iter().find(|e| s.name(e) == name).unwrap();
+            (e.depth, e.user_path)
+        }
+        assert_eq!(meta(&store, "app.js"), (2, 1));
+        assert_eq!(meta(&store, "report.txt"), (2, 1));
+        assert_eq!(meta(&store, "Bob"), (1, 1));
+        assert!(store.lookup_idx(0, 12).is_none()); // photo.PNG deleted
+    }
+
+    #[test]
+    fn delete_only_batch_refreshes_lookup_and_dirty_ext_index() {
+        // Deletes-only drains skip the splice; they must still re-base the
+        // ref buckets and mark ext_index dirty — its stored indices would
+        // otherwise dangle past the trimmed entries and OOB an ext search.
+        let mut store = IndexStore::new();
+        store.populate_from_scan(
+            scan_result(&[
+                (1, 0, "Users", true),
+                (10, 1, "a.txt", false),
+                (11, 1, "b.txt", false),
+            ]),
+            &ntfs_drive('C'),
+        );
+        store.finalize();
+        assert!(!store.ext_dirty);
+
+        store.apply_events(vec![IndexEvent::Deleted { drive_letter: 'C', file_ref: 10 }]);
+        assert!(store.ext_dirty);
+        assert!(store.lookup_idx(0, 10).is_none());
+        assert_eq!(store.lookup_idx(0, 11), Some(0)); // b.txt slides to index 0
+        assert_eq!(store.entries.len(), 2);
+    }
+
+    #[test]
+    fn random_event_batches_keep_index_invariants() {
+        // Deterministic LCG — any failure reproduces. Mixed create/delete/
+        // rename/move batches on two drives that share file_refs exercise
+        // the splice + compression + expansion bookkeeping far harder than
+        // any hand-written case.
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 32) as u32
+        };
+        let mut store = IndexStore::new();
+        store.populate_from_scan(
+            scan_result(&[
+                (1, 0, "Users", true),
+                (2, 0, "dev", true),
+                (10, 1, "a.txt", false),
+                (11, 1, "b.txt", false),
+                (12, 2, "c.bin", false),
+            ]),
+            &ntfs_drive('C'),
+        );
+        store.populate_from_scan(
+            scan_result(&[
+                (1, 0, "Games", true),
+                (10, 1, "d.exe", false),
+            ]),
+            &ntfs_drive('D'),
+        );
+        store.finalize();
+
+        let names = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta.txt", "iota.pdf"];
+        for _ in 0..150 {
+            let mut batch = Vec::new();
+            let n_ops = 1 + (next() % 5) as usize;
+            for _ in 0..n_ops {
+                let drive = if next() % 2 == 0 { 'C' } else { 'D' };
+                let rec = 1 + (next() % 20) as u64;
+                let name = names[(next() as usize) % names.len()].to_string();
+                match next() % 4 {
+                    0 => batch.push(IndexEvent::Created {
+                        drive_letter: drive,
+                        record: FileRecord {
+                            file_ref: rec,
+                            parent_ref: 1 + (next() % 2) as u64,
+                            name,
+                            kind: if next() % 3 == 0 {
+                                FileKind::Directory
+                            } else {
+                                FileKind::File
+                            },
+                        },
+                    }),
+                    1 => batch.push(IndexEvent::Deleted {
+                        drive_letter: drive,
+                        file_ref: rec,
+                    }),
+                    2 => batch.push(IndexEvent::Renamed {
+                        drive_letter: drive,
+                        old_ref: rec,
+                        new_record: FileRecord {
+                            file_ref: rec,
+                            parent_ref: 1 + (next() % 2) as u64,
+                            name,
+                            kind: FileKind::File,
+                        },
+                    }),
+                    _ => batch.push(IndexEvent::Moved {
+                        drive_letter: drive,
+                        file_ref: rec,
+                        new_parent_ref: 1 + (next() % 2) as u64,
+                        name,
+                        kind: FileKind::File,
+                    }),
+                }
+            }
+            store.apply_events(batch);
+
+            // Invariants after every batch:
+            // 1. entries stay name-sorted by the lowercased key.
+            for w in store.entries.windows(2) {
+                assert!(store.name_lower(&w[0]) <= store.name_lower(&w[1]), "unsorted");
+            }
+            // 2. no duplicate (drive, file_ref).
+            let mut seen = std::collections::HashSet::new();
+            for e in &store.entries {
+                assert!(seen.insert((e.drive, e.file_ref)), "duplicate ref");
+            }
+            // 3. every bucket entry resolves into its own record.
+            for (d, bucket) in store.ref_lookup.iter().enumerate() {
+                for &(r, idx) in bucket {
+                    assert!((idx as usize) < store.entries.len(), "dangling idx");
+                    let e = &store.entries[idx as usize];
+                    assert_eq!(e.drive, d as u8);
+                    assert_eq!(e.file_ref, r);
+                }
+            }
+            // 4. every record is reachable through its drive's bucket.
+            for (i, e) in store.entries.iter().enumerate() {
+                assert_eq!(store.lookup_idx(e.drive, e.file_ref), Some(i as u32));
+            }
+            // 5. stamped metadata stays in range.
+            for e in &store.entries {
+                assert!(e.depth >= 1 && e.depth <= 15);
+                assert!(e.user_path <= 1);
+            }
+        }
     }
 
     #[test]
