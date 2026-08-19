@@ -535,7 +535,12 @@ fn search_apps(query: String, state: tauri::State<AppState>) -> Vec<UiResult> {
 /// blank the launcher.
 fn apps_refresh_loop(apps: Arc<RwLock<Vec<AppEntry>>>, rev: Arc<AtomicU64>) {
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        // D2/B3: 60 s was needlessly chatty for a forever loop (registry +
+        // folder enumeration every minute). 10 min still catches new
+        // installs on a timescale that matters and drops the overhead 10x.
+        // A future event-driven pass (SHChangeNotifyRegister over the Start
+        // Menu / AppsFolder roots) would remove the poll entirely.
+        std::thread::sleep(std::time::Duration::from_secs(600));
         let fresh = discover_apps();
         if fresh.is_empty() {
             continue;
@@ -724,8 +729,20 @@ fn launch_with_verb(path: &str, verb: &str) -> Result<(), String> {
     // Explorer. (Explicit "runas"/"properties"/"run" verbs still go straight
     // to ShellExecuteW, which is their purpose.)
     if verb == "open" {
+        // S3: a real FILE row is never executed through the shell — it opens
+        // "selected" in Explorer so a planted filename can be inspected, not
+        // run. Directory rows navigate into the folder (Explorer's normal
+        // open). Namespace/UNC/nonexistent paths generally fail the local
+        // probe and keep the legacy plain-open behavior, which at MEDIUM
+        // integrity (S5) can no longer hand out admin rights anyway.
+        let path_buf = std::path::Path::new(path);
+        let arg: std::ffi::OsString = match std::fs::metadata(path_buf) {
+            Ok(m) if m.is_dir() => path_buf.as_os_str().to_os_string(),
+            Ok(_) => format!("/select,{}", path).into(),
+            Err(_) => path_buf.as_os_str().to_os_string(),
+        };
         std::process::Command::new("explorer")
-            .arg(path)
+            .arg(&arg)
             .spawn()
             .map(|_| ())
             .map_err(|e| format!("failed to launch: {}", e))?;
@@ -922,8 +939,26 @@ fn fix_task_power_gates() -> Result<bool, String> {
         return Ok(false);
     }
     text = ungated;
-    let xml_path = std::env::temp_dir().join("finder_task.xml");
-    std::fs::write(&xml_path, &text).map_err(|e| e.to_string())?;
+    // S6: a fixed-name temp file is a TOCTOU target (a local actor could
+    // drop their own XML ahead of schtasks reading ours). Use a unique name
+    // and create_new so the file is OURS exclusively before a single byte
+    // is written.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let xml_path =
+        std::env::temp_dir().join(format!("finder_task_{}_{}.xml", std::process::id(), stamp));
+    let mut xml_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&xml_path)
+        .map_err(|e| e.to_string())?;
+    {
+        use std::io::Write;
+        xml_file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    drop(xml_file);
     let patched = std::process::Command::new("schtasks")
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .args([
@@ -1056,7 +1091,6 @@ fn image_data(path: String) -> Result<Option<String>, String> {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "bmp" => "image/bmp",
-        "svg" => "image/svg+xml",
         "ico" => "image/x-icon",
         _ => return Ok(None),
     };

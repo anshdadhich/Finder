@@ -1068,7 +1068,8 @@ if (setBlur) {
 const glassLayerEl = document.getElementById("glassLayer");
 let glassBackdrop = null; // { uri, w, h } from grab_backdrop
 let glassRect = null;
-let glassRafId = null;
+let glassOb = null; // ResizeObserver driving the glass rect (U1)
+let glassResizeHandler = null;
 
 // The glass layer tracks the card (or the scan card while the palette is
 // hidden) so the blur stays INSIDE the search tool: same rect, same radius,
@@ -1103,18 +1104,30 @@ function syncGlassRect() {
   }
 }
 
+// U1: no standing animation-frame loop. A ResizeObserver fires only when the
+// card (or the scan card while the palette is hidden) actually changes size;
+// a window resize listener covers position-only shifts. syncGlassRect still
+// dedups identical rects, so repeated events cost nothing.
 function startGlassLoop() {
-  if (glassRafId) return;
-  const step = () => {
-    syncGlassRect();
-    glassRafId = requestAnimationFrame(step);
-  };
-  glassRafId = requestAnimationFrame(step);
+  if (glassOb || !glassLayerEl) return;
+  const scanHost = document.querySelector("#scanState");
+  const targets = [cardWinEl, scanHost, scanHost && scanHost.querySelector(".fr-card")].filter(Boolean);
+  glassOb = new ResizeObserver(() => syncGlassRect());
+  targets.forEach((t) => glassOb.observe(t));
+  glassResizeHandler = () => syncGlassRect();
+  window.addEventListener("resize", glassResizeHandler);
+  syncGlassRect();
 }
 
 function stopGlassLoop() {
-  if (glassRafId) cancelAnimationFrame(glassRafId);
-  glassRafId = null;
+  if (glassOb) {
+    glassOb.disconnect();
+    glassOb = null;
+  }
+  if (glassResizeHandler) {
+    window.removeEventListener("resize", glassResizeHandler);
+    glassResizeHandler = null;
+  }
 }
 
 function applyBackdrop(g) {
