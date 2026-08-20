@@ -1188,6 +1188,12 @@ fn image_data(path: String, nonce: String) -> Result<Option<String>, String> {
 /// re-encode as JPEG, everything else as PNG (keeps alpha for icons and
 /// screenshots).
 fn thumbnail_data_uri(path: &str, mime: &str) -> Option<String> {
+    // Byte cap BEFORE any decode: a crafted huge file must not force
+    // multi-tens-of-MB reads/scans in this elevated process — the 24 MP
+    // pixel gate below bounds the decoded bitmap, not the input.
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 32 * 1024 * 1024 {
+        return None;
+    }
     // Bounded decode: a 24 MP ceiling keeps the transient full-res decode
     // under ~100 MB in this process; beyond it the icon row is a fine
     // preview and the webview must not allocate the giant bitmap instead.
@@ -1313,8 +1319,13 @@ fn warm_icon_cache(state: &AppState) {
             if let Ok(Some(uri)) = reply_rx.recv_timeout(Duration::from_secs(3)) {
                 icon_cache_insert(&icon_cache, key.clone(), uri.clone());
                 if let Some(png) = uri_png_bytes(&uri) {
-                    let _ = std::fs::create_dir_all(icon_cache_dir());
-                    let _ = std::fs::write(icon_disk_path(&key), png);
+                    // A planted junction under the icon dir must not redirect
+                    // the elevated write elsewhere.
+                    let dir = icon_cache_dir();
+                    if path_reparse_safe(&dir) {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::fs::write(icon_disk_path(&key), png);
+                    }
                 }
                 warmed += 1;
             }
@@ -1333,12 +1344,13 @@ fn warm_icon_cache(state: &AppState) {
 /// extractor repopulates real icons (lazy, one batch per viewport — costs a
 /// second on the first open, then cached forever).
 fn purge_legacy_generic_icons() {
-    let stamp = icon_cache_dir().join(".gen3");
-    if stamp.exists() {
+    let dir = icon_cache_dir();
+    let stamp = dir.join(".gen3");
+    if stamp.exists() || !path_reparse_safe(&dir) {
         return;
     }
     let mut removed = 0usize;
-    if let Ok(entries) = std::fs::read_dir(icon_cache_dir()) {
+    if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
             if e.path().extension().map(|x| x == "png").unwrap_or(false) {
                 if std::fs::remove_file(e.path()).is_ok() {
@@ -1347,7 +1359,7 @@ fn purge_legacy_generic_icons() {
             }
         }
     }
-    let _ = std::fs::write(stamp, b"1");
+    let _ = std::fs::write(&stamp, b"1");
     log_line(&format!("icons: purged {} cached icons (one-time cache reset)", removed));
 }
 
@@ -2513,6 +2525,29 @@ fn looks_like_url(value: &str) -> bool {
         || lower.contains(".org")
 }
 
+/// Refuse paths whose existing components are reparse points (junctions /
+/// symlinks): this process is ELEVATED and must never write through a
+/// redirect that a same-user medium-integrity process can plant under
+/// `%LOCALAPPDATA%\Finder`. Each ancestor is probed independently with
+/// FILE_FLAG_OPEN_REPARSE_POINT semantics (symlink_metadata), so a junction
+/// at ANY level trips the check.
+fn path_reparse_safe(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(md) = std::fs::symlink_metadata(&cur) {
+            if md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+                return false;
+            }
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+    true
+}
+
 /// Append a lifecycle line to %LOCALAPPDATA%\Finder\log.txt — the tray
 /// app has no console, so this file is the only place panic/exit evidence
 /// survives.
@@ -2520,13 +2555,18 @@ fn log_line(msg: &str) {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    if let Some(dir) = base.parent() {
+    let path = base.join("Finder").join("log.txt");
+    // Never append through a planted junction (see path_reparse_safe).
+    if !path_reparse_safe(&path) {
+        return;
+    }
+    if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(base.join("Finder").join("log.txt"))
+        .open(&path)
         .and_then(|mut f| {
             use std::io::Write;
             writeln!(
@@ -2570,18 +2610,6 @@ fn best_effort_crash_log(reason: &str) {
 }
 
 fn main() {
-    // WebView2's GPU process retains ~250-300 MB of D3D texture cache even
-    // while idle (transparent layered window) and grows with every previewed
-    // image without releasing it — that retention is the preview/RAM spike.
-    // Render software-only (SwiftShader): the glass, transparency and previews
-    // look identical (checked on build 26200) and the GPU process drops out
-    // of the tree. NOTE: wry always calls SetAdditionalBrowserArguments
-    // itself, which OVERRIDES this env var — the flag actually rides in
-    // WindowBuilder::additional_browser_args below. This set_var is kept only
-    // as a fallback should a future wry stop overriding the env var.
-    if std::env::var_os("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").is_none() {
-        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--disable-gpu");
-    }
     // Everything hits the log file, panics included — the window has no
     // console and silent exits are impossible to debug otherwise.
     std::panic::set_hook(Box::new(|info| {
@@ -2757,9 +2785,10 @@ fn main() {
             // WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS env var — the flag must
             // ride in this single supported slot. `--disable-gpu` drops
             // WebView2's GPU process (~250-300 MB of retained D3D textures
-            // that never shrink) in favor of software compositing; keep wry's
-            // default feature disables (msWebOOUI etc.) since overriding the
-            // args replaces them.
+            // that never shrink) in favor of software compositing. wry's
+            // default also disabled msSmartScreenProtection — overriding the
+            // args replaces that default, so SmartScreen is deliberately
+            // KEPT here (only the msWebOOUI/msPdfOOUI UI extras stay off).
             let window = tauri::WindowBuilder::new(
                 &app.handle(),
                 "main",
@@ -2774,9 +2803,7 @@ fn main() {
             .always_on_top(true)
             .skip_taskbar(true)
             .visible(false)
-            .additional_browser_args(
-                "--disable-gpu --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection",
-            )
+            .additional_browser_args("--disable-gpu --disable-features=msWebOOUI,msPdfOOUI")
             .build()
             .expect("main window");
             *setup_close_window.lock() = Some(window.clone());
@@ -4326,12 +4353,15 @@ fn start_backend(
         // or corrupt, the rescan still happens but through the status bar.
         let first_run = {
             let marker = first_run_marker();
-            let fresh = !marker.exists();
+            let mut fresh = !marker.exists();
             if fresh {
-                if let Some(dir) = marker.parent() {
+                // Never create the marker through a planted junction.
+                if !path_reparse_safe(&marker) {
+                    fresh = false;
+                } else if let Some(dir) = marker.parent() {
                     let _ = std::fs::create_dir_all(dir);
+                    let _ = std::fs::write(&marker, b"1");
                 }
-                let _ = std::fs::write(&marker, b"1");
             }
             fresh
         };
@@ -4900,7 +4930,9 @@ fn rebuild_index_impl(state: &AppState) {
     let progress = Arc::clone(&state.progress);
     thread::spawn(move || {
         let cache_path = index_cache_path();
-        let _ = std::fs::remove_file(&cache_path);
+        if path_reparse_safe(&cache_path) {
+            let _ = std::fs::remove_file(&cache_path);
+        }
         let drives = get_ntfs_drives();
         if drives.is_empty() {
             *status.write() = String::from("No NTFS drives found. Run as Administrator.");
@@ -4995,9 +5027,163 @@ fn app_info(name: String, path: String) -> AppInfo {
     }
 }
 
+/// Spawn `exe` with a MEDIUM-integrity primary token duplicated from the
+/// interactive shell (explorer.exe). Registry uninstallers must never run
+/// with Finder's admin token: a planted HKCU UninstallString would otherwise
+/// be one click from full admin code execution. Fails hard (no elevated
+/// fallback) when no usable explorer token exists.
+#[allow(clippy::too_many_lines)]
+fn spawn_unelevated(exe: &str, args: &str) -> Result<u32, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        CreateWellKnownSid, DuplicateTokenEx, SecurityImpersonation, SetTokenInformation,
+        TokenIntegrityLevel, TokenPrimary, WinMediumLabelSid, TOKEN_ACCESS_MASK,
+        TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL,
+        TOKEN_QUERY, PSID, SID_AND_ATTRIBUTES,
+    };
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::Threading::{
+        CreateProcessWithTokenW, OpenProcess, OpenProcessToken, PROCESS_CREATION_FLAGS,
+        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    };
+
+    // 1) Find explorer.exe — the interactive shell runs medium-integrity
+    //    even from an elevated caller's session.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|_| "cannot snapshot processes")?;
+    let mut explorer_pid = None;
+    let mut entry = PROCESSENTRY32W::default();
+    let mut has = unsafe { Process32FirstW(snapshot, &mut entry).is_ok() };
+    while has {
+        let name = String::from_utf16_lossy(&entry.szExeFile)
+            .trim_end_matches('\0')
+            .to_lowercase();
+        if name == "explorer.exe" {
+            explorer_pid = Some(entry.th32ProcessID);
+            break;
+        }
+        has = unsafe { Process32NextW(snapshot, &mut entry).is_ok() };
+    }
+    unsafe {
+        let _ = CloseHandle(snapshot);
+    }
+    let pid = explorer_pid
+        .ok_or_else(|| "no explorer.exe process (interactive shell unavailable)".to_string())?;
+
+    // 2) Duplicate explorer's token as a primary token we can spawn with.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        .map_err(|_| "cannot open explorer process".to_string())?;
+    let mut explorer_token = HANDLE(std::ptr::null_mut());
+    unsafe {
+        OpenProcessToken(
+            process,
+            TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+            &mut explorer_token,
+        )
+        .map_err(|_| "cannot open explorer token".to_string())?;
+        let _ = CloseHandle(process);
+    }
+    let mut medium = HANDLE(std::ptr::null_mut());
+    unsafe {
+        // 0x0200_0000 = MAXIMUM_ALLOWED (0.60 exposes no
+        // SECURITY_MAXIMUM_ALLOWED const for TOKEN_ACCESS_MASK).
+        DuplicateTokenEx(
+            explorer_token,
+            TOKEN_ACCESS_MASK(0x0200_0000),
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut medium,
+        )
+        .map_err(|_| "cannot duplicate explorer token".to_string())?;
+        let _ = CloseHandle(explorer_token);
+    }
+
+    // 3) Pin the integrity label to Medium (covers the rare case where the
+    //    shell itself runs elevated); refusing to pin means refusing to run.
+    let mut sid_len = 0u32;
+    unsafe {
+        let _ = CreateWellKnownSid(WinMediumLabelSid, None, None, &mut sid_len);
+    }
+    let mut sid_bytes = vec![0u8; sid_len.max(1) as usize];
+    unsafe {
+        CreateWellKnownSid(
+            WinMediumLabelSid,
+            None,
+            Some(PSID(sid_bytes.as_mut_ptr() as *mut core::ffi::c_void)),
+            &mut sid_len,
+        )
+        .map_err(|_| "cannot build medium-integrity SID".to_string())?;
+        let label = TOKEN_MANDATORY_LABEL {
+            Label: SID_AND_ATTRIBUTES {
+                Sid: PSID(sid_bytes.as_mut_ptr() as *mut core::ffi::c_void),
+                Attributes: 0x20, // SE_GROUP_INTEGRITY
+            },
+        };
+        SetTokenInformation(
+            medium,
+            TokenIntegrityLevel,
+            (&label as *const TOKEN_MANDATORY_LABEL).cast(),
+            std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32,
+        )
+        .map_err(|_| "cannot pin medium integrity".to_string())?;
+    }
+
+    // 4) Spawn the child with that token (no console flash, no elevated
+    //    fallback). The command line mirrors the old std::process::Command
+    //    shape: quoted exe + raw args forwarded untouched.
+    let app: Vec<u16> = std::ffi::OsStr::new(exe).encode_wide().chain(Some(0)).collect();
+    let cmdline = if args.is_empty() {
+        format!("\"{}\"", exe)
+    } else {
+        format!("\"{}\" {}", exe, args)
+    };
+    let mut cmd: Vec<u16> = std::ffi::OsStr::new(&cmdline).encode_wide().chain(Some(0)).collect();
+    let si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+    // CreateProcessWithTokenW does NOT inherit the caller's env — hand the
+    // child an explicit UTF-16 block built from our own environment.
+    let env_block: Vec<u16> = std::env::vars()
+        .flat_map(|(k, v)| {
+            let mut s = format!("{k}={v}").encode_utf16().collect::<Vec<u16>>();
+            s.push(0);
+            s
+        })
+        .chain(std::iter::once(0))
+        .collect();
+    use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT};
+    unsafe {
+        CreateProcessWithTokenW(
+            medium,
+            windows::Win32::System::Threading::CREATE_PROCESS_LOGON_FLAGS::default(),
+            windows::core::PCWSTR(app.as_ptr()),
+            Some(windows::core::PWSTR(cmd.as_mut_ptr())),
+            PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW.0 | CREATE_UNICODE_ENVIRONMENT.0),
+            Some(env_block.as_ptr() as *const core::ffi::c_void),
+            windows::core::PCWSTR::null(),
+            &si,
+            &mut pi,
+        )
+        .map_err(|_| "cannot create unelevated process".to_string())?;
+        let _ = CloseHandle(medium);
+        let _ = CloseHandle(pi.hProcess);
+        let _ = CloseHandle(pi.hThread);
+    }
+    Ok(pi.dwProcessId)
+}
+
 /// Run the app's uninstaller (registry UninstallString), falling back to the
 /// Apps & features settings page when no registry entry exists. UWP apps have
 /// no uninstaller string — open their settings page instead.
+/// The uninstaller always runs UNELEVATED (spawn_unelevated), so even a
+/// planted HKCU entry cannot reach admin from the elevated Finder.
 #[tauri::command]
 fn uninstall_app(name: String, path: String, nonce: String) -> Result<(), String> {
     check_nonce(&nonce)?;
@@ -5016,13 +5202,9 @@ fn uninstall_app(name: String, path: String, nonce: String) -> Result<(), String
                 if !uninstall_exe_allowed(&exe) {
                     return Err(format!("unsafe uninstall command: {}", exe));
                 }
-                let mut c = std::process::Command::new(&exe);
-                c.creation_flags(0x0800_0000); // no console flash
-                if !args.is_empty() {
-                    use std::os::windows::process::CommandExt;
-                    c.raw_arg(&args);
-                }
-                c.spawn().map_err(|e| e.to_string())?;
+                // Medium-integrity spawn (never Finder's elevated token).
+                spawn_unelevated(&exe, &args)
+                    .map_err(|e| format!("could not start uninstaller unelevated: {}", e))?;
             }
             return Ok(());
         }
@@ -5117,6 +5299,8 @@ fn find_uninstall_entry(app_name: &str) -> Option<UninstallEntry> {
     // HKLM first: admin-written entries are trusted. HKCU entries are
     // user-writable (any process can plant a fake one), so they only win
     // when no system entry exists — per-user apps keep their uninstall.
+    // The RCE chain is closed in `uninstall_app`: whatever entry wins, the
+    // uninstaller runs with a MEDIUM token, not Finder's elevated one.
     const SUB: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
     let bases = [
         (HKEY_LOCAL_MACHINE, SUB.to_string()),
@@ -5202,6 +5386,13 @@ fn write_atomic_with(
     path: &Path,
     write: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    // Elevated write: refuse to serialize through a user-planted junction.
+    if !path_reparse_safe(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to write through a reparse point",
+        ));
+    }
     let _guard = SAVE_LOCK.lock();
     let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
