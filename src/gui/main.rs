@@ -706,11 +706,33 @@ fn get_nonce() -> String {
     privilege_nonce().to_string()
 }
 
-/// Diagnostic: log a line from the webview (probe instrumentation for the
-/// withGlobalTauri:false re-attempt; harmless in normal operation).
+/// Renderer-accessible diagnostics channel (page-error traps at boot). Not a
+/// trust boundary: length-capped, line-structure-clean (CR/LF/NUL stripped so
+/// a forged message can't inject fake log lines or break the one-line-per-
+/// entry format), and throttled so a runaway error loop can't churn the disk.
+/// The log file itself is size-capped in log_line (F6 hardening).
+static LAST_JS_LOG: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
+
 #[tauri::command]
 fn js_log(msg: String) {
-    log_line(&format!("[js] {}", msg));
+    // Throttle: at most ~20 lines/sec through this channel.
+    let mut last = LAST_JS_LOG.lock();
+    if let Some(t) = *last {
+        if t.elapsed() < std::time::Duration::from_millis(50) {
+            return;
+        }
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+
+    // Length cap (take() stops at a char boundary), then strip anything that
+    // could break the line format or forge evidence.
+    let sanitized: String = msg
+        .chars()
+        .take(JS_LOG_MAX_CHARS)
+        .map(|c| if c == '\r' || c == '\n' || c == '\0' { ' ' } else { c })
+        .collect();
+    log_line(&format!("[js] {}", sanitized));
 }
 
 #[tauri::command]
@@ -2563,6 +2585,13 @@ fn path_reparse_safe(path: &Path) -> bool {
     true
 }
 
+/// Hard ceiling for log.txt before it rotates to log.old — bounds disk
+/// growth even if a compromised/buggy renderer hammers the js_log channel.
+const LOG_FILE_MAX_BYTES: u64 = 1024 * 1024;
+/// Per-message cap for the renderer's js_log channel. The page-error traps
+/// that feed it produce short messages; anything longer is hostile or broken.
+const JS_LOG_MAX_CHARS: usize = 1024;
+
 /// Append a lifecycle line to %LOCALAPPDATA%\Finder\log.txt — the tray
 /// app has no console, so this file is the only place panic/exit evidence
 /// survives.
@@ -2577,6 +2606,15 @@ fn log_line(msg: &str) {
     }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
+    }
+    // Bound the log file: once it passes the cap, rotate it to log.old
+    // (atomically replacing the previous one) so a runaway writer can never
+    // grow the file unbounded. Startup/scan lines are far below 1 MB — the
+    // cap exists for the renderer-accessible js_log channel (F6).
+    if let Ok(md) = std::fs::metadata(&path) {
+        if md.len() > LOG_FILE_MAX_BYTES {
+            let _ = replace_file(&path, &path.with_extension("old"));
+        }
     }
     let _ = std::fs::OpenOptions::new()
         .create(true)
