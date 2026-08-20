@@ -2,7 +2,7 @@
 
 A comprehensive record of how Finder works under the hood — every subsystem with its real
 data structures, algorithms, memory profile, and security posture. Written from the code
-(source at `src/`, UI at `tauri-ui/`), shipping state as of commit `ca100d5`.
+(source at `src/`, UI at `tauri-ui/`), shipping state as of commit `79d8633`.
 
 ---
 
@@ -11,7 +11,8 @@ data structures, algorithms, memory profile, and security posture. Written from 
 Finder is a Windows-native launcher in the style of Spotlight/Raycast.
 
 - **Backend**: Rust + Tauri v1 (WebView2 for the UI), `windows` 0.60 crate for Win32, raw
-  NTFS MFT scanning for whole-drive indexing (~3M records in ~28 s), Win32 global hotkey
+  NTFS MFT scanning for whole-drive indexing (~3M records in ~30-45 s,
+  machine-dependent), Win32 global hotkey
   (`RegisterHotKey`), frameless transparent always-on-top window.
 - **Frontend**: vanilla JS/CSS/HTML in `tauri-ui/`, no framework, Tauri global API
   (`withGlobalTauri`).
@@ -22,7 +23,7 @@ Finder is a Windows-native launcher in the style of Spotlight/Raycast.
 
 | File | Lines | Role |
 |---|---|---|
-| `src/gui/main.rs` | 3448 | window, hotkey loop, tray, all `#[tauri::command]`s, backdrop pipeline, app icon cache |
+| `src/gui/main.rs` | 5229 | window, hotkey loop, tray, all `#[tauri::command]`s, backdrop pipeline, app icon cache |
 | `src/index/store.rs` | 897 | in-memory index: arenas, chunks, cache format v2, live event application |
 | `src/index/search.rs` | 785 | scoring, paging, extension search, fuzzy fallback, app pool |
 | `src/index/apps.rs` | 356 | WinRT installed-app enumeration + Start Menu .lnk scanning |
@@ -31,9 +32,9 @@ Finder is a Windows-native launcher in the style of Spotlight/Raycast.
 | `src/mft/types.rs` | 87 | `FileRecord`, `IndexEvent`, `JournalCheckpoint` |
 | `src/utils/drives.rs` | 61 | drive enumeration |
 | `src/main.rs` | 592 | binary bootstrap, self-relocation to `%LOCALAPPDATA%`, single-instance |
-| `tauri-ui/main.js` | 72.5 KB | all UI logic |
-| `tauri-ui/index.html` | 12.4 KB | markup |
-| `tauri-ui/styles.css` | 29.7 KB | theming (CSS vars), layout, states |
+| `tauri-ui/main.js` | 2534 (94.4 KB) | all UI logic |
+| `tauri-ui/index.html` | 239 (12.9 KB) | markup |
+| `tauri-ui/styles.css` | 1338 (33.4 KB) | theming (CSS vars), layout, states |
 
 ---
 
@@ -81,9 +82,13 @@ hide_spotlight():
 ```
 
 **Reset-on-hide** (JS `spotlight-hide` listener): clears query/selection/footer, bumps the
-`searchSeq` counter (cancels in-flight search pages), resets `#results` scrollTop before and
-after repaint, closes the Settings panel. The backdrop image is deliberately **kept** —
-that's what lets a reused Rust-side grab skip its emit entirely.
+`searchSeq` counter (cancels in-flight search pages), resets `#results` scrollTop, closes the
+Settings panel — **and drops all heavy UI state** (`main.js:1398`): the results DOM
+(rows/items; an empty-query browse can be ~500 rows with ~500 decoded icons), the preview
+bitmap, and the blurred glass texture. The next show rebuilds everything from scratch —
+`refreshBackdrop()` re-pulls the Rust-side cached grab via `grab_backdrop`, so the desktop
+is **not** re-captured (TTL/dHash gates still apply), only the cached JPEG string crosses
+IPC again.
 
 ---
 
@@ -91,10 +96,12 @@ that's what lets a reused Rust-side grab skip its emit entirely.
 
 ### 3.1 Native window
 
-`tauri.conf.json`: 1050×690 logical, fixed size, `decorations:false`, `transparent:true`,
-`alwaysOnTop:true`, `skipTaskbar:true`, initially hidden. The webview body has transparent
-margins (`padding: 85px 70px`) — room for the card shadow, and clicks in the margin hit the
-click-outside-to-hide handler.
+Built in `setup` via `tauri::WindowBuilder` (`main.rs:2763`): 1050×690 logical, fixed size,
+`decorations:false`, `transparent:true`, `alwaysOnTop:true`, `skipTaskbar:true`, initially
+hidden — identical to the former `tauri.conf.json` window (the config array was removed so
+the WebView2 environment can carry explicit browser args, §8.1 #3). The webview body has
+transparent margins (`padding: 85px 70px`) — room for the card shadow, and clicks in the
+margin hit the click-outside-to-hide handler.
 
 - **Corner radius**: the native sheet is never rounded; the visible rounding is the card's
   CSS `border-radius: var(--radius-window)` (Settings slider, 0–32px) mirrored in the glass
@@ -354,7 +361,12 @@ always live and correct after renames.
 2. **App-pool icons: 5–60 MB** — every `AppEntry` embeds a 256 px base64 PNG URI at
    startup (`gui/main.rs:941`), then `icon_cache` clones them all again (`gui/main.rs:1541`)
    and never evicts — every distinct path iconed later lives forever too.
-3. WebView2/Chromium (renderer+compositor+GPU) — a few tens of MB.
+3. WebView2/Chromium (renderer+compositor+GPU) — now ~360-530 MB for the whole tree, down
+   from ~700-800+ before the GPU fix (lever #10 in §8.3): the **GPU process is disabled**
+   (`--disable-gpu` via `WindowBuilder::additional_browser_args`, `main.rs:2777`) and runs
+   in WARP software mode — 67-91 MB instead of ~230 MB of D3D hardware textures that grew
+   with every previewed image and **never shrank** (that retention was the preview-scroll
+   RAM spike). The renderer holds ~264 MB of decoded preview bitmaps (the app's own cost).
 4. Backdrop: one ~100–250 KB string (trivial).
 
 ### 8.2 Verified-steady paths (no leak)
@@ -362,6 +374,16 @@ always live and correct after renames.
 Hotkey mashing is flat now: backdrop gated by TTL + dHash + downscale + q55; listeners,
 loops, timers all single-registration; preview-image cache capped at 12; icon cache bounded
 by app count; pools cached in Rust (`OnceLock`) and JS.
+
+- **Hide drops the heavy UI state** (`main.js:1398`): results DOM/rows/items, the preview
+  bitmap and the glass texture are released on hide; the next show rebuilds them (backdrop
+  refetched from the Rust-side cached grab — no desktop re-capture, §2.2).
+- **JPEG previews decode at scaled IDCT resolution** (`main.rs:1198, 1231`): a 12 MP photo
+  decodes at the smallest 1/8-1/4-1/2-1/1 scale covering the 512 px box (~10-30 ms) instead
+  of a full-resolution decode + downscale; the previous image stays on screen during the
+  swap (no "Loading" flash).
+- **GPU process steady under load** since the fix: after a 100-preview scroll the WARP
+  process *sheds* memory (126 → 67 MB) instead of climbing and retaining.
 
 ### 8.3 Optimization levers (no behavior loss)
 
@@ -376,6 +398,7 @@ by app count; pools cached in Rust (`OnceLock`) and JS.
 | 7 | `search_apps`: lowercase the path once per `AppEntry` (or lowercase the `freq` key at insert) | ~40 KB of String allocs per keystroke | Trivial: `gui/main.rs:230, 313` | ⏳ deferred (trivial absolute cost) |
 | 8 | Load-path: decompress into the deserialize input (`bincode::deserialize_from` over a reader) | ~230 MB off the one-shot load peak | Low: `gui/main.rs:2971` | ✅ **Done** (came free with #1's frame decoder) |
 | 9 | Drop `name_lower_arena` (lowercase on the fly) or mmap the arenas | ~60–130 MB steady, or near-zero resident pages under pressure | High: format v3 + reindex / remap discipline — do after 1–5 | ⏳ deferred |
+| 10 | **Disable WebView2's GPU process** (`--disable-gpu` + wry's default feature disables, via `WindowBuilder::additional_browser_args`, `main.rs:2777`) | ~230 MB GPU + the post-scroll D3D-retention spike; window created in `setup` (config array removed from `tauri.conf.json`) | Trivial — but the env var is a **dead channel**: wry always calls `SetAdditionalBrowserArguments` itself, which overrides `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` (shell-set, in-process, and fresh-profile attempts all failed; see `main.rs:2571` comment) | ✅ **Done** — verified: GPU 67-91 MB WARP software mode, webview tree 360-530 MB vs ~700-800+, zero registry/environment needed on any machine |
 
 ### 8.4 Speed notes (measured behavior, no work needed)
 
@@ -435,7 +458,9 @@ never be treated as a trust boundary. The surface is small (no remote navigation
 - The exe cannot be overwritten while running (it's elevated) — quit from the tray before
   rebuilding.
 - Logs: `%LOCALAPPDATA%\Finder\log.txt`.
-- Cache/scan timeline example (one machine): 2,885,165 records, read+parse 26.26 s, index
-  1.41 s, finalize 0.12 s, save 0.33 s — index ready in 28.13 s.
+- Cache/scan timeline examples: 2,885,165 records → read+parse 26.26 s, index 1.41 s,
+  finalize 0.12 s, save 0.33 s — ready in 28.13 s. 3,074,620 records → read+parse 42.69 s,
+  index 0.48 s, finalize 0.03 s, save 0.81 s — ready in 44.02 s (I/O-bound; machine- and
+  load-dependent).
 - Rebuild loop: quit from tray → `cargo build --release --bin finder-gui` → relaunch
   via `Start-Process … -Verb RunAs`.
