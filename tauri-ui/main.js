@@ -296,6 +296,18 @@ function settingsIconFor(path) {
   if (!low.startsWith("ms-settings:")) return null;
   return SETTINGS_ICON_BY_PATH[low] || SETTINGS_ICON;
 }
+// Instant shared glyphs for real file/folder rows: the Windows shell icon
+// (folder type, PDF, exe brand, …) still arrives a beat later from the icon
+// pool and replaces these — they exist to end the letter-chip wait. They are
+// deliberately NOT stored in iconCache: that map also gates the icon observer
+// (has → real icon never requested), so caching a placeholder would freeze
+// every file row on the generic glyph forever.
+const GENERIC_FOLDER_ICON = svgIcon(
+  '<path d="M3 7a1 1 0 0 1 1-1h4l2 2h10a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/>'
+);
+const GENERIC_FILE_ICON = svgIcon(
+  '<path d="M6 3h8l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v4h4"/>'
+);
 // Web-search rows (a leading "@") get a dedicated globe mark tinted with the
 // app's accent color. This is NOT optional decoration: the row's "path" is a
 // search term or domain, and without an icon here the viewport icon fetch
@@ -1101,6 +1113,17 @@ function renderNow() {
         iconCache.set(iconKey, uri);
       } else if (!uri && item.kind === "app") {
         uri = settingsIconFor(item.path);
+      } else if (
+        !uri &&
+        item.kind !== "app" &&
+        item.kind !== "more" &&
+        item.kind !== "math"
+      ) {
+        // Real file/folder row: paint an instant shared glyph (folder or
+        // document sheet) instead of a letter chip; the per-type shell icon
+        // still extracts in the background and replaces it. Not cached — see
+        // the GENERIC_* constants' comment.
+        uri = item.is_dir ? GENERIC_FOLDER_ICON : GENERIC_FILE_ICON;
       }
       if (el._iconKey !== iconKey) {
         el._iconKey = iconKey;
