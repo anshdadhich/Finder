@@ -1395,7 +1395,18 @@ listen("spotlight-hide", async () => {
   searchSeq += 1; // cancel any in-flight search page
   fileTotal = 0;
   resultsEl.scrollTop = 0;
-  await runSearchSafe();
+  // Hidden-state cleanup (RAM): the empty-query browse can be a 500-row
+  // list with ~500 decoded icons — re-running the search on hide kept every
+  // one of those rows alive invisibly, plus the decoded preview bitmap and
+  // the blurred glass texture. Drop all three now instead. The next show
+  // rebuilds everything from scratch: window focus → input focus →
+  // runSearchSafe() (items is empty), refreshBackdrop() re-grabs the
+  // desktop, and re-previewing re-fetches from the capped thumb cache.
+  items = [];
+  rowEls = [];
+  resultsEl.replaceChildren();
+  if (pvImgEl) pvImgEl.removeAttribute("src");
+  clearBackdrop();
   resultsEl.scrollTop = 0;
 });
 
