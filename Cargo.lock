@@ -823,6 +823,7 @@ dependencies = [
  "ctrlc",
  "fuzzy-matcher",
  "image 0.24.9",
+ "jpeg-decoder",
  "lz4_flex",
  "memmap2",
  "once_cell",
@@ -1813,6 +1814,9 @@ name = "jpeg-decoder"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
+dependencies = [
+ "rayon",
+]
 
 [[package]]
 name = "js-sys"

@@ -1841,12 +1841,22 @@ function renderPreview() {
       pvImgEl.src = cached;
       pvImgEl.alt = item.name || "";
     } else {
-      pvImgEl.removeAttribute("src");
-      pvImgEl.alt = "Loading…";
+      // Cold preview: keep the previous picture on screen while the new
+      // thumbnail loads (scaled JPEG decode ≈ 15-40 ms now) — blanking the
+      // pane first turned that into a visible "Loading…" flash per row.
       const selPath = item.path;
       privileged("image_data", { path: item.path })
         .then((uri) => {
-          if (!uri || !currentSelection || currentSelection.item.path !== selPath) return;
+          if (!currentSelection || currentSelection.item.path !== selPath) return;
+          if (!uri) {
+            // Undecodable/oversized: fall back to the row's icon like
+            // non-image files instead of leaving a dead pane.
+            pvImgEl.hidden = true;
+            pvImgEl.removeAttribute("src");
+            iconEl.style.display = "";
+            return;
+          }
+          if (!uri.startsWith("data:")) return;
           pvImgCache.set(selPath, uri);
           // Bounded cache: a handful of recent previews is plenty; evicting
           // the oldest keeps the map from growing without limit over a long
