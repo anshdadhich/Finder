@@ -296,6 +296,22 @@ function settingsIconFor(path) {
   if (!low.startsWith("ms-settings:")) return null;
   return SETTINGS_ICON_BY_PATH[low] || SETTINGS_ICON;
 }
+// Web-search rows (a leading "@") get a dedicated globe mark tinted with the
+// app's accent color. This is NOT optional decoration: the row's "path" is a
+// search term or domain, and without an icon here the viewport icon fetch
+// extracts a FILE icon for it — the generic white sheet with the blue
+// rectangle — and swaps it in over the globe chip. Seeding it into the icon
+// cache also keeps that fetch from ever running for web rows. Built per
+// render so it follows a runtime accent change (Windows accent / theme).
+function webSearchIconUri() {
+  const hex =
+    getComputedStyle(document.documentElement).getPropertyValue("--accent-blue").trim() ||
+    ACCENT_DEFAULTS.hex;
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="${hex}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">` +
+    `<circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="9" ry="3.6"/><ellipse cx="12" cy="12" rx="3.6" ry="9"/></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
 let rowEls = [];
 const rowPool = new Map();
 
@@ -704,6 +720,20 @@ function groupItems() {
 const iconQueue = new Set();
 let iconTimer = null;
 const ICON_BATCH = 12;
+// Requeue a path whose icon answer didn't arrive in a batch (slow extraction
+// or a cold start), capped so a genuinely broken path stops being retried
+// after two misses. Without this a single transient timeout would leave the
+// row on its letter chip for the whole render.
+const iconRetries = new Map();
+function retryIconPath(path) {
+  const key = path.toLowerCase();
+  if (key.startsWith("ms-settings:")) return;
+  const tries = (iconRetries.get(key) || 0) + 1;
+  if (tries <= 2 && !iconCache.has(key)) {
+    iconRetries.set(key, tries);
+    iconQueue.add(path);
+  }
+}
 
 const iconObserver = new IntersectionObserver(
   (entries) => {
@@ -748,7 +778,14 @@ function scheduleIconDrain() {
           }
         }
       }
-    } catch {}
+      // Paths missing from the answer get retried (bounded) instead of being
+      // left on their letter chip.
+      for (const path of batch) {
+        if (!map || !(path in map)) retryIconPath(path);
+      }
+    } catch {
+      for (const path of batch) retryIconPath(path);
+    }
     if (iconQueue.size) scheduleIconDrain();
   }, 30);
 }
@@ -1056,7 +1093,15 @@ function renderNow() {
       }
       const iconKey = item.path.toLowerCase();
       let uri = iconCache.get(iconKey);
-      if (!uri && item.kind === "app") uri = settingsIconFor(item.path);
+      if (item.kind === "web") {
+        // Search term/domain — there is no file to extract. Show the accent-
+        // colored globe mark and seed the cache so the viewport observer
+        // skips it (no bogus file-icon request, no generic-icon swap-in).
+        uri = webSearchIconUri();
+        iconCache.set(iconKey, uri);
+      } else if (!uri && item.kind === "app") {
+        uri = settingsIconFor(item.path);
+      }
       if (el._iconKey !== iconKey) {
         el._iconKey = iconKey;
         if (uri) {
@@ -1408,6 +1453,11 @@ listen("spotlight-hide", async () => {
   if (pvImgEl) pvImgEl.removeAttribute("src");
   clearBackdrop();
   resultsEl.scrollTop = 0;
+  // Reset the card height so the next summon opens directly at the height of
+  // the initial apps list — without gliding up from the previous search's
+  // (possibly much smaller) height on every reopen.
+  cardWinEl.style.height = "auto";
+  cardHeightShown = null;
 });
 
 // Theme: dark / light / system (system follows the OS live).
@@ -2059,6 +2109,14 @@ function showActionError(what, error) {
 }
 
 input.addEventListener("input", () => {
+  // Typing while Settings is open closes the panel so the query's results
+  // take over the results column immediately (same close path as the gear).
+  if (document.body.classList.contains("settings-open")) {
+    document.body.classList.remove("settings-open");
+    if (settingsBtn) settingsBtn.setAttribute("aria-pressed", "false");
+    renderPreview();
+    syncCardHeight();
+  }
   paintFromPools(input.value); // instant, zero IPC
   scheduleSearch(); // authoritative backfill
   syncScanNotice(); // hide the first-run notice once the user types

@@ -77,9 +77,14 @@ struct AppState {
     /// so the UI knows to re-fetch without polling the full list down.
     app_rev: Arc<AtomicU64>,
     icon_cache: Arc<Mutex<HashMap<String, String>>>,
-    /// Worker pool that performs the actual shell icon extraction. The
-    /// command enqueues jobs here and awaits per-path reply channels.
+    /// Interactive icon pool: serves the UI's viewport batches. Kept entirely
+    /// separate from the boot warm queue below so the launcher's first open
+    /// after boot never queues behind background pre-extraction (that queueing
+    /// was what made rows time out and sit as letter chips for a whole render).
     icon_tx: Arc<std::sync::mpsc::Sender<IconJob>>,
+    /// Background/boot warm queue on its own workers — lower priority by
+    /// construction, and nothing interactive ever waits on it.
+    icon_tx_cold: Arc<std::sync::mpsc::Sender<IconJob>>,
     freq: Arc<Mutex<std::collections::HashMap<String, u32>>>,
     first_scan: Arc<AtomicBool>,
 }
@@ -1457,14 +1462,30 @@ fn icon_cache_dir() -> std::path::PathBuf {
 
 /// Pre-extract icons for the first screenful of app rows at startup, so the
 /// first open after boot shows real icons immediately instead of letter chips
-/// while the lazy per-row extraction crawls through. Runs on its own thread,
-/// reuses the same STA worker pool, and skips anything already cached.
+/// while the lazy per-row extraction crawls through. Runs on its own thread
+/// against the BACKGROUND warm pool (icon_tx_cold) — it can never delay or
+/// starve the interactive icon requests the UI makes, even under a cold boot
+/// when this is still churning.
 fn warm_icon_cache(state: &AppState) {
-    let pool: Vec<AppEntry> = state.apps.read().clone();
-    let icon_tx = Arc::clone(&state.icon_tx);
+    let apps = Arc::clone(&state.apps);
+    let icon_tx = Arc::clone(&state.icon_tx_cold);
     let icon_cache = Arc::clone(&state.icon_cache);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
+        // The app pool is restored from disk on another thread; wait briefly
+        // for it so the warm covers the real first screenful instead of
+        // racing an empty list and warming zero icons on a cold disk.
+        let pool = {
+            let mut waited = 0u32;
+            loop {
+                let p = apps.read().clone();
+                if !p.is_empty() || waited >= 40 {
+                    break p;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                waited += 1;
+            }
+        };
         let mut warmed = 0usize;
         for app in pool.iter().take(60) {
             if app.path.starts_with("ms-settings:") {
@@ -1479,7 +1500,7 @@ fn warm_icon_cache(state: &AppState) {
             if icon_tx.send(job).is_err() {
                 break;
             }
-            if let Ok(Some(uri)) = reply_rx.recv_timeout(Duration::from_secs(3)) {
+            if let Ok(Some(uri)) = reply_rx.recv_timeout(Duration::from_secs(5)) {
                 icon_cache_insert(&icon_cache, key.clone(), uri.clone());
                 if let Some(png) = uri_png_bytes(&uri) {
                     // A planted junction under the icon dir must not redirect
@@ -3099,6 +3120,7 @@ fn main() {
         app_rev: Arc::clone(&app_rev),
         icon_cache: Arc::clone(&icon_cache),
         icon_tx: spawn_icon_workers(4),
+        icon_tx_cold: spawn_icon_workers(2),
         freq: Arc::new(Mutex::new(std::collections::HashMap::new())),
         first_scan: Arc::clone(&first_scan),
     };
