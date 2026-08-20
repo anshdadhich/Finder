@@ -47,23 +47,6 @@
     },
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'"
-    },
-    "windows": [
-      {
-        "title": "Finder",
-        "width": 1050,
-        "height": 690,
-        "center": false,
-        "x": 100,
-        "y": 80,
-        "resizable": false,
-        "fullscreen": false,
-        "decorations": false,
-        "transparent": true,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "visible": false
-      }
-    ]
+    }
   }
 }

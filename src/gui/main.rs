@@ -2570,6 +2570,18 @@ fn best_effort_crash_log(reason: &str) {
 }
 
 fn main() {
+    // WebView2's GPU process retains ~250-300 MB of D3D texture cache even
+    // while idle (transparent layered window) and grows with every previewed
+    // image without releasing it — that retention is the preview/RAM spike.
+    // Render software-only (SwiftShader): the glass, transparency and previews
+    // look identical (checked on build 26200) and the GPU process drops out
+    // of the tree. NOTE: wry always calls SetAdditionalBrowserArguments
+    // itself, which OVERRIDES this env var — the flag actually rides in
+    // WindowBuilder::additional_browser_args below. This set_var is kept only
+    // as a fallback should a future wry stop overriding the env var.
+    if std::env::var_os("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").is_none() {
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--disable-gpu");
+    }
     // Everything hits the log file, panics included — the window has no
     // console and silent exits are impossible to debug otherwise.
     std::panic::set_hook(Box::new(|info| {
@@ -2739,7 +2751,34 @@ fn main() {
         ))
         .manage(state)
         .setup(move |app| {
-            let window = app.get_window("main").expect("main window");
+            // The window is built here (not via tauri.conf.json) so the
+            // WebView2 environment can get explicit browser args: wry always
+            // calls SetAdditionalBrowserArguments itself, which OVERRIDES the
+            // WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS env var — the flag must
+            // ride in this single supported slot. `--disable-gpu` drops
+            // WebView2's GPU process (~250-300 MB of retained D3D textures
+            // that never shrink) in favor of software compositing; keep wry's
+            // default feature disables (msWebOOUI etc.) since overriding the
+            // args replaces them.
+            let window = tauri::WindowBuilder::new(
+                &app.handle(),
+                "main",
+                tauri::WindowUrl::App("index.html".into()),
+            )
+            .title("Finder")
+            .inner_size(1050.0, 690.0)
+            .position(100.0, 80.0)
+            .resizable(false)
+            .decorations(false)
+            .transparent(true)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .visible(false)
+            .additional_browser_args(
+                "--disable-gpu --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection",
+            )
+            .build()
+            .expect("main window");
             *setup_close_window.lock() = Some(window.clone());
             strip_system_menu(&window);
             position_spotlight(&window);
