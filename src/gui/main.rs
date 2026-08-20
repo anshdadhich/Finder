@@ -7,7 +7,7 @@ use std::{
     mem::size_of,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
     thread,
@@ -24,7 +24,7 @@ use tauri::{
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, RECT, SIZE};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     GetObjectW, ReleaseDC, SelectObject, StretchBlt, BITMAP, BITMAPINFO, BI_RGB, DIB_RGB_COLORS,
@@ -44,8 +44,10 @@ use windows::Win32::UI::Shell::{
     SIID_APPLICATION, SHSTOCKICONINFO, SHIL_JUMBO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyIcon, FindWindowW, GetIconInfo, GetWindowRect, HICON, ICONINFO, SetForegroundWindow,
-    ShowWindow, SW_RESTORE,
+    CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW,
+    FindWindowExW, FindWindowW, GetIconInfo, GetMessageW, GetWindowRect, GWL_WNDPROC, HICON,
+    HWND_MESSAGE, ICONINFO, MSG, PostMessageW, RegisterWindowMessageW, SetForegroundWindow,
+    SetWindowLongPtrW, ShowWindow, SW_RESTORE, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
 };
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::System::Diagnostics::Debug::{
@@ -3035,9 +3037,16 @@ fn main() {
             log_line("main: boot start while already running — exiting quietly");
             std::process::exit(0);
         }
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-            let _ = SetForegroundWindow(hwnd);
+        // Let the running instance summon itself through its OWN show_spotlight
+        // path (backdrop refresh, frontend re-sync, input focus) so a relaunched
+        // palette is fully live. Falls back to the raw Win32 wake only when the
+        // running instance's wake host isn't reachable (e.g. it is still
+        // finishing startup and hasn't armed it yet).
+        if !wake_existing_instance() {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(hwnd);
+            }
         }
         log_line("main: woke existing instance, exiting");
         std::process::exit(0);
@@ -3208,6 +3217,10 @@ fn main() {
             let hotkey = hotkey_name();
             log_line(&format!("hotkey configured: {}", hotkey));
             register_shortcut(&app.handle(), &hotkey, window.clone());
+            // Accept the "second launch" summon: a relaunched exe posts a
+            // wake message to the host window so THIS instance summons the
+            // palette through the full show path (see arm_wake_host).
+            arm_wake_host(window);
             Ok(())
         })
         .on_window_event({
@@ -5362,6 +5375,136 @@ fn find_finder_window() -> Option<HWND> {
     let mut title: Vec<u16> = "Finder".encode_utf16().chain(std::iter::once(0)).collect();
     let title_ptr = PCWSTR(title.as_mut_ptr());
     unsafe { FindWindowW(PCWSTR::null(), title_ptr).ok().filter(|h| !h.0.is_null()) }
+}
+
+/// Well-known wake message name. RegisterWindowMessageW maps the same string
+/// to a single message id across ALL processes in the session, so the second
+/// instance and the running instance agree on the id without any file/pipe.
+const WAKE_MESSAGE_NAME: &str = "Finder\\SummonPalette";
+/// The registered wake message id (0 until the host is armed).
+static WAKE_MSG: AtomicU32 = AtomicU32::new(0);
+/// Original wndproc of the message-only wake host, chained for every message
+/// we do not own. Isize (not HWND) so it is atomically storable.
+static WAKE_OLD_PROC: AtomicIsize = AtomicIsize::new(0);
+/// Tauri window the wake host summons.
+static WAKE_WINDOW: Mutex<Option<tauri::Window>> = Mutex::new(None);
+/// Typed fn-pointer constant so `as isize` below is a plain pointer cast
+/// (casting a bare fn item to an integer warns).
+const WAKE_PROC: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = wake_wndproc;
+
+/// The OWNER instance arms a tiny message-only window ("STATIC" class so no
+/// custom class registration) whose subclassed wndproc turns a posted "wake"
+/// message into its own show_spotlight. A second launch therefore summons the
+/// palette through the REAL show path — backdrop refresh, frontend re-sync,
+/// input focus — instead of a stray ShowWindow/SetForegroundWindow from a
+/// different process, which left the window visibly stale and unfocused.
+/// The pump loop runs on the same thread the window is created on, so owned
+/// window messages are dispatched here.
+fn arm_wake_host(window: tauri::Window) {
+    let mut name: Vec<u16> = WAKE_MESSAGE_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let msg = unsafe { RegisterWindowMessageW(PCWSTR(name.as_mut_ptr())) };
+    if msg == 0 {
+        log_line("wake: RegisterWindowMessageW failed — raw-wake fallback stays");
+        return;
+    }
+    WAKE_MSG.store(msg, Ordering::Relaxed);
+    *WAKE_WINDOW.lock() = Some(window);
+    std::thread::spawn(move || {
+        let class: Vec<u16> = "STATIC".encode_utf16().chain(std::iter::once(0)).collect();
+        let title: Vec<u16> = "FinderWakeHost".encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let Ok(hwnd) = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(class.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            ) else {
+                return;
+            };
+            if hwnd.0.is_null() {
+                return;
+            }
+            let old = SetWindowLongPtrW(hwnd, GWL_WNDPROC, WAKE_PROC as isize);
+            WAKE_OLD_PROC.store(old, Ordering::Relaxed);
+            log_line(&format!(
+                "wake: host armed (msg {})",
+                WAKE_MSG.load(Ordering::Relaxed)
+            ));
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                let _ = TranslateMessage(&msg);
+                let _ = DispatchMessageW(&msg);
+            }
+        }
+    });
+}
+
+/// Subclassed wndproc of the message-only wake host: the wake message is the
+/// only one we own; everything else chains to the original wndproc untouched.
+unsafe extern "system" fn wake_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WAKE_MSG.load(Ordering::Relaxed) {
+        if let Some(window) = WAKE_WINDOW.lock().as_ref() {
+            show_spotlight(window);
+        }
+        return LRESULT(0);
+    }
+    let old = WAKE_OLD_PROC.load(Ordering::Relaxed);
+    if old == 0 {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    } else {
+        // isize → fn-pointer is not an `as` cast (E0605); both are pointer
+        // sized, so transmute is exact.
+        let old_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
+            std::mem::transmute(old);
+        CallWindowProcW(Some(old_proc), hwnd, msg, wparam, lparam)
+    }
+}
+
+/// Tells the running instance to summon the palette through its own
+/// show_spotlight. Returns false (caller falls back to the raw Win32 wake)
+/// when the running instance hasn't armed its host window yet.
+fn wake_existing_instance() -> bool {
+    let mut name: Vec<u16> = WAKE_MESSAGE_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let msg = unsafe { RegisterWindowMessageW(PCWSTR(name.as_mut_ptr())) };
+    if msg == 0 {
+        return false;
+    }
+    let class: Vec<u16> = "STATIC".encode_utf16().chain(std::iter::once(0)).collect();
+    let title: Vec<u16> = "FinderWakeHost".encode_utf16().chain(std::iter::once(0)).collect();
+    let host = unsafe {
+        FindWindowExW(
+            Some(HWND_MESSAGE),
+            None,
+            PCWSTR(class.as_ptr()),
+            PCWSTR(title.as_ptr()),
+        )
+    };
+    let Ok(host) = host else {
+        return false;
+    };
+    if host.0.is_null() {
+        return false;
+    }
+    unsafe { PostMessageW(Some(host), msg, WPARAM(0), LPARAM(0)) }.is_ok()
 }
 
 #[tauri::command]
