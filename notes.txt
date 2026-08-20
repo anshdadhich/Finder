@@ -1,16 +1,30 @@
-Finder v0.2.1
+Finder v0.2.2
 
-Fixed: "Start with Windows" enabled but the app never launched at boot.
+Memory, security & preview overhaul.
 
-Root cause: the logon task was created with Task Scheduler's default power
-gates (DisallowStartIfOnBatteries / StopIfGoingOnBatteries). On a laptop
-logging in on battery — Finder's autostart silently never fired, while Task
-Manager showed it "enabled".
+RAM:
+- Fast-scrolling through previews no longer leaves the WebView2 GPU process
+  holding memory forever (browser flags now force it to release); the renderer
+  returns toward its baseline after scrolling stops.
+- Heavy UI state (search-result rows, preview bitmap, window-glass layer) is
+  dropped when the window hides, instead of being kept alive between opens.
+- Preview thumbnails now decode at scaled resolution (~10-30 ms per image)
+  instead of full-size, and the previous image stays visible while the next
+  loads (no more "Loading..." flash between every photo).
 
-Fix: Finder now clears both gates when creating the logon task, and repairs
-existing gated tasks on the next launch (logged as "autostart: repaired
-battery-gated logon task").
+Security:
+- Vendored IPC core with verified wire contract; privileged commands are
+  gated behind a runtime nonce.
+- Device-path & invalid-path rejection on file/folder/open actions.
+- Diagnostics channel hardened (length caps, sanitized, throttled) and the
+  log file is size-capped with rotation.
 
-Also: second launches now log "main: woke existing instance, exiting"
-instead of exiting silently, so the single-instance wake is visible in
-log.txt.
+Search & performance:
+- File-index polling now yields to the idle OS instead of blocking startup.
+- The fuzzy fallback pass runs under a strict wall-clock budget.
+- Warm-start cache loads faster.
+
+Fixes:
+- Launching apps/files validates integrity at medium level.
+- Cache decode no longer mis-decodes after a warm start; entries are UTF-8
+  validated.

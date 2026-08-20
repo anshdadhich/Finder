@@ -469,3 +469,54 @@ never be treated as a trust boundary. The surface is small (no remote navigation
   load-dependent).
 - Rebuild loop: quit from tray → `cargo build --release --bin finder-gui` → relaunch
   via `Start-Process … -Verb RunAs`.
+
+---
+
+## 11. Backlog — planned optimizations (not yet implemented)
+
+Analyzed `tauri-ui/main.js` during the RAM-pass; both noted here for later work.
+
+### 11.1 Tighten the result-row pool (small, safe)
+
+Rows are already pooled (`rowPool`, keyed by `item.path`, `main.js:300`) and
+dirty-checked per render (`el._name/_path/_tagText/_iconKey/_q`), so searches
+reuse DOM instead of rebuilding it. The remaining cost: the pool retains up to
+`MAX_ITEMS + 40` (~240) **detached** rows after every render, and each keeps
+its decoded icon bitmap (`<img>` with a data-URI `src`) alive even when not on
+screen. Plan:
+
+- After each render, prune pooled rows that are not in the current visible set
+  (rows are cheap to rebuild — the pool exists to skip *frequent re-query*
+  churn, not to hold the whole history).
+- When dropping a stale row, clear its `img.src` (drops the decoded bitmap
+  immediately) and `iconObserver.unobserve(el)` (already done in the size-cap
+  prune at `main.js:1086`).
+- Expected: shaves the retained-bitmap floor in the renderer (tens of MB on
+  the measured 376 MB renderer working set with a 240-row pool). No behavior
+  change: reuse across keystrokes is preserved for visible rows.
+
+### 11.2 Virtualize the results list (bigger structural win)
+
+The card shows at most ~30 rows in the 520 px-tall viewport, but renders all
+`MAX_ITEMS` rows (~200) — and the empty-query browse renders ~500. The plan is
+a windowed list: keep a fixed pool of ~viewport-sized rows positioned over a
+spacer of the full list height; on scroll, swap the window. This caps DOM
+nodes *and* decoded icon bitmaps at O(viewport) for lists of any length.
+
+Risks to plan around (why this is a separate project, not a quick change):
+
+- Keyboard navigation (`selected` index + `rowEls` array) must map logical
+  index ↔ rendered window and auto-scroll the window into view.
+- `loadMoreFiles` infinite-pagination trigger is scroll-based (`main.js:2332`);
+  the spacer scroll math must keep it firing at the right logical offset.
+- Grouped layout (group headers interleaved with rows, `groupItems`) needs the
+  header positions folded into the spacer, or headers float over it.
+- Preview pane selection (`renderPreview`) and the `selected` row re-render
+  must survive window swaps mid-scroll.
+- Regression surface: fast typing, keyboard-only use, mouse scroll inertia,
+  DPI scaling (row heights are content-driven; a fixed row height simplifies
+  everything — measure one and adopt it, or derive offsets from measured
+  heights per window).
+
+Order: do 11.1 first (one session, low risk); revisit 11.2 if the renderer
+working set still matters after 11.1.
