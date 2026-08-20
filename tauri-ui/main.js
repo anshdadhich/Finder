@@ -1,16 +1,167 @@
-// IPC surface. `withGlobalTauri: false` (S4) removes the page-wide
-// `window.__TAURI__` namespace from the webview; the runtime still exposes
-// the minimal internal bridge the official @tauri-apps/api package sits on,
-// which we re-plumb here — one `invoke`, two event `listen`s, and the
-// updater. The __TAURI__ fallback keeps the page working if the flag is
-// ever re-enabled for local development.
-const __i = window.__TAURI__ || window.__TAURI_INTERNALS__ || {};
-const invoke =
-  __i.tauri?.invoke ||
-  __i.invoke ||
-  (() => Promise.reject(new Error("no IPC bridge")));
+// ── Tauri v1 IPC core (vendored — contract verified against tauri-1.8.3)
+// With withGlobalTauri:false the runtime injects ONLY window.__TAURI_IPC__
+// ({cmd, callback, error, payload} — scripts/ipc.js stamps the invoke key
+// itself); responses arrive as Rust-eval'd window['_<id>'](<payload>) and
+// events as window['<id>']({event, windowLabel, payload}). This is the same
+// contract @tauri-apps/api implements; vendored here so the static frontend
+// needs no bundler. The __TAURI__ fallbacks keep the page working if the
+// flag is re-enabled for local development.
+let __cbSeq = 0;
+const __regist = (fn, once) => {
+  const id = ++__cbSeq;
+  const key = `_${id}`;
+  window[key] = (resp) => {
+    if (once) delete window[key];
+    fn(resp);
+  };
+  return id;
+};
+const __invokeCore = (cmd, args) =>
+  new Promise((resolve, reject) => {
+    if (!window.__TAURI_IPC__) {
+      reject(new Error("no IPC bridge"));
+      return;
+    }
+    const ok = __regist(resolve, true);
+    const err = __regist(reject, true);
+    // Wire format (verified against bundle.global.js invoke + hooks.rs
+    // InvokePayload flatten): args ride at TOP LEVEL as siblings of
+    // cmd/callback/error — NOT under a `payload` key. The backend's
+    // #[serde(flatten)] inner cast collects every remaining field and
+    // command.rs extracts args by key; a stray `payload:` wrapper makes
+    // even no-arg commands reject (unit deserialization fails on a map).
+    window.__TAURI_IPC__({ cmd, callback: ok, error: err, ...(args || {}) });
+  });
+const __listenCore = (event, handler) => {
+  const h = __regist(handler);
+  // v1.8 built-in modules route through cmd "tauri" + __tauriModule/message
+  // (NOT "plugin:event" — that's the 1.9+/v2 surface). The listen invoke
+  // resolves with the backend-generated event id, which unlisten needs.
+  return __invokeCore("tauri", {
+    __tauriModule: "Event",
+    message: { cmd: "listen", event, windowLabel: null, handler: h },
+  }).then((eventId) => () =>
+    __invokeCore("tauri", {
+      __tauriModule: "Event",
+      message: { cmd: "unlisten", event, eventId },
+    })
+  );
+};
+const __emitCore = (event, payload) =>
+  __invokeCore("tauri", {
+    __tauriModule: "Event",
+    message: { cmd: "emit", event, payload },
+  });
+const __T = window.__TAURI__;
+const invoke = __T?.tauri?.invoke || __T?.invoke || __invokeCore;
 const listen = (event, handler) =>
-  (__i.event?.listen || window.__TAURI_INTERNALS__?.listen)(event, handler);
+  (window.__TAURI_INTERNALS__?.listen || __T?.event?.listen || __listenCore)(event, handler);
+const updater =
+  __T?.updater || {
+    // v1.8 updater is event-driven (verified in bundle.global.js + the
+    // backend's updater listener): checkUpdate/installUpdate subscribe for
+    // status events and EMIT the trigger event; onUpdaterEvent unwraps the
+    // status payload for the persistent listener.
+    checkUpdate: () =>
+      new Promise((resolve, reject) => {
+        let closed = false;
+        const offs = [];
+        const close = () => {
+          closed = true;
+          offs.forEach((o) => {
+            try {
+              o();
+            } catch {}
+          });
+          offs.length = 0;
+        };
+        const arm = (p) =>
+          p
+            .then((o) => {
+              if (closed) {
+                try {
+                  o();
+                } catch {}
+              } else offs.push(o);
+            })
+            .catch(() => {});
+        arm(
+          listen("tauri://update-available", (e) => {
+            const p = e && e.payload;
+            close();
+            resolve({ manifest: p, shouldUpdate: true });
+          })
+        );
+        arm(
+          listen("tauri://update-status", (e) => {
+            const p = e && e.payload;
+            if (!p) return;
+            if (p.error) {
+              const err = p.error;
+              close();
+              reject(err);
+            } else if (p.status === "UPTODATE") {
+              close();
+              resolve({ shouldUpdate: false });
+            }
+          })
+        );
+        __emitCore("tauri://update").catch(() => {});
+      }),
+    installUpdate: () =>
+      new Promise((resolve, reject) => {
+        let closed = false;
+        const offs = [];
+        const close = () => {
+          closed = true;
+          offs.forEach((o) => {
+            try {
+              o();
+            } catch {}
+          });
+          offs.length = 0;
+        };
+        const arm = (p) =>
+          p
+            .then((o) => {
+              if (closed) {
+                try {
+                  o();
+                } catch {}
+              } else offs.push(o);
+            })
+            .catch(() => {});
+        arm(
+          listen("tauri://update-status", (e) => {
+            const p = e && e.payload;
+            if (!p) return;
+            if (p.error) {
+              const err = p.error;
+              close();
+              reject(err);
+            } else if (p.status === "DONE") {
+              close();
+              resolve();
+            }
+          })
+        );
+        __emitCore("tauri://update-install").catch(() => {});
+      }),
+    onUpdaterEvent: (handler) =>
+      listen("tauri://update-status", (e) => handler(e && e.payload)),
+  };
+
+// Page-error traps: any uncaught exception or rejection after this point
+// gets reported through js_log (works via bundle OR vendored path), so a
+// silent boot death is never silent again.
+window.addEventListener("error", (ev) =>
+  invoke("js_log", {
+    msg: "pageerr " + ev.message + " @ " + ev.filename + ":" + ev.lineno,
+  }).catch(() => {})
+);
+window.addEventListener("unhandledrejection", (ev) =>
+  invoke("js_log", { msg: "unhd " + String(ev.reason) }).catch(() => {})
+);
 
 // Privileged commands (launch_admin, uninstall_app, image_data,
 // grab_backdrop) require the per-session nonce (S4): fetched once at boot
@@ -20,6 +171,56 @@ const nonceP = invoke("get_nonce").catch(() => "");
 async function privileged(cmd, payload) {
   const nonce = await nonceP;
   return invoke(cmd, { ...(payload || {}), nonce });
+}
+
+// Boot-time IPC environment probe (diagnostic). Reports exactly what the
+// runtime injected so the withGlobalTauri:false re-attempt can be built
+// against facts instead of assumptions. Fully guarded — never raises.
+try {
+  const env = {
+    ipc: typeof window.__TAURI_IPC__,
+    postMsg: typeof window.__TAURI_POST_MESSAGE__,
+    winIpc: typeof window.ipc,
+    tauri: typeof window.__TAURI__,
+    pattern: typeof window.__TAURI_PATTERN__,
+    key: typeof window.__TAURI_INVOKE_KEY__,
+    internals: typeof window.__TAURI_INTERNALS__,
+  };
+  invoke("js_log", { msg: "env " + JSON.stringify(env) }).catch(() => {});
+  invoke("get_nonce")
+    .then((n) => invoke("js_log", { msg: "nonce_len " + String(n ? n.length : 0) }))
+    .catch(() => {});
+  // S4 A/B: prove the vendored __TAURI_IPC__ path can talk to the backend
+  // while the bundle keeps the page healthy. If the raw message arrives,
+  // js_log itself logs "[js] vendored-arrived" — double confirmation.
+  // ok      => vendored core logic is sound; a false-mode failure would be
+  //            an injection difference (e.g. __TAURI_IPC__ not present).
+  // no-bridge => __TAURI_IPC__ missing even WITH the bundle: ipc.js gate.
+  // timeout  => message sent but never answered: shape/invoke-key problem.
+  const s4Report = (m) => invoke("js_log", { msg: m }).catch(() => {});
+  const s4VendoredTest = (tag) =>
+    new Promise((resolve) => {
+      if (typeof window.__TAURI_IPC__ !== "function") {
+        resolve(tag + " no-bridge");
+        return;
+      }
+      const timer = setTimeout(() => resolve(tag + " timeout"), 3000);
+      __invokeCore("js_log", { msg: tag + "-arrived" })
+        .then(() => {
+          clearTimeout(timer);
+          resolve(tag + " ok");
+        })
+        .catch((e) => {
+          clearTimeout(timer);
+          resolve(tag + " err " + String(e));
+        });
+    });
+  s4VendoredTest("vendored").then((r) => s4Report("S4-AB: " + r));
+  __listenCore("__s4probe", () => {})
+    .then(() => s4Report("S4-AB: listen ok"))
+    .catch((e) => s4Report("S4-AB: listen err " + String(e)));
+} catch (e) {
+  invoke("js_log", { msg: "env probe failed: " + String(e) }).catch(() => {});
 }
 
 // Theme: follows the OS by default ("system"); a manual dark/light choice
@@ -1639,7 +1840,7 @@ function renderPreview() {
           // Bounded cache: a handful of recent previews is plenty; evicting
           // the oldest keeps the map from growing without limit over a long
           // session (its decoded images are dropped with it).
-          if (pvImgCache.size > 12) pvImgCache.delete(pvImgCache.keys().next().value);
+          if (pvImgCache.size > 6) pvImgCache.delete(pvImgCache.keys().next().value);
           if (currentSelection.item.path === selPath) {
             pvImgEl.src = uri;
             pvImgEl.alt = currentSelection.item.name || "";
@@ -2167,15 +2368,7 @@ if (scanQuitBtn) {
 // The backend push side is publish-update.ps1 + latest.json (signed NSIS
 // installer). This client listens for update events, checks the feed at most
 // once per 7 days (timestamp kept in localStorage), and lets the user install.
-const updater =
-  window.__TAURI__?.updater || {
-    checkUpdate: () =>
-      window.__TAURI_INTERNALS__?.invoke("plugin:updater|check") ||
-      Promise.reject(new Error("no updater")),
-    installUpdate: () =>
-      window.__TAURI_INTERNALS__?.invoke("plugin:updater|install") ||
-      Promise.reject(new Error("no updater")),
-  };
+// (`updater` itself is declared at the top with the vendored IPC core.)
 const updateBanner = document.querySelector("#updateBanner");
 const updateVersionEl = document.querySelector("#updateVersion");
 const updateBtnEl = document.querySelector("#updateBtn");

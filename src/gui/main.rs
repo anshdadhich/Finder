@@ -706,6 +706,13 @@ fn get_nonce() -> String {
     privilege_nonce().to_string()
 }
 
+/// Diagnostic: log a line from the webview (probe instrumentation for the
+/// withGlobalTauri:false re-attempt; harmless in normal operation).
+#[tauri::command]
+fn js_log(msg: String) {
+    log_line(&format!("[js] {}", msg));
+}
+
 #[tauri::command]
 fn launch_admin(path: String, nonce: String, state: tauri::State<AppState>) -> Result<(), String> {
     check_nonce(&nonce)?;
@@ -1147,9 +1154,16 @@ fn image_data(path: String, nonce: String) -> Result<Option<String>, String> {
     if !meta.file_type().is_file() {
         return Ok(None);
     }
-    // Thumbnail pass first; the raw path below stays as the fallback.
+    // Thumbnail pass first. The decodable static formats are thumbnail-ONLY:
+    // refusing the raw file keeps the webview from ever decoding a giant
+    // bitmap (observed ~600 MB preview spikes from a few full-res photos in
+    // the preview cache). Animated gifs and webp keep the raw whole-file
+    // path (unchanged behavior — those need the full bytes anyway).
     if let Some(uri) = thumbnail_data_uri(&path, &mime) {
         return Ok(Some(uri));
+    }
+    if !matches!(mime, "image/gif" | "image/webp") {
+        return Ok(None);
     }
     let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
     // Hard cap at read time too — no TOCTOU between a metadata check and
@@ -1169,14 +1183,16 @@ fn image_data(path: String, nonce: String) -> Result<Option<String>, String> {
 }
 
 /// 512 px-box thumbnail data URI for static image formats. `None` when the
-/// file is undecodable or beyond the bounded dimensions — callers fall back
-/// to the whole-file data URI. JPEG sources re-encode as JPEG, everything
-/// else as PNG (keeps alpha for icons and screenshots).
+/// file is undecodable or beyond the pixel budget — callers fall back to the
+/// icon row (never the raw file for these static formats). JPEG sources
+/// re-encode as JPEG, everything else as PNG (keeps alpha for icons and
+/// screenshots).
 fn thumbnail_data_uri(path: &str, mime: &str) -> Option<String> {
-    // Bounded decode: a photo past 4096 px would allocate hundreds of MB
-    // just to scale down — send it down the raw path (16 MB cap) instead.
+    // Bounded decode: a 24 MP ceiling keeps the transient full-res decode
+    // under ~100 MB in this process; beyond it the icon row is a fine
+    // preview and the webview must not allocate the giant bitmap instead.
     let (w, h) = image::image_dimensions(path).ok()?;
-    if w.max(h) > 4096 {
+    if w.saturating_mul(h) > 24_000_000 {
         return None;
     }
     let img = image::open(path).ok()?;
@@ -1212,7 +1228,7 @@ fn icon_cache_insert(
     uri: String,
 ) {
     let mut m = cache.lock();
-    if m.len() >= 600 {
+    if m.len() >= 200 {
         m.clear();
     }
     m.insert(key, uri);
@@ -2800,6 +2816,7 @@ fn main() {
             set_hotkey,
             image_data,
             get_nonce,
+            js_log,
             frontend_loaded
         ])
         .build(tauri::generate_context!())
