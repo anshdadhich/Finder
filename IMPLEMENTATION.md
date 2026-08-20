@@ -23,7 +23,7 @@ Finder is a Windows-native launcher in the style of Spotlight/Raycast.
 
 | File | Lines | Role |
 |---|---|---|
-| `src/gui/main.rs` | 5420 | window, hotkey loop, tray, all `#[tauri::command]`s, backdrop pipeline, app icon cache |
+| `src/gui/main.rs` | 5435 | window, hotkey loop, tray, all `#[tauri::command]`s, backdrop pipeline, app icon cache |
 | `src/index/store.rs` | 897 | in-memory index: arenas, chunks, cache format v2, live event application |
 | `src/index/search.rs` | 785 | scoring, paging, extension search, fuzzy fallback, app pool |
 | `src/index/apps.rs` | 356 | WinRT installed-app enumeration + Start Menu .lnk scanning |
@@ -436,6 +436,7 @@ never be treated as a trust boundary. The surface is small (no remote navigation
 | 11 | Medium | Elevated process wrote state under `%LOCALAPPDATA%\Finder` (cache, log, icons, first-run marker) without checking ancestors for **reparse points** — a same-user process can plant a junction and redirect the elevated writes (fixed-name file create/overwrite, log forgery) into any admin-writable location. | `log_line`, `write_atomic_with`, `rebuild_index`, `warm_icon_cache`, `purge_legacy_generic_icons`, first-run marker | Verify no path component carries `FILE_ATTRIBUTE_REPARSE_POINT` before every elevated write; refuse (skip/Err) when one does | ✅ **Fixed** — `path_reparse_safe` walks every ancestor with reparse-point semantics and gates every write site; junctioned paths are refused (log lines skipped, saves return `PermissionDenied`) |
 | 12 | Low | Thumbnail pipeline gated **pixels** (24 MP) but not **file size** — a crafted huge JPEG forced multi-tens-of-MB metadata scans and up to ~96 MB decode transients in the elevated process. | `thumbnail_data_uri` (main.rs:1190) | Byte-cap the input before any dimension scan/decode | ✅ **Fixed** — 32 MB file-size cap before `image_dimensions`; oversize files fall back to the icon row |
 | 13 | Info | (a) leftover `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` set-var let a same-user launcher influence elevated webview flags if wry ever stops overriding it — deleted; (b) the browser args re-disabled `msSmartScreenProtection` (inherited from wry's default) — now deliberately **kept** enabled, only `msWebOOUI,msPdfOOUI` stay off. | `main()` / `setup` | remove dead env-var; drop SmartScreen from the disable list | ✅ **Fixed** — env block deleted; args = `--disable-gpu --disable-features=msWebOOUI,msPdfOOUI` |
+| 14 | Info | `open_path`/`open_parent` handed any path straight to Explorer without the raw NT-namespace rejection (`\\.\` / `\\?\`) that `launch_with_verb` had — inconsistent hardening; Explorer fails such paths harmlessly today, but a device path has no business reaching the shell. | `open_path`, `open_parent` (main.rs) | apply the same prefix guard as `launch_with_verb` | ✅ **Fixed** — shared `is_device_path()` helper now gates all three entry points (`launch_with_verb`, `open_path`, `open_parent`); device paths return errors instead of spawning Explorer |
 
 ### Verified-clean
 

@@ -733,6 +733,15 @@ fn open_properties(path: String) -> Result<(), String> {
     launch_with_verb(&path, "properties")
 }
 
+/// True when a path uses the raw NT namespace (`\\.\` = device namespace,
+/// `\\?\` = extended-length win32 paths). These bypass ALL normal path
+/// parsing and file-type checks (a raw disk handle can be addressed through
+/// them) — they must never be handed to the shell or Explorer, which is why
+/// every path-typed command (launch, open, open-parent) rejects them up front.
+fn is_device_path(path: &str) -> bool {
+    path.starts_with("\\\\.\\") || path.starts_with("\\\\?\\")
+}
+
 fn launch_with_verb(path: &str, verb: &str) -> Result<(), String> {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -744,7 +753,7 @@ fn launch_with_verb(path: &str, verb: &str) -> Result<(), String> {
     }
     // Raw device paths (\\.\C: etc) must never be handed to the shell — they
     // bypass every file-type check and have no business being "opened".
-    if path.starts_with("\\\\.\\") || path.starts_with("\\\\?\\") {
+    if is_device_path(path) {
         return Err("device paths are not launchable".into());
     }
 
@@ -2199,6 +2208,9 @@ fn grab_backdrop(nonce: String) -> Result<Option<BackdropGrab>, String> {
 
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
+    if is_device_path(&path) {
+        return Err("device paths are not openable".into());
+    }
     std::process::Command::new("explorer")
         .arg(path)
         .spawn()
@@ -2208,6 +2220,9 @@ fn open_path(path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn open_parent(path: String) -> Result<(), String> {
+    if is_device_path(&path) {
+        return Err("device paths have no parent".into());
+    }
     if let Some(rest) = path.strip_prefix("aumid:") {
         // Packaged (Store) apps live in the ACL-protected WindowsApps folder,
         // which Explorer won't open for the user. The Apps folder is the
