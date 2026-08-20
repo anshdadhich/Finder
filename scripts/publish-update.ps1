@@ -47,7 +47,9 @@ if (-not $signature) { throw "empty signature in $sigPath" }
 
 $notes = ""
 if (Test-Path (Join-Path $repoRoot "notes.txt")) {
-  $notes = (Get-Content (Join-Path $repoRoot "notes.txt") -Raw).Trim()
+  # Explicit UTF8: Windows PowerShell 5.1 defaults to ANSI and would mangle
+  # any non-ASCII byte (em-dashes etc.) on the way into latest.json.
+  $notes = (Get-Content (Join-Path $repoRoot "notes.txt") -Raw -Encoding UTF8).Trim()
 }
 
 $manifest = [ordered]@{

@@ -28,3 +28,6 @@ Fixes:
 - Launching apps/files validates integrity at medium level.
 - Cache decode no longer mis-decodes after a warm start; entries are UTF-8
   validated.
+- "Start with Windows" now boots silently - the launcher stays in the tray at
+  logon and opens only when summoned (hotkey / tray); existing installs are
+  migrated automatically.

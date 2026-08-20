@@ -46,30 +46,47 @@ Finder is a Windows-native launcher in the style of Spotlight/Raycast.
    (or the self-update path), it copies itself there and relaunches — the updater can then
    overwrite the original.
 2. **Single-instance**: a named mutex; a second instance pokes the first (shows the launcher)
-   and exits.
-3. **Logging**: `%LOCALAPPDATA%\Finder\log.txt`, monotonic `+seconds.millis pid=…` lines.
-4. **Index load** (`store.rs::from_cache`): cache file read, arenas travel byte-for-byte;
+   and exits. A second instance carrying `--startup` exits **quietly** — boot must never
+   throw the palette on screen just because an instance was already running.
+3. **Quiet boot flag**: the autostart logon task (and the legacy Startup-folder shortcut)
+   launch the app with `--startup`. `BOOT_QUIET` is set before anything else: the
+   first-show handshake (§2.2) then leaves the palette hidden until a hotkey / tray summon.
+   The **first launch after install always shows** (install-marker absent), even from boot.
+4. **Logging**: `%LOCALAPPDATA%\Finder\log.txt`, monotonic `+seconds.millis pid=…` lines.
+5. **Index load** (`store.rs::from_cache`): cache file read, arenas travel byte-for-byte;
    only `ref_lookup` + `ext_index` are rebuilt (parallel). Cache format is versioned with a
    magic; foreign formats are rejected (a stale/older version triggers a fresh scan).
-5. **App pool** (`apps.rs`): WinRT `GetInstalledApps`-style enumeration **plus** Start Menu
+6. **App pool** (`apps.rs`): WinRT `GetInstalledApps`-style enumeration **plus** Start Menu
    `.lnk` scanning; each app logs `app-pool | name | aumid/target | score`.
-6. **Hotkey**: reads `HKCU\Software\Finder\Hotkey` (default `ctrl+space`), spawns the
+7. **Hotkey**: reads `HKCU\Software\Finder\Hotkey` (default `ctrl+space`), spawns the
    dedicated message loop thread: `RegisterHotKey` + `GetMessage` + tray icon +
    `CreateWindowExW` hidden hotkey window (log `hotkey registered: …`).
-7. **Watchers** (`watcher.rs`): opens the USN journal per drive (log `index ready —
+8. **Watchers** (`watcher.rs`): opens the USN journal per drive (log `index ready —
    watchers starting`).
-8. **Frontend handshake**: JS pulls the cached backdrop (`grab_backdrop`), subscribes to
+9. **Frontend handshake**: JS pulls the cached backdrop (`grab_backdrop`), subscribes to
    pools and state, flips from the scan card to the launcher card on `state=ready`.
 
 ### 2.2 Show / hide
+
+**First show** — a handshake, not a direct show: the window is created hidden; once the JS
+has painted the frosted-glass backdrop it invokes `frontend_loaded`, which runs
+`show_spotlight()` once (`FIRST_SHOWN` gate), with a 4s watchdog fallback. A **quiet boot**
+start (`--startup` and not a first-run install) skips both the handshake show and the
+watchdog: the palette stays in the tray until the hotkey or the tray menu summons it.
+The window is only ever auto-shown at launch when (a) this is the very first run after
+installation, or (b) the tray "Re-Index Files" item was clicked (it summons the palette
+first so the index rebuild progress is visible).
 
 ```
 hotkey/tray ─▶ show_spotlight() [main.rs]:
   1. strip_system_menu()    — WS_SYSMENU removal + SWP_FRAMECHANGED (§4.3)
   2. position_spotlight()   — center X; y = 12% of monitor height (clamped)
-  3. capture_backdrop()     — desktop grab behind the window (§4.2)
-  4. emit "backdrop"        — ONLY when the grab is fresh (fingerprint gate)
-  5. window.show() + set_focus()
+  3. capture_backdrop_if_stale() — reuse decision + raw GDI snapshot while the
+     window is STILL hidden (fast BitBlt; encode is deferred). None = reuse.
+  4. window.show() + set_focus()   — happens IMMEDIATELY; a fresh grab's JPEG
+     encode + IPC emit run on a background thread (cache_and_emit_backdrop),
+     so no hotkey press ever waits on the encode — this keeps summon snappy
+     with the WebView2 GPU process disabled (software raster only).
 
 hide paths (all → hide_spotlight()):
   - hotkey re-press · Esc on empty query (JS → invoke("hide_window"))
@@ -126,7 +143,9 @@ show ─▶ BitBlt (screen DC → memory bitmap, WINDOW-SIZED ONLY: ~1312×862 d
       ▶ JpegEncoder::new_with_quality(Q=55)   [JPEG, not PNG: ~10× smaller]
       ▶ base64 → data:image/jpeg;base64,…  (~100–250 KB after downscale+q55)
       ▶ cached in global BACKDROP (one string, replaced in place)
-      ▶ if fresh: window.emit("backdrop", grab)   [window still hidden]
+      ▶ emit("backdrop", grab) — from a background thread AFTER show() so the
+        palette opens instantly; the fresh blur pops in a frame or two later.
+        (Boot still encodes synchronously while hidden, once per launch.)
 JS:   listen("backdrop") → applyBackdrop() → .glass-layer backgroundImage = URI
 CSS:  .glass-layer { position:fixed; z-index:-1; clip-path: inset(24px round …);
                      filter: blur(var(--blur-px,20px)) saturate(1.8) }
@@ -175,7 +194,7 @@ HWND type.
 | Instant math | `localStorage fs-math` | — | local evaluator (no IPC) |
 | Compact mode | `localStorage fs-compact` | — | body class `compact-empty` (query empty) → 400px slim bar, normal placement |
 | Summon hotkey | `HKCU\Software\Finder\Hotkey` | `get_hotkey`/`set_hotkey` | unregister old + register new live; only `ctrl+space`/`alt+space` (Win+Space reserved) |
-| Start with Windows | Startup folder .lnk + scheduled task | `get_autostart`/`set_autostart` | `schtasks /Create` via `std::process` argv (no shell interpolation), `IShellLinkW`/`IPersistFile` .lnk fallback |
+| Start with Windows | Startup folder .lnk + scheduled task | `get_autostart`/`set_autostart` | logon task materialized via `schtasks /TR` (no shell interpolation), then rewritten via `rewrite_task_exec()` XML pass → `<Command>` unquoted + `<Arguments>--startup</Arguments>`; `IShellLinkW`/`IPersistFile` .lnk fallback likewise passes `--startup` (quiet boot — the palette only appears when summoned) |
 
 **Settings panel** (redesigned): full-width flat panel that takes over the card below the
 search bar (results + preview hidden) — APPEARANCE / WINDOW / BEHAVIOR muted uppercase
@@ -408,8 +427,9 @@ by app count; pools cached in Rust (`OnceLock`) and JS.
 - Extension queries are O(bucket) — instant *after* the deferral in lever #2 keeps the
   per-row path/name builds on the sliced page only.
 - Icons: lazy + batched (viewport-only) — no startup icon storm.
-- Backdrop capture ~3 ms (thumbnail) / ~15 ms (full) — off the hotkey-critical path (show
-  proceeds with the cached grab).
+- Backdrop capture ~3 ms (thumbnail) / ~15 ms (full BitBlt+GetDIBits, raw pixels) — the
+  JPEG encode (+~50–250 ms debug, ~30–80 ms release) runs on a background thread after
+  `show()`, so hotkey summon never waits on it even with `--disable-gpu`.
 
 ---
 
@@ -469,6 +489,20 @@ never be treated as a trust boundary. The surface is small (no remote navigation
   load-dependent).
 - Rebuild loop: quit from tray → `cargo build --release --bin finder-gui` → relaunch
   via `Start-Process … -Verb RunAs`.
+- Quiet boot: the autostart logon task's action is authored via a
+  `rewrite_task_exec()` XML pass — `<Command>` is the bare exe (no quotes) and
+  `<Arguments>--startup</Arguments>` is a sibling element; the rest of the task
+  XML (principal SID, gates, trigger) passes through byte-for-byte. The
+  Startup-folder `.lnk` carries the same argument. `schtasks /TR` alone is NOT
+  trusted with a quoted command + trailing argument (it splits multi-space
+  paths mid-way and leaks `\"` artifacts — observed live), so /TR is used only
+  to materialize the task and the flag is always injected via XML. A launch
+  with `--startup` stays in the tray — the palette only appears via hotkey /
+  tray "Show Search" / tray "Re-Index Files", or on the very first run after
+  install. Logon tasks registered by pre-quiet-boot builds (including ones
+  mangled by the old /TR-with-args scheme) are upgraded automatically on next
+  launch — the SAME `Command` is preserved when parseable, so a migration run
+  from a debug binary never hijacks autostart onto the source tree.
 
 ---
 

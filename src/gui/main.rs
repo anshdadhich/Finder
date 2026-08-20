@@ -982,6 +982,122 @@ fn gates_fixed_marker() -> std::path::PathBuf {
         .join("task_gates_fixed")
 }
 
+/// True when the registered "Finder" logon task passes --startup to the app.
+/// Exact element match, so the mangled `\"`-artifact tasks from older
+/// /TR-with-args builds (whose Arguments element wraps the flag mid-path)
+/// still count as NOT upgraded and get repaired on next launch.
+fn task_has_boot_arg() -> bool {
+    task_xml()
+        .map(|x| x.contains("<Arguments>--startup</Arguments>"))
+        .unwrap_or(false)
+}
+
+/// Raw XML of the registered "Finder" logon task, when it exists.
+fn task_xml() -> Option<String> {
+    std::process::Command::new("schtasks")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .args(["/Query", "/TN", "Finder", "/XML"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// The executable the "Finder" logon task's <Command> element names,
+/// unquoted. Returns None when unparseable — including the `\"`-artifact
+/// form schtasks produced for /TR values that mixed a quoted path with a
+/// trailing argument.
+fn task_exe() -> Option<std::path::PathBuf> {
+    let xml = task_xml()?;
+    let start = xml.find("<Command>")? + "<Command>".len();
+    let rel = xml[start..].find("</Command>")?;
+    let mut cmd = xml[start..start + rel].trim();
+    if cmd.starts_with('"') && cmd.ends_with('"') {
+        cmd = cmd[1..cmd.len() - 1].trim();
+    }
+    // Reject `\"`-artifact forms (mangled by older /TR-with-args builds):
+    // they lead with a backslash or still carry a quote. A clean path may
+    // contain spaces elsewhere, so only the LEAD is checked.
+    if cmd.is_empty() || cmd.contains('"') || cmd.starts_with('\\') {
+        return None;
+    }
+    Some(std::path::PathBuf::from(cmd))
+}
+
+/// Rewrite the task's Exec action to the canonical shape — `<Command>` =
+/// the executable WITHOUT quotes, `<Arguments>--startup</Arguments>` — by
+/// editing only that element pair in the existing task XML and recreating
+/// the task from it (/XML /F). Every other element (principal SID, power
+/// gates, trigger) passes through byte-for-byte.
+fn rewrite_task_exec(boot_exe: &std::path::Path) -> Result<(), String> {
+    let xml = task_xml().ok_or("cannot read the registered Finder task XML")?;
+    let start = xml
+        .find("<Command>")
+        .ok_or("no <Command> element in task XML")?;
+    let cmd_end = start
+        + xml[start..]
+            .find("</Command>")
+            .ok_or("unclosed <Command> element")?
+        + "</Command>".len();
+    let mut tail = String::from(&xml[cmd_end..]);
+    // Drop any pre-existing <Arguments>…</Arguments> right after Command.
+    if let Some(a0) = tail.find("<Arguments>") {
+        if let Some(a1) = tail[a0..].find("</Arguments>") {
+            tail = String::from(&tail[a0 + a1 + "</Arguments>".len()..]);
+        }
+    }
+    let mut rebuilt = String::with_capacity(xml.len() + 64);
+    rebuilt.push_str(&xml[..start]);
+    rebuilt.push_str("<Command>");
+    rebuilt.push_str(&boot_exe.to_string_lossy());
+    rebuilt.push_str("</Command>\n      <Arguments>--startup</Arguments>");
+    rebuilt.push_str(&tail);
+
+    // S6: unique temp name + create_new so the XML file is ours exclusively.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let xml_path = std::env::temp_dir().join(format!(
+        "finder_task_{}_{}.xml",
+        std::process::id(),
+        stamp
+    ));
+    let mut xml_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&xml_path)
+        .map_err(|e| e.to_string())?;
+    {
+        use std::io::Write;
+        xml_file.write_all(rebuilt.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    drop(xml_file);
+    let patched = std::process::Command::new("schtasks")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .args([
+            "/Create",
+            "/TN",
+            "Finder",
+            "/XML",
+            xml_path.to_str().ok_or("temp path")?,
+            "/F",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&xml_path);
+    if patched {
+        Ok(())
+    } else {
+        Err("schtasks /Create /XML /F failed".into())
+    }
+}
+
 /// schtasks /Create cannot express the battery options, and its defaults
 /// gate ONLOGON tasks on laptops: when the laptop is on battery the task
 /// shows as enabled yet silently never fires. Dump the task XML, flip the
@@ -1083,9 +1199,16 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
         let _ = std::fs::remove_file(gates_fixed_marker());
         return Ok(());
     }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    // /TR needs the path backslash-quote-escaped inside the value, exactly
-    // like the documented  schtasks /Create /TR "\"C:\Program Files\x.exe\""  form.
+    // Re-register the SAME exe the task already targets when one exists (a
+    // migration run from a debug build must not hijack autostart to the
+    // source tree); a fresh install uses the running exe.
+    let exe = task_exe().unwrap_or(std::env::current_exe().map_err(|e| e.to_string())?);
+    // schtasks /TR cannot be trusted with a *quoted* command PLUS a trailing
+    // argument when the path contains spaces (it splits the value mid-path
+    // and leaks `\"` artifacts into the XML — seen live). So /TR is used
+    // ONLY to materialize a task with schtasks' own SID/principal plumbing,
+    // and the boot flag is injected afterwards by rewriting the Exec action
+    // in the task XML (Command unquoted + <Arguments>--startup</Arguments>).
     let tr = format!("\\\"{}\\\"", exe.to_string_lossy());
     let created = std::process::Command::new("schtasks")
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
@@ -1102,6 +1225,11 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
         // The task is the working mechanism — drop any legacy shortcut so it
         // neither double-launches nor leaves a misleading Task Manager entry.
         let _ = std::fs::remove_file(&lnk);
+        // Canonical Exec shape: unquoted Command + Arguments --startup. This
+        // also repairs tasks mangled by older /TR-with-args builds.
+        if let Err(e) = rewrite_task_exec(&exe) {
+            log_line(&format!("autostart: --startup rewrite FAILED: {e}"));
+        }
         // Clear the default power gates (laptop logons on battery would
         // otherwise silently never fire).
         match fix_task_power_gates() {
@@ -1132,10 +1260,14 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
         .map(|d| d.to_string_lossy().to_string())
         .unwrap_or_default();
     let wdir: Vec<u16> = dir.encode_utf16().chain(std::iter::once(0)).collect();
+    // Boot-launch marker on the shortcut, matching the logon task's --startup.
+    let args: Vec<u16> = "--startup".encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         link.SetPath(PCWSTR(target.as_ptr()))
             .map_err(|e| e.to_string())?;
         link.SetWorkingDirectory(PCWSTR(wdir.as_ptr()))
+            .map_err(|e| e.to_string())?;
+        link.SetArguments(PCWSTR(args.as_ptr()))
             .map_err(|e| e.to_string())?;
     }
     let persist = link.cast::<IPersistFile>().map_err(|e| e.to_string())?;
@@ -1880,6 +2012,20 @@ fn apps_from_shell() -> Vec<AppEntry> {
 fn hide_spotlight(window: &tauri::Window) {
     let _ = window.emit("spotlight-hide", ());
     let _ = window.hide();
+    // Keep the cached backdrop current for the NEXT show: once the window is
+    // actually hidden, re-snapshot the desktop behind it (dHash-gated, so a
+    // desktop that did not change costs nothing) and cache the fresh grab.
+    // Without this, opening the palette right after the desktop changed shows
+    // the stale grab on frame one, then swaps once a fresh encode lands — the
+    // visible "adapting to the background" glitch. Emitting while hidden is
+    // skipped (throttled renderer); the next show pushes the newer grab.
+    let win = (*window).clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        if let Some(snap) = capture_backdrop_force(&win) {
+            let _ = cache_backdrop(snap);
+        }
+    });
 }
 
 /// Frameless or not, Windows gives every window a system menu and pops it
@@ -1952,6 +2098,14 @@ static BACKDROP: Mutex<Option<BackdropGrab>> = Mutex::new(None);
 static BACKDROP_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static BACKDROP_RECT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
 const BACKDROP_TTL_MS: u128 = 800;
+
+/// Generation of the grab the page last received. Every fresh cache bump
+/// increments BACKDROP_GEN; the show path emits the cached grab only when the
+/// page hasn't seen that generation yet — exactly one event per new grab (no
+/// duplicate pushes under hotkey mashing), and the hide-refresh below can
+/// cache a current grab without emitting to the throttled hidden renderer.
+static BACKDROP_GEN: Mutex<u64> = Mutex::new(0);
+static BACKDROP_SENT: Mutex<u64> = Mutex::new(0);
 
 /// Desktop fingerprint: a tiny 64×36 downscaled grab of the window rect,
 /// reduced to a dHash (bit = "pixel brighter than its left neighbor"). If
@@ -2059,60 +2213,97 @@ fn thumb_dhash(_window: &tauri::Window, rect: Option<(i32, i32, i32, i32)>) -> O
     Some(out)
 }
 
-/// Capture the desktop behind the window and cache it. Returns the grab and
-/// whether it is a FRESH capture (the webview already holds any reused one —
-/// it is never cleared on hide — so only fresh grabs need emitting). The
-/// caller can push a fresh grab to the webview BEFORE the window becomes
-/// visible — the JPEG decode then overlaps the still-hidden period and the user never
-/// sees the previous (stale) backdrop flash in.
-fn capture_backdrop(window: &tauri::Window) -> Option<(BackdropGrab, bool)> {
-    // The window rect this grab would cover — also the reuse validity check.
-    let rect = (|| -> Option<(i32, i32, i32, i32)> {
-        let hwnd_tauri = window.hwnd().ok()?;
-        let hwnd = HWND(hwnd_tauri.0 as *mut std::os::raw::c_void);
-        let mut r = RECT::default();
-        unsafe { GetWindowRect(hwnd, &mut r).ok()?; }
-        Some((r.left, r.top, r.right, r.bottom))
-    })();
+/// A raw desktop grab taken while the window was STILL hidden. The JPEG
+/// encode is deliberately deferred so a hotkey press never waits on it.
+struct PendingBackdrop {
+    rect: (i32, i32, i32, i32),
+    w: i32,
+    h: i32,
+    scale: f64,
+    /// BGRA top-down rows (matches the old capture ordering).
+    pixels: Vec<u8>,
+}
 
-    // Reuse a recent grab that still covers the same rect. The webview keeps
-    // the last applied backdrop across hides, so a reused grab needs NO emit:
-    // rapid open/close then costs a single capture and no IPC traffic beyond
-    // the first show.
+/// The window rect the launcher covers right now — both the capture region
+/// and the reuse validity check (a grab is reusable only while its rect still
+/// matches).
+fn window_rect(window: &tauri::Window) -> Option<(i32, i32, i32, i32)> {
+    let hwnd_tauri = window.hwnd().ok()?;
+    let hwnd = HWND(hwnd_tauri.0 as *mut std::os::raw::c_void);
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut r).ok()?; }
+    Some((r.left, r.top, r.right, r.bottom))
+}
+
+/// Like capture_backdrop_if_stale, but ignores the recency TTL so a refresh
+/// can be forced — used right after hide so the cached grab tracks the
+/// CURRENT desktop for the next open. Still dHash-gated, so a desktop that
+/// did not change costs nothing.
+fn capture_backdrop_force(window: &tauri::Window) -> Option<PendingBackdrop> {
+    let rect = window_rect(window);
     let rect_ok = match (*BACKDROP_RECT.lock(), rect) {
         (Some(c), Some(r)) => c == r,
         _ => false,
     };
-    let age_ms = match *BACKDROP_AT.lock() {
-        Some(t) => t.elapsed().as_millis(),
-        None => u128::MAX,
-    };
-
-    // Fast path: the grab is recent AND covers the same rect — reuse.
-    if rect_ok && age_ms < BACKDROP_TTL_MS {
-        if let Some(g) = BACKDROP.lock().clone() {
-            return Some((g, false));
-        }
-    }
-
-    // Fingerprint path: the TTL expired, so check whether the desktop under
-    // the window actually changed via a tiny dHash thumbnail. Unchanged →
-    // the webview's backdrop is still accurate: reuse silently and refresh
-    // the timestamp, so mashing the hotkey never produces a full capture.
-    if rect_ok && age_ms >= BACKDROP_TTL_MS {
+    if BACKDROP.lock().is_some() && rect_ok {
         let same = match (thumb_dhash(window, rect), BACKDROP_THUMB.lock().as_ref()) {
             (Some(a), Some(b)) => hamming_bits(&a, b) <= THUMB_MAX_DIFF_BITS,
             _ => false,
         };
         if same {
-            *BACKDROP_AT.lock() = Some(Instant::now());
-            if let Some(g) = BACKDROP.lock().clone() {
-                return Some((g, false));
+            return None;
+        }
+    }
+    snapshot_backdrop(window)
+}
+
+/// Decide whether the cached backdrop is still good, and if not, snapshot
+/// the desktop behind the window into raw pixels. Runs SYNCHRONOUSLY while
+/// the window is hidden — everything after the BitBlt/GetDIBits (swizzle,
+/// thumbnail, JPEG encode, base64, IPC emit) happens off the hotkey thread
+/// so the palette appears instantly.
+///
+/// Returns None when the cached grab is reusable (recent + same rect, or an
+/// unchanged dHash), or a raw snapshot when a fresh capture is required.
+fn capture_backdrop_if_stale(window: &tauri::Window) -> Option<PendingBackdrop> {
+    let rect = window_rect(window);
+
+    let rect_ok = match (*BACKDROP_RECT.lock(), rect) {
+        (Some(c), Some(r)) => c == r,
+        _ => false,
+    };
+
+    // Reuse paths apply only when we actually HAVE a cached grab.
+    if BACKDROP.lock().is_some() {
+        let age_ms = match *BACKDROP_AT.lock() {
+            Some(t) => t.elapsed().as_millis(),
+            None => u128::MAX,
+        };
+        // Fast path: recent AND same rect — reuse.
+        if rect_ok && age_ms < BACKDROP_TTL_MS {
+            return None;
+        }
+        // Fingerprint path: TTL expired but the desktop under the window did
+        // not change — reuse silently and refresh the timestamp.
+        if rect_ok && age_ms >= BACKDROP_TTL_MS {
+            let same = match (thumb_dhash(window, rect), BACKDROP_THUMB.lock().as_ref()) {
+                (Some(a), Some(b)) => hamming_bits(&a, b) <= THUMB_MAX_DIFF_BITS,
+                _ => false,
+            };
+            if same {
+                *BACKDROP_AT.lock() = Some(Instant::now());
+                return None;
             }
         }
     }
 
-    let grab = (|| -> Result<BackdropGrab, String> {
+    snapshot_backdrop(window)
+}
+
+/// Raw BitBlt/GetDIBits grab of the desktop behind the window, taken while the
+/// window is still hidden (so the palette can never appear in the grab).
+fn snapshot_backdrop(window: &tauri::Window) -> Option<PendingBackdrop> {
+    let grab = (|| -> Result<PendingBackdrop, String> {
         // tauri's HWND comes from its own pinned `windows` crate version;
         // unwrap the raw pointer and rebuild it as our crate's handle type.
         let hwnd_tauri = window.hwnd().map_err(|e| e.to_string())?;
@@ -2184,42 +2375,128 @@ fn capture_backdrop(window: &tauri::Window) -> Option<(BackdropGrab, bool)> {
         if dib < 1 {
             return Err(format!("GetDIBits failed: {}", dib));
         }
-
-        // BGRA → RGBA for the image crate.
-        for px in pixels.chunks_exact_mut(4) {
-            px.swap(0, 2);
-        }
-        let img = image::RgbaImage::from_raw(w as u32, h as u32, pixels)
-            .ok_or_else(|| "image buffer invalid".to_string())?;
-        // The backdrop is heavily blurred and dimmed — full resolution buys
-        // nothing. Downscale to half before encoding: ~4× smaller payload,
-        // and the browser decodes/retains a ~4× smaller texture per capture.
-        let small = image::imageops::thumbnail(&img, (w / 2).max(1) as u32, (h / 2).max(1) as u32);
-        let mut out = std::io::Cursor::new(Vec::new());
-        // Quality 55: barely perceptible under blur(20px)+dim, ~40% smaller
-        // than the old default, and the retain-path memory shrinks with it.
-        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 55);
-        enc.encode_image(&small).map_err(|e| e.to_string())?;
-        Ok(BackdropGrab {
-            uri: format!("data:image/jpeg;base64,{}", B64.encode(out.into_inner())),
-            w_css: w as f64 / scale,
-            h_css: h as f64 / scale,
+        Ok(PendingBackdrop {
+            rect: (rect.left, rect.top, rect.right, rect.bottom),
+            w,
+            h,
+            scale,
+            pixels,
         })
     })();
 
     match grab {
-        Ok(g) => {
-            *BACKDROP.lock() = Some(g.clone());
-            *BACKDROP_AT.lock() = Some(Instant::now());
-            *BACKDROP_RECT.lock() = rect;
-            *BACKDROP_THUMB.lock() = thumb_dhash(window, rect);
-            Some((g, true))
-        }
+        Ok(g) => Some(g),
         Err(e) => {
             log_line(&format!("backdrop capture failed: {}", e));
             None
         }
     }
+}
+
+/// Encode a fresh snapshot and store it in the BACKDROP statics, bumping the
+/// generation counter. Returns the new generation (0 if the encode failed).
+/// Does NOT emit: the show path emits via emit_backdrop_if_unsent so a fresh
+/// grab lands exactly once, pre-show when possible.
+fn cache_backdrop(snap: PendingBackdrop) -> u64 {
+    let rect = snap.rect;
+    let thumb = dhash_from_bgra(&snap.pixels, snap.w, snap.h);
+    let mut gen = 0u64;
+    if let Some(grab) = encode_backdrop(snap) {
+        *BACKDROP.lock() = Some(grab);
+        *BACKDROP_AT.lock() = Some(Instant::now());
+        *BACKDROP_RECT.lock() = Some(rect);
+        *BACKDROP_THUMB.lock() = thumb;
+        let mut g = BACKDROP_GEN.lock();
+        *g += 1;
+        gen = *g;
+    }
+    gen
+}
+
+/// Push the cached grab to the page unless it has already received this
+/// generation — the exactly-once gate for backdrop events. The SENT lock is
+/// held across the emit so two concurrent emitters (show path + background
+/// encode thread) can never double-send. Safe to call from any thread.
+fn emit_backdrop_if_unsent(window: &tauri::Window) {
+    let gen = *BACKDROP_GEN.lock();
+    if gen == 0 {
+        return;
+    }
+    let mut sent = BACKDROP_SENT.lock();
+    if gen == *sent {
+        return;
+    }
+    if let Some(grab) = BACKDROP.lock().clone() {
+        if window.emit("backdrop", grab).is_ok() {
+            *sent = gen;
+        }
+    }
+}
+
+/// Encode a raw snapshot into the JPEG data-URI the frontend layers behind
+/// the card. Expensive (swizzle + downscale + JPEG + base64), so it runs on
+/// a background thread after the window is already visible.
+fn encode_backdrop(snap: PendingBackdrop) -> Option<BackdropGrab> {
+    let mut pixels = snap.pixels;
+    // BGRA → RGBA for the image crate.
+    for px in pixels.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    let img = image::RgbaImage::from_raw(snap.w as u32, snap.h as u32, pixels)?;
+    // The backdrop is heavily blurred and dimmed — full resolution buys
+    // nothing. Downscale to half before encoding: ~4× smaller payload,
+    // and the browser decodes/retains a ~4× smaller texture per capture.
+    let small = image::imageops::thumbnail(&img, (snap.w / 2).max(1) as u32, (snap.h / 2).max(1) as u32);
+    let mut out = std::io::Cursor::new(Vec::new());
+    // Quality 55: barely perceptible under blur(20px)+dim, ~40% smaller
+    // than the old default, and the retain-path memory shrinks with it.
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 55);
+    enc.encode_image(&small).ok()?;
+    Some(BackdropGrab {
+        uri: format!("data:image/jpeg;base64,{}", B64.encode(out.into_inner())),
+        w_css: snap.w as f64 / snap.scale,
+        h_css: snap.h as f64 / snap.scale,
+    })
+}
+
+/// dHash over the already-captured BGRA snapshot (nearest-neighbour
+/// downscale to the THUMB size, then the same luminance-compare as
+/// thumb_dhash). Used on the background thread so the stored fingerprint —
+/// and therefore the next show's reuse decision — matches what was actually
+/// rendered, without re-reading the screen while the palette is visible.
+fn dhash_from_bgra(pixels: &[u8], w: i32, h: i32) -> Option<Vec<u32>> {
+    if w < 2 || h < 2 {
+        return None;
+    }
+    let tw = THUMB_W as usize;
+    let th = THUMB_H as usize;
+    let mut mins = vec![0u8; tw * th * 3]; // RGB accumulators
+    for ty in 0..th {
+        let sy = ((ty as i64 * h as i64) / th as i64) as usize;
+        for tx in 0..tw {
+            let sx = ((tx as i64 * w as i64) / tw as i64) as usize;
+            let i = (sy * w as usize + sx) * 4;
+            let o = (ty * tw + tx) * 3;
+            mins[o] = pixels[i];
+            mins[o + 1] = pixels[i + 1];
+            mins[o + 2] = pixels[i + 2];
+        }
+    }
+    // dHash over nearest-neighbour RGB using approximate luminance.
+    let bits = (tw - 1) * th;
+    let mut out = vec![0u32; bits.div_ceil(32)];
+    for y in 0..th {
+        for x in 0..tw - 1 {
+            let i0 = (y * tw + x) * 3;
+            let i1 = i0 + 3;
+            let l = (mins[i0] as u32 + mins[i0 + 1] as u32 + mins[i0 + 2] as u32) / 3;
+            let r = (mins[i1] as u32 + mins[i1 + 1] as u32 + mins[i1 + 2] as u32) / 3;
+            let bit = (l > r) as u32;
+            let b = y * (tw - 1) + x;
+            out[b / 32] |= bit << (b % 32);
+        }
+    }
+    Some(out)
 }
 
 #[tauri::command]
@@ -2719,10 +2996,24 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Boot background start: the autostart logon task (and the legacy
+    // Startup-folder shortcut) launch the app with --startup so the palette
+    // does NOT pop up over the desktop at every logon. Only a first-run
+    // launch or an explicit summon (hotkey / tray "Show Search" / tray
+    // Re-Index Files) shows the window.
+    let boot_start = std::env::args().any(|a| a == "--startup");
+    BOOT_QUIET.store(boot_start, std::sync::atomic::Ordering::Relaxed);
+
     // Single instance: a second launch just wakes and focuses the running
     // window, so double-clicking the exe never spawns a second index or a
-    // second hotkey registration.
+    // second hotkey registration. A --startup wake stays invisible: boot
+    // bringing up a second instance must not suddenly throw the palette on
+    // screen — the ambient instance is already running in the tray.
     if let Some(hwnd) = ensure_single_instance() {
+        if boot_start {
+            log_line("main: boot start while already running — exiting quietly");
+            std::process::exit(0);
+        }
         unsafe {
             let _ = ShowWindow(hwnd, SW_RESTORE);
             let _ = SetForegroundWindow(hwnd);
@@ -2741,8 +3032,12 @@ fn main() {
     // Sync mirror of the old setup-time check: the backend now spawns BEFORE
     // the window exists (so the cache load overlaps webview creation), and it
     // writes the first-run marker during its run — this store keeps the
-    // first-launch "scanning" overlay deterministic.
-    if !first_run_marker().exists() {
+    // first-launch "scanning" overlay deterministic. FIRST_RUN_LAUNCH drives
+    // the frontend_loaded show decision too: even a --startup boot shows the
+    // welcome/scan overlay when the install marker is absent.
+    let first_run_launch = !first_run_marker().exists();
+    FIRST_RUN_LAUNCH.store(first_run_launch, std::sync::atomic::Ordering::Relaxed);
+    if first_run_launch {
         first_scan.store(true, Ordering::Relaxed);
     }
     start_backend(
@@ -2865,15 +3160,24 @@ fn main() {
             // first_scan was decided synchronously in main() before the
             // backend spawned (the backend writes the first-run marker during
             // its own run); the backend clears it once the scan finishes.
-            if let Some(grab) = capture_backdrop(&window) {
-                // Harmless if the page hasn't registered listeners yet (the
-                // initial load's refreshBackdrop() covers that first show).
-                let _ = window.emit("backdrop", grab);
+            if let Some(snap) = capture_backdrop_if_stale(&window) {
+                // The window is still hidden here — a fresh grab can never
+                // contain the palette. Encode inline: it happens once per
+                // launch, before the first show; the emit marks the page as
+                // having seen this generation.
+                let _ = cache_backdrop(snap);
+                emit_backdrop_if_unsent(&window);
             }
             // Hold the first show until the frontend signals it has painted
             // the frosted-glass backdrop (frontend_loaded); a 4s watchdog
             // guarantees the window appears even if the page never loads.
-            arm_first_show_timeout(window.clone());
+            // Quiet boot starts skip both: the palette must not steal the
+            // desktop at logon — the hotkey or tray summons it instead.
+            if first_show_allowed() {
+                arm_first_show_timeout(window.clone());
+            } else {
+                log_line("window: boot quiet — first-show watchdog not armed");
+            }
 
             // Primary summon hotkey, configurable in Settings (Ctrl+Space or
             // Alt+Space, persisted in HKCU\Software\Finder\Hotkey). NB:
@@ -2937,6 +3241,13 @@ fn main() {
                 }
             }
             SystemTrayEvent::MenuItemClick { id, .. } if id.as_str() == "reindex" => {
+                // Rebuilding from the tray must be visible: summon the
+                // palette up front (status strip shows the index progress),
+                // then kick off the rebuild so a cold start doesn't look
+                // like nothing happened.
+                if let Some(window) = app.get_window("main") {
+                    show_spotlight(&window);
+                }
                 let state = app.state::<AppState>();
                 rebuild_index_impl(&state);
             }
@@ -3019,17 +3330,35 @@ fn backdrop_ok() -> bool {
 // frontend_loaded once it has painted and grabbed the backdrop; a watchdog
 // shows the window anyway after a timeout so a dead/blank webview can never
 // leave launch looking like nothing happened.
+//
+// Boot start: the autostart launch carries --startup, so the handshake skips
+// the first show entirely (the palette waits for a hotkey / tray summon).
+// The very first launch after install always shows, marker or not.
 static FIRST_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BOOT_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FIRST_RUN_LAUNCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The palette may auto-show only when this launch is NOT a quiet boot, or
+/// when it IS the very first run after installation.
+fn first_show_allowed() -> bool {
+    !BOOT_QUIET.load(std::sync::atomic::Ordering::Relaxed)
+        || FIRST_RUN_LAUNCH.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[tauri::command]
 fn frontend_loaded(window: tauri::Window) {
     if !FIRST_SHOWN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        log_line("window: frontend loaded — first show");
-        show_spotlight(&window);
+        if first_show_allowed() {
+            log_line("window: frontend loaded — first show");
+            show_spotlight(&window);
+        } else {
+            log_line("window: boot background start — palette stays in the tray until summoned");
+        }
     }
 }
 
-/// Timeout fallback for the first-show handshake.
+/// Timeout fallback for the first-show handshake. Not armed for quiet boot
+/// starts (the window must stay hidden until the hotkey says otherwise).
 fn arm_first_show_timeout(window: tauri::Window) {
     thread::spawn(move || {
         thread::sleep(std::time::Duration::from_secs(4));
@@ -3091,16 +3420,51 @@ fn position_spotlight(window: &tauri::Window) {
     ));
 }
 
+/// How long show_spotlight waits for a fresh backdrop encode before showing
+/// the window anyway. Release encodes typically land in 30-80 ms, so the
+/// palette usually opens with the CURRENT desktop already on its first frame.
+const SHOW_ENCODE_BUDGET_MS: u128 = 110;
+
 fn show_spotlight(window: &tauri::Window) {
     strip_system_menu(window);
     position_spotlight(window);
-    if let Some((grab, fresh)) = capture_backdrop(window) {
-        // Reused grabs are already applied in the webview (it is never
-        // cleared on hide) — only a genuinely fresh capture is emitted.
-        if fresh {
-            let _ = window.emit("backdrop", grab);
+    // Snapshot the desktop (raw GDI BitBlt — a few ms) while STILL hidden so
+    // the grab can never contain the palette. The JPEG encode then races a
+    // short budget: if it lands in time, the fresh grab is emitted BEFORE the
+    // first visible frame — no stale "adapts to the background" flash — and
+    // the palette still opens almost instantly. If the encode runs long, the
+    // window still shows at once and the newer grab swaps in a frame or two.
+    let pending = capture_backdrop_if_stale(window);
+    if let Some(snap) = pending {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let win = window.clone();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let _ = cache_backdrop(snap);
+            let encoded_ms = t0.elapsed().as_millis();
+            let _ = done_tx.send(());
+            // If the show path already emitted this generation, this is a
+            // no-op (the exactly-once gate). Otherwise push the fresh grab.
+            emit_backdrop_if_unsent(&win);
+            log_line(&format!("backdrop: encoded fresh grab in {} ms", encoded_ms));
+        });
+        // Bounded wait so a fresh grab is usually ready before show(). This is
+        // a few frames of call latency — far below the second-long stall a
+        // fully synchronous encode cost before — and it buys a flash-free open.
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(SHOW_ENCODE_BUDGET_MS as u64) {
+            match done_rx.try_recv() {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(3));
+                }
+                Err(_) => break,
+            }
         }
     }
+    // While still hidden, push whatever the page hasn't seen — the fresh grab
+    // if it won the race, or the still-current cached one otherwise.
+    emit_backdrop_if_unsent(window);
     let _ = window.show();
     let _ = window.set_focus();
 }
@@ -4445,6 +4809,17 @@ fn start_backend(
                 Ok(true) => log_line("autostart: repaired battery-gated logon task"),
                 Ok(false) => {}
                 Err(e) => log_line(&format!("autostart: power-gate repair FAILED: {e}")),
+            }
+        }
+        // Upgrade path (logon tasks created before the quiet-boot flag): the
+        // task launches the app without --startup, so the palette popped up
+        // over the desktop at every boot. Recreate the task once, targeting
+        // the same installed exe, with --startup appended. Runs at most once
+        // per install (after this, task_has_boot_arg() stays true).
+        if schtasks_status() && !task_has_boot_arg() {
+            match set_autostart(true) {
+                Ok(()) => log_line("autostart: logon task upgraded with --startup (quiet boot)"),
+                Err(e) => log_line(&format!("autostart: --startup upgrade FAILED: {e}")),
             }
         }
 

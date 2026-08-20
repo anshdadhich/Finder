@@ -2,6 +2,9 @@
 name = "finder"
 version = "0.2.2"
 edition = "2021"
+# The GUI launcher is the app's main binary (tauri's bundler flags whichever
+# bin matches `default-run` or the package name as the installer's main exe).
+default-run = "Finder"
 
 [lib]
 name = "finder"
