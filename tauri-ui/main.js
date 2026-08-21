@@ -354,6 +354,7 @@ async function loadApps(force) {
       appPool.length = 0;
       appPool.push(...all);
       appPoolLoaded = true;
+      endBootSettleWhenReady();
       if (!items.length) runSearchSafe();
     }
   } catch (error) {
@@ -905,6 +906,23 @@ function render() {
 const cardWinEl = document.querySelector(".launcher-window");
 let cardHeightTimer = null;
 let cardHeightShown = null;
+// Whether cardHeightShown was measured while the palette was VISIBLE. The
+// 1.5s status poll re-runs setState("ready") → syncCardHeight even while
+// hidden, measuring the emptied list at the 210px floor — without this flag
+// every reopen glided 210 → full from that poisoned baseline.
+let cardHeightShownVisible = false;
+/* Height glides are suspended until the initial post-boot settle finishes
+   (first show + app pool rendered + a short grace). A cold-boot summon that
+   beats page load would otherwise watch the card animate 210px → full — the
+   "roll-down". Snapping during the settle reads as "opened"; after the
+   settle, normal glides resume within the same session. */
+let bootSettle = true;
+let bootShown = false;
+let bootSettleTimer = null;
+function endBootSettleWhenReady() {
+  if (!bootSettle || !bootShown || !appPoolLoaded || bootSettleTimer) return;
+  bootSettleTimer = setTimeout(() => { bootSettle = false; }, 400);
+}
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 function syncCardHeight() {
   clearTimeout(cardHeightTimer);
@@ -928,8 +946,10 @@ function measureCardHeight() {
   cardWinEl.style.height = h + "px";
   cardWinEl.classList.remove("no-height-transition");
   const prev = cardHeightShown;
+  const prevVisible = cardHeightShownVisible;
   cardHeightShown = h;
-  if (prev != null && prev !== h && !reduceMotion.matches) {
+  cardHeightShownVisible = !document.hidden;
+  if (prev != null && prevVisible && prev !== h && !reduceMotion.matches && !bootSettle) {
     cardWinEl.animate(
       [{ height: prev + "px" }, { height: h + "px" }],
       { duration: 180, easing: "cubic-bezier(0.16, 1, 0.3, 1)" }
@@ -2425,6 +2445,13 @@ resultsEl.addEventListener(
 
 window.addEventListener("focus", () => {
   input.focus();
+  if (!bootShown) {
+    bootShown = true;
+    endBootSettleWhenReady();
+    // Hard backstop: even if the app pool never arrives (failed IPC),
+    // glides must come back instead of staying off forever.
+    setTimeout(() => { bootSettle = false; }, 3000);
+  }
   // Selecting the whole query on every show wipes it on the next keystroke;
   // do it once per session only.
   if (!firstInitDone) {
