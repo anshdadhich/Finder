@@ -273,6 +273,18 @@ let lastSearchAt = 0;
 let firstInitDone = false;
 
 const iconCache = new Map();
+// Bounded like the backend cache (which clears at 600 entries): every entry
+// holds a base64 data-URI string, so an uncapped map grew ~10-30MB during
+// deep scrolls of broad queries. Eviction is FIFO (Map keeps insertion
+// order); an evicted path simply refetches — get_icons answers from the
+// backend's own memory/disk cache instantly, so nothing visible changes.
+const ICON_CACHE_MAX = 600;
+function iconCacheSet(key, uri) {
+  iconCache.set(key, uri);
+  if (iconCache.size > ICON_CACHE_MAX) {
+    iconCache.delete(iconCache.keys().next().value);
+  }
+}
 
 // Settings deep links have no file to extract an icon from; give them
 // inline glyphs (gear for everything, Wi-Fi/Bluetooth for their own pages).
@@ -777,7 +789,7 @@ function scheduleIconDrain() {
       const map = await invoke("get_icons", { paths: batch });
       if (map) {
         for (const [path, uri] of Object.entries(map)) {
-          iconCache.set(path.toLowerCase(), uri);
+          iconCacheSet(path.toLowerCase(), uri);
           const img =
             rowEls &&
             rowEls.find((el) => el && el.dataset.path === path)?.querySelector(".icon");
@@ -1130,7 +1142,7 @@ function renderNow() {
         // colored globe mark and seed the cache so the viewport observer
         // skips it (no bogus file-icon request, no generic-icon swap-in).
         uri = webSearchIconUri();
-        iconCache.set(iconKey, uri);
+        iconCacheSet(iconKey, uri);
       } else if (!uri && item.kind === "app") {
         uri = settingsIconFor(item.path);
       } else if (
